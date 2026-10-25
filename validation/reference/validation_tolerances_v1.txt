@@ -1,0 +1,35 @@
+# Validation tolerance table for CosmoSim validation ladder.
+# schema_version = 1
+# Policy: thresholds are conservative pass/fail envelopes for routine CI-sized runs.
+# Per-problem reference outputs are tracked in validation/reference/ with explicit version suffixes.
+
+gravity_two_body.max_relative_accel_error = 5.0e-3
+gravity_tree_small_n_open_boundary.max_relative_l2_error = 5.0e-2
+gravity_tree_pm_split.composition_abs_error = 1.0e-12
+# Analytic PM truth gate: sign-sensitive shape plus independent amplitude/error checks.
+gravity_pm_single_mode.min_cosine_similarity = 9.95e-1
+gravity_pm_single_mode.max_relative_l2_error = 2.0e-2
+gravity_pm_single_mode.max_relative_amplitude_error = 2.0e-2
+gravity_pm_uniform_density.max_rms_accel = 8.0e-2
+gravity_pm_glass_like.max_rms_accel = 1.5e-1
+
+# Solver-generated mesh-consistency regression on explicitly identical physical k bins.
+analysis_power_spectrum_mesh_consistency.max_relative_l2_error = 3.5e-1
+
+gravity_tree_pm_periodic_proxy.pm_only_rel_l2_max = 1.5
+gravity_tree_pm_periodic_proxy.split_rel_l2_max = 3.5e-1
+
+gravity_tree_opening.mean_relative_error_theta_0p8 = 9.0e-2
+gravity_tree_opening.mean_relative_error_theta_0p6 = 6.0e-2
+gravity_tree_opening.mean_relative_error_theta_0p4 = 3.5e-2
+gravity_two_body_orbit.max_relative_energy_drift = 8.0e-2
+gravity_static_halo.max_radial_relative_force_error = 1.0e-1
+
+hydro_sod_like.mass_abs_error = 1.0e-10
+hydro_sine_wave.l1_density_error_n64 = 2.0e-1
+hydro_sine_wave.l1_density_error_n128 = 1.5e-1
+hydro_sine_wave.observed_order_min = 0.15
+
+amr_reflux.mass_correction_abs = 1.0e-12
+cooling_box.total_energy_nonincrease_eps = 1.0e-12
+star_formation.mass_budget_abs = 1.0e-9

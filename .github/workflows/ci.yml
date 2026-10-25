@@ -1,0 +1,218 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+    inputs:
+      run_mpi_job:
+        description: "Run optional MPI smoke path"
+        type: boolean
+        default: false
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CMake and Ninja
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      - name: Repository hygiene checks
+        run: bash ./scripts/ci/check_repo_hygiene.sh
+
+  core_strict_warnings:
+    needs: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C++ toolchain
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake ninja-build
+      - name: Build src/core with strict warnings as errors
+        run: |
+          cmake -S . -B build/core-strict -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCOSMOSIM_ENABLE_MPI=OFF \
+            -DCOSMOSIM_ENABLE_HDF5=OFF \
+            -DCOSMOSIM_ENABLE_FFTW=OFF \
+            -DCOSMOSIM_ENABLE_CUDA=OFF \
+            -DCOSMOSIM_ENABLE_TESTS=OFF \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Wundef -Wformat=2 -Wnull-dereference -Werror"
+          cmake --build build/core-strict --target cosmosim_core --parallel 2
+
+  io_strict_warnings:
+    needs: hygiene
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install I/O strict-warning toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ clang cmake ninja-build pkg-config libhdf5-dev
+      - name: Build cosmosim_io with strict warnings as errors
+        env:
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+        run: |
+          cmake -S . -B build/io-strict-${{ matrix.compiler }} -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCOSMOSIM_ENABLE_MPI=OFF \
+            -DCOSMOSIM_ENABLE_HDF5=ON \
+            -DCOSMOSIM_ENABLE_FFTW=OFF \
+            -DCOSMOSIM_ENABLE_CUDA=OFF \
+            -DCOSMOSIM_ENABLE_TESTS=OFF \
+            -DCOSMOSIM_STRICT_IO_WARNINGS=ON
+          cmake --build build/io-strict-${{ matrix.compiler }} --target cosmosim_io --parallel 2
+
+  windows_io_transactional:
+    needs: hygiene
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Windows I/O transaction path
+        run: >-
+          cmake -S . -B build/windows-io -DCMAKE_BUILD_TYPE=Debug
+          -DCOSMOSIM_ENABLE_MPI=OFF -DCOSMOSIM_ENABLE_HDF5=OFF
+          -DCOSMOSIM_ENABLE_FFTW=OFF -DCOSMOSIM_ENABLE_CUDA=OFF
+          -DCOSMOSIM_ENABLE_TESTS=ON
+      - name: Build Windows transactional test
+        run: cmake --build build/windows-io --config Debug --target test_unit_transactional_file --parallel 2
+      - name: Run Windows transactional test
+        run: ctest --test-dir build/windows-io -C Debug -R "^unit_transactional_file$" --output-on-failure
+
+  build_test_matrix:
+    needs: hygiene
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configure_preset: cpu-only-debug
+            build_preset: build-cpu-debug
+            test_preset: test-cpu-debug
+            test_regex: "-"
+            apt_packages: "g++ cmake ninja-build"
+            run_bench: "1"
+          - configure_preset: hdf5-debug
+            build_preset: build-hdf5-debug
+            test_preset: test-hdf5-debug
+            test_regex: "unit_snapshot_hdf5_schema|integration_snapshot_hdf5_roundtrip|integration_restart_checkpoint_roundtrip"
+            apt_packages: "g++ cmake ninja-build pkg-config libhdf5-dev"
+            run_bench: "0"
+          - configure_preset: pm-hdf5-fftw-debug
+            build_preset: build-pm-hdf5-fftw-debug
+            test_preset: test-pm-hdf5-fftw-debug
+            test_regex: "unit_tree_pm_split_kernel|validation_tree_pm_ewald_accuracy|validation_tree_pm_recovery_ewald_accuracy|validation_tree_pm_ewald_accuracy_first_light_softening|integration_hierarchical_treepm_workflow|integration_restart_equivalence_treepm|python_treepm_snapshot_tools|unit_pm_solver|integration_pm_periodic_mode|integration_tree_pm_coupling_periodic|validation_unit|validation_integration|validation_convergence|validation_regression|integration_reference_workflow"
+            apt_packages: "g++ cmake ninja-build pkg-config libhdf5-dev libfftw3-dev python3-numpy python3-h5py"
+            run_bench: "1"
+          - configure_preset: mpi-hdf5-fftw-debug
+            build_preset: build-mpi-hdf5-fftw-debug
+            test_preset: test-mpi-hdf5-fftw-debug
+            test_regex: "integration_hierarchical_treepm_workflow_np2|integration_hierarchical_treepm_workflow_np4|unit_config_parser|integration_provenance_roundtrip|integration_docs_scaffold|unit_parallel_distributed_memory|integration_pm_periodic_mode_mpi_two_rank|integration_pm_slab_halo_exchange_mpi_two_rank|integration_tree_pm_coupling_periodic_mpi_two_rank|integration_tree_pseudo_hierarchy_exchange_mpi_two_rank|integration_reference_workflow_distributed_treepm_mpi_two_rank|integration_runtime_app_mpi_treepm_smoke_two_rank|integration_snapshot_set_mpi_2_rank|integration_snapshot_set_mpi_4_rank|integration_distributed_sfc_rebalance_mpi_two_rank|integration_distributed_sfc_rebalance_mpi_three_rank|integration_distributed_gas_cell_migration_mpi_two_rank|integration_reference_workflow_distributed_hydro_mpi_two_rank|integration_reference_workflow_distributed_amr_mpi_two_rank|integration_reference_workflow_distributed_isolated_pm_mpi_two_rank|validation_phase2_mpi_gravity_two_rank|validation_phase2_mpi_gravity_three_rank|validation_phase2_mpi_gravity_four_rank"
+            apt_packages: "g++ cmake ninja-build pkg-config libopenmpi-dev openmpi-bin libhdf5-dev libhdf5-openmpi-dev libfftw3-dev libfftw3-mpi-dev"
+            run_bench: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+      - name: Configure, build, test, and archive preset artifacts
+        run: |
+          bash ./scripts/ci/run_preset_pipeline.sh \
+            "${{ matrix.configure_preset }}" \
+            "${{ matrix.build_preset }}" \
+            "${{ matrix.test_preset }}" \
+            "${{ matrix.test_regex }}" \
+            "ci_artifacts/${{ matrix.configure_preset }}" \
+            "${{ matrix.run_bench }}"
+      - name: Validate build metadata contract
+        run: |
+          python3 ./scripts/ci/check_build_metadata.py \
+            "ci_artifacts/${{ matrix.configure_preset }}/cosmosim_build_metadata-${{ matrix.configure_preset }}.json" \
+            "validation/reference/ci_build_metadata_expectations_v1.json" \
+            "${{ matrix.configure_preset }}"
+      - name: Run offline snapshot contracts with the packaged Python dependencies
+        if: matrix.configure_preset == 'pm-hdf5-fftw-debug'
+        run: /usr/bin/python3 tests/python/test_treepm_snapshot_tools.py
+      - name: Generate TreePM force-error map artifact
+        if: matrix.configure_preset == 'pm-hdf5-fftw-debug'
+        run: |
+          cmake --build --preset build-pm-hdf5-fftw-debug --target generate_tree_pm_force_error_map
+          mkdir -p ci_artifacts/${{ matrix.configure_preset }}/validation_artifacts
+          cp validation/artifacts/tree_pm_force_error_map.csv \
+            ci_artifacts/${{ matrix.configure_preset }}/validation_artifacts/tree_pm_force_error_map.csv
+      - name: Generate MPI gravity scaling artifacts
+        if: matrix.configure_preset == 'mpi-hdf5-fftw-debug'
+        run: |
+          cmake --build --preset build-mpi-hdf5-fftw-debug --target generate_mpi_gravity_scaling_artifacts
+          mkdir -p ci_artifacts/${{ matrix.configure_preset }}/validation_artifacts
+          cp validation/artifacts/pm_only_scaling_np1.csv ci_artifacts/${{ matrix.configure_preset }}/validation_artifacts/pm_only_scaling_np1.csv
+          cp validation/artifacts/pm_only_scaling_np2.csv ci_artifacts/${{ matrix.configure_preset }}/validation_artifacts/pm_only_scaling_np2.csv
+          cp validation/artifacts/tree_only_scaling_np1.csv ci_artifacts/${{ matrix.configure_preset }}/validation_artifacts/tree_only_scaling_np1.csv
+          cp validation/artifacts/tree_only_scaling_np2.csv ci_artifacts/${{ matrix.configure_preset }}/validation_artifacts/tree_only_scaling_np2.csv
+      - name: Upload preset artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-${{ matrix.configure_preset }}
+          path: ci_artifacts/${{ matrix.configure_preset }}
+
+  infrastructure_gates:
+    needs: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies for explicit feature-path gates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake ninja-build pkg-config libopenmpi-dev openmpi-bin libhdf5-dev libhdf5-openmpi-dev libfftw3-dev libfftw3-mpi-dev
+      - name: Run infrastructure gate bundle
+        run: bash ./scripts/ci/enforce_infra_gates.sh ci_artifacts/infrastructure_gates
+      - name: Upload infrastructure gate report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-infrastructure-gates
+          path: ci_artifacts/infrastructure_gates
+
+  reproducibility_gate:
+    needs: [build_test_matrix, infrastructure_gates]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y g++ cmake ninja-build
+      - name: Run reproducibility gate
+        run: bash ./scripts/ci/run_reproducibility_gate.sh ci_artifacts/reproducibility_gate
+      - name: Upload reproducibility report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-reproducibility-gate
+          path: ci_artifacts/reproducibility_gate
+
+  optional_mpi_smoke:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_mpi_job)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MPI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake ninja-build pkg-config libopenmpi-dev openmpi-bin
+      - name: Configure and build MPI preset
+        run: |
+          cmake --preset mpi-release
+          cmake --build --preset build-mpi-release
+      - name: Run MPI smoke tests
+        run: |
+          mkdir -p ci_artifacts
+          ctest --preset test-mpi-release -R "^(unit_parallel_distributed_memory|integration_parallel_two_rank_restart)$" --output-on-failure --timeout 300 --output-junit ci_artifacts/ctest-mpi-release.xml
+      - name: Upload MPI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-mpi-release
+          path: ci_artifacts

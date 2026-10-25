@@ -1,0 +1,1812 @@
+#include "cosmosim/analysis/diagnostics.hpp"
+
+#include "cosmosim/core/build_config.hpp"
+#include "cosmosim/core/checked_arithmetic.hpp"
+#include "cosmosim/core/openmp_runtime.hpp"
+#include "cosmosim/parallel/distributed_memory.hpp"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <complex>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <numbers>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+
+#if COSMOSIM_ENABLE_FFTW
+#include <fftw3.h>
+#endif
+
+namespace cosmosim::analysis {
+namespace {
+
+constexpr double k_two_pi = 2.0 * std::numbers::pi_v<double>;
+
+[[nodiscard]] double sinc(double value) {
+  if (value == 0.0) {
+    return 1.0;
+  }
+  return std::sin(value) / value;
+}
+
+[[nodiscard]] std::size_t flatten(std::size_t ix, std::size_t iy, std::size_t iz, std::size_t n) {
+  return (ix * n + iy) * n + iz;
+}
+
+[[nodiscard]] std::size_t flatten2(std::size_t ix, std::size_t iy, std::size_t n) { return ix * n + iy; }
+
+
+struct SliceDensityAccumulation {
+  std::vector<double> density_sum;
+  std::vector<std::uint64_t> sample_count;
+};
+
+[[nodiscard]] SliceDensityAccumulation accumulateGasXySliceDensity(
+    const GasDiagnosticsView& gas_cells,
+    std::size_t grid_n,
+    double box_size_code) {
+  if (grid_n == 0U || !std::isfinite(box_size_code) || box_size_code <= 0.0) {
+    throw std::invalid_argument("gas xy slice requires positive grid size and box size");
+  }
+  const double dz_half = box_size_code / static_cast<double>(grid_n) * 0.5;
+  const double z_mid = box_size_code * 0.5;
+  const double cell_size = box_size_code / static_cast<double>(grid_n);
+  SliceDensityAccumulation accumulation{
+      .density_sum = std::vector<double>(grid_n * grid_n, 0.0),
+      .sample_count = std::vector<std::uint64_t>(grid_n * grid_n, 0U),
+  };
+  for (std::size_t i = 0; i < gas_cells.mass_code.size(); ++i) {
+    const double z = gas_cells.center_z_comoving[i];
+    if (std::abs(z - z_mid) > dz_half) {
+      continue;
+    }
+    const auto periodic_index = [&](double value) {
+      const double wrapped = std::fmod(std::fmod(value, box_size_code) + box_size_code, box_size_code);
+      return std::min(grid_n - 1U, static_cast<std::size_t>(wrapped / cell_size));
+    };
+    const std::size_t idx = flatten2(
+        periodic_index(gas_cells.center_x_comoving[i]),
+        periodic_index(gas_cells.center_y_comoving[i]), grid_n);
+    accumulation.density_sum[idx] += gas_cells.density_code[i];
+    ++accumulation.sample_count[idx];
+  }
+  return accumulation;
+}
+
+[[nodiscard]] bool finite3(double x, double y, double z) {
+  return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+[[nodiscard]] double magnitude(const std::array<double, 3>& v) {
+  return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+
+[[nodiscard]] bool isPowerOfTwo(std::size_t value) noexcept {
+  return value != 0 && (value & (value - 1U)) == 0;
+}
+
+void radix2Fft1d(std::span<std::complex<double>> data) {
+  const std::size_t n = data.size();
+  if (!isPowerOfTwo(n)) {
+    throw std::invalid_argument("built-in FFT backend requires power-of-two line length");
+  }
+  for (std::size_t i = 1, j = 0; i < n; ++i) {
+    std::size_t bit = n >> 1U;
+    for (; (j & bit) != 0U; bit >>= 1U) {
+      j ^= bit;
+    }
+    j ^= bit;
+    if (i < j) {
+      std::swap(data[i], data[j]);
+    }
+  }
+  for (std::size_t length = 2; length <= n; length <<= 1U) {
+    const double angle = -k_two_pi / static_cast<double>(length);
+    const std::complex<double> w_length{std::cos(angle), std::sin(angle)};
+    for (std::size_t base = 0; base < n; base += length) {
+      std::complex<double> w{1.0, 0.0};
+      const std::size_t half = length >> 1U;
+      for (std::size_t j = 0; j < half; ++j) {
+        const std::complex<double> even = data[base + j];
+        const std::complex<double> odd = data[base + j + half] * w;
+        data[base + j] = even + odd;
+        data[base + j + half] = even - odd;
+        w *= w_length;
+      }
+    }
+    if (length == n) {
+      break;
+    }
+  }
+}
+
+void builtInFft3d(std::vector<std::complex<double>>& field, std::size_t n) {
+  if (!isPowerOfTwo(n)) {
+    throw std::invalid_argument(
+        "production power spectrum requires FFTW or a power-of-two mesh for the built-in FFT backend");
+  }
+  const std::ptrdiff_t line_count = static_cast<std::ptrdiff_t>(n * n);
+
+  // Z lines are contiguous.
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel
+#endif
+  {
+    std::vector<std::complex<double>> line(n);
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (std::ptrdiff_t line_index = 0; line_index < line_count; ++line_index) {
+      const std::size_t x = static_cast<std::size_t>(line_index) / n;
+      const std::size_t y = static_cast<std::size_t>(line_index) % n;
+      const std::size_t base = flatten(x, y, 0, n);
+      std::copy_n(field.begin() + static_cast<std::ptrdiff_t>(base), n, line.begin());
+      radix2Fft1d(line);
+      std::copy(line.begin(), line.end(), field.begin() + static_cast<std::ptrdiff_t>(base));
+    }
+  }
+
+  // Y lines.
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel
+#endif
+  {
+    std::vector<std::complex<double>> line(n);
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (std::ptrdiff_t line_index = 0; line_index < line_count; ++line_index) {
+      const std::size_t x = static_cast<std::size_t>(line_index) / n;
+      const std::size_t z = static_cast<std::size_t>(line_index) % n;
+      for (std::size_t y = 0; y < n; ++y) {
+        line[y] = field[flatten(x, y, z, n)];
+      }
+      radix2Fft1d(line);
+      for (std::size_t y = 0; y < n; ++y) {
+        field[flatten(x, y, z, n)] = line[y];
+      }
+    }
+  }
+
+  // X lines.
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel
+#endif
+  {
+    std::vector<std::complex<double>> line(n);
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (std::ptrdiff_t line_index = 0; line_index < line_count; ++line_index) {
+      const std::size_t y = static_cast<std::size_t>(line_index) / n;
+      const std::size_t z = static_cast<std::size_t>(line_index) % n;
+      for (std::size_t x = 0; x < n; ++x) {
+        line[x] = field[flatten(x, y, z, n)];
+      }
+      radix2Fft1d(line);
+      for (std::size_t x = 0; x < n; ++x) {
+        field[flatten(x, y, z, n)] = line[x];
+      }
+    }
+  }
+}
+
+void forwardFft3d(std::vector<std::complex<double>>& field, std::size_t n) {
+#if COSMOSIM_ENABLE_FFTW
+  static_assert(sizeof(std::complex<double>) == sizeof(fftw_complex));
+  fftw_plan plan = fftw_plan_dft_3d(
+      static_cast<int>(n),
+      static_cast<int>(n),
+      static_cast<int>(n),
+      reinterpret_cast<fftw_complex*>(field.data()),
+      reinterpret_cast<fftw_complex*>(field.data()),
+      FFTW_FORWARD,
+      FFTW_ESTIMATE);
+  if (plan == nullptr) {
+    throw std::runtime_error("failed to create FFTW plan for production power spectrum");
+  }
+  fftw_execute(plan);
+  fftw_destroy_plan(plan);
+#else
+  builtInFft3d(field, n);
+#endif
+}
+
+[[nodiscard]] const char* diagnosticClassLabel(DiagnosticClass cls) {
+  switch (cls) {
+    case DiagnosticClass::kRunHealth:
+      return "run_health";
+    case DiagnosticClass::kScienceLight:
+      return "science_light";
+    case DiagnosticClass::kScienceHeavy:
+      return "science_heavy";
+  }
+  throw std::logic_error("unhandled DiagnosticClass enum value during serialization");
+}
+
+[[nodiscard]] const char* diagnosticTierLabel(DiagnosticTier tier) {
+  switch (tier) {
+    case DiagnosticTier::kInfrastructureHealth:
+      return "infrastructure_health";
+    case DiagnosticTier::kValidatedScience:
+      return "validated_science";
+    case DiagnosticTier::kReferenceScience:
+      return "reference_science";
+    case DiagnosticTier::kProvisionalScience:
+      return "provisional_science";
+  }
+  throw std::logic_error("unhandled DiagnosticTier enum value during serialization");
+}
+
+[[nodiscard]] const char* diagnosticMaturityLabel(DiagnosticMaturity maturity) {
+  switch (maturity) {
+    case DiagnosticMaturity::kProduction:
+      return "production";
+    case DiagnosticMaturity::kValidated:
+      return "validated";
+    case DiagnosticMaturity::kProvisional:
+      return "provisional";
+  }
+  throw std::logic_error("unhandled DiagnosticMaturity enum value during serialization");
+}
+
+[[nodiscard]] const char* diagnosticImplementationMaturityLabel(
+    DiagnosticImplementationMaturity maturity) {
+  switch (maturity) {
+    case DiagnosticImplementationMaturity::kProductionScalable:
+      return "production_scalable";
+    case DiagnosticImplementationMaturity::kReference:
+      return "reference";
+  }
+  throw std::logic_error(
+      "unhandled DiagnosticImplementationMaturity enum value during serialization");
+}
+
+[[nodiscard]] const char* diagnosticScalabilityLabel(DiagnosticScalability scalability) {
+  switch (scalability) {
+    case DiagnosticScalability::kCheap:
+      return "cheap";
+    case DiagnosticScalability::kModerate:
+      return "moderate";
+    case DiagnosticScalability::kHeavyReference:
+      return "heavy_reference";
+    case DiagnosticScalability::kScalableFft:
+      return "scalable_fft";
+  }
+  throw std::logic_error("unhandled DiagnosticScalability enum value during serialization");
+}
+
+[[nodiscard]] const char* executionPolicyLabel(core::AnalysisConfig::DiagnosticsExecutionPolicy policy) {
+  switch (policy) {
+    case core::AnalysisConfig::DiagnosticsExecutionPolicy::kRunHealthOnly:
+      return "run_health_only";
+    case core::AnalysisConfig::DiagnosticsExecutionPolicy::kRunHealthAndLightScience:
+      return "run_health_and_light_science";
+    case core::AnalysisConfig::DiagnosticsExecutionPolicy::kAllIncludingProvisional:
+      return "all_including_provisional";
+  }
+  throw std::logic_error("unhandled DiagnosticsExecutionPolicy enum value during serialization");
+}
+
+}  // namespace
+
+MetalBudgetDiagnostics computeMetalBudgetDiagnostics(
+    const core::SimulationState& state) {
+  MetalBudgetDiagnostics diagnostics;
+  double gas_mass_total = 0.0;
+  double metal_free_gas_mass = 0.0;
+  diagnostics.minimum_gas_metallicity = std::numeric_limits<double>::infinity();
+  for (std::size_t cell_index = 0; cell_index < state.cells.size(); ++cell_index) {
+    const double gas_mass = state.cells.mass_code[cell_index];
+    const double metal_mass = state.gas_cells.metal_mass_code[cell_index];
+    if (!std::isfinite(gas_mass) || !std::isfinite(metal_mass) ||
+        gas_mass < 0.0 || metal_mass < 0.0 || metal_mass > gas_mass) {
+      ++diagnostics.invalid_gas_states;
+      continue;
+    }
+    const double metallicity = gas_mass > 0.0 ? metal_mass / gas_mass : 0.0;
+    diagnostics.gas_metal_mass_code += metal_mass;
+    gas_mass_total += gas_mass;
+    diagnostics.minimum_gas_metallicity = std::min(
+        diagnostics.minimum_gas_metallicity, metallicity);
+    diagnostics.maximum_gas_metallicity = std::max(
+        diagnostics.maximum_gas_metallicity, metallicity);
+    if (metal_mass == 0.0) {
+      metal_free_gas_mass += gas_mass;
+    }
+  }
+  if (state.cells.size() == 0U || !std::isfinite(diagnostics.minimum_gas_metallicity)) {
+    diagnostics.minimum_gas_metallicity = 0.0;
+  }
+  diagnostics.mass_weighted_mean_gas_metallicity = gas_mass_total > 0.0
+      ? diagnostics.gas_metal_mass_code / gas_mass_total : 0.0;
+  diagnostics.metal_free_gas_mass_fraction = gas_mass_total > 0.0
+      ? metal_free_gas_mass / gas_mass_total : 0.0;
+
+  for (std::size_t star_index = 0;
+       star_index < state.star_particles.size(); ++star_index) {
+    const double birth_metals =
+        state.star_particles.birth_mass_code[star_index] *
+        state.star_particles.metallicity_mass_fraction[star_index];
+    const double returned_metals =
+        state.star_particles.stellar_returned_metals_cumulative_code[star_index];
+    const double new_metals =
+        state.star_particles.stellar_newly_synthesized_metals_cumulative_code[star_index];
+    const double returned_birth_metals = std::max(returned_metals - new_metals, 0.0);
+    diagnostics.stellar_birth_metal_mass_code += birth_metals;
+    diagnostics.stellar_locked_metal_mass_code +=
+        std::max(birth_metals - returned_birth_metals, 0.0);
+    diagnostics.cumulative_newly_synthesized_metal_mass_code += new_metals;
+    diagnostics.cumulative_returned_metal_mass_code += returned_metals;
+    diagnostics.cumulative_deposited_metal_mass_code +=
+        state.star_particles.stellar_deposited_metals_cumulative_code[star_index];
+    diagnostics.unresolved_carried_metal_mass_code +=
+        state.star_particles.enrichment_carry_metals_code[star_index];
+  }
+  diagnostics.enrichment_deposition_residual_code =
+      diagnostics.cumulative_returned_metal_mass_code -
+      diagnostics.cumulative_deposited_metal_mass_code -
+      diagnostics.unresolved_carried_metal_mass_code;
+  return diagnostics;
+}
+
+double globalMetalAuditResidualCode(
+    const MetalBudgetDiagnostics& diagnostics,
+    double initial_total_metal_mass_code,
+    double escaped_metal_mass_code) noexcept {
+  const double accounted_final = diagnostics.gas_metal_mass_code +
+      diagnostics.stellar_locked_metal_mass_code +
+      diagnostics.unresolved_carried_metal_mass_code;
+  return accounted_final -
+      (initial_total_metal_mass_code +
+       diagnostics.cumulative_newly_synthesized_metal_mass_code -
+       escaped_metal_mass_code);
+}
+
+std::string_view powerSpectrumMassAssignmentLabel(
+    PowerSpectrumMassAssignment assignment) noexcept {
+  switch (assignment) {
+    case PowerSpectrumMassAssignment::kNearestGridPoint:
+      return "ngp";
+    case PowerSpectrumMassAssignment::kCloudInCell:
+      return "cic";
+  }
+  return "unknown";
+}
+
+std::string_view powerSpectrumWindowCorrectionLabel(
+    PowerSpectrumWindowCorrection correction) noexcept {
+  switch (correction) {
+    case PowerSpectrumWindowCorrection::kNone:
+      return "none";
+    case PowerSpectrumWindowCorrection::kDeconvolveAssignmentWindow:
+      return "deconvolve_assignment_window";
+  }
+  return "unknown";
+}
+
+std::string_view powerSpectrumShotNoisePolicyLabel(
+    PowerSpectrumShotNoisePolicy policy) noexcept {
+  switch (policy) {
+    case PowerSpectrumShotNoisePolicy::kReportWithoutSubtraction:
+      return "poisson_reported_not_subtracted";
+    case PowerSpectrumShotNoisePolicy::kSubtractPoisson:
+      return "poisson_subtracted";
+  }
+  return "unknown";
+}
+
+std::string_view powerSpectrumKUnits() noexcept { return "code_length^-1"; }
+
+std::string_view powerSpectrumPowerUnits() noexcept { return "code_length^3"; }
+
+std::string_view powerSpectrumFourierNormalization() noexcept {
+  return "delta_k=sum(delta_grid*exp(-i*k*x_grid))/N_mesh;P=V*abs(delta_k)^2";
+}
+
+PowerSpectrumMemoryEstimate estimatePowerSpectrumMemory(
+    std::size_t mesh_n, std::size_t bin_count, std::size_t thread_count) {
+  if (mesh_n < 2U || bin_count == 0U || thread_count == 0U ||
+      mesh_n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument("invalid production power-spectrum memory geometry");
+  }
+  const auto mul = [](std::uint64_t lhs, std::uint64_t rhs,
+                      std::string_view label) {
+    if (lhs != 0U && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+      throw std::overflow_error(std::string(label) + ": byte multiplication overflow");
+    }
+    return lhs * rhs;
+  };
+  const auto add = [](std::uint64_t lhs, std::uint64_t rhs,
+                      std::string_view label) {
+    return core::checkedMemoryBytesAdd(lhs, rhs, label);
+  };
+  const std::uint64_t n = static_cast<std::uint64_t>(mesh_n);
+  const std::uint64_t bins = static_cast<std::uint64_t>(bin_count);
+  if (bin_count > std::vector<PowerSpectrumEstimateBin>{}.max_size() ||
+      bin_count > std::vector<PowerSpectrumBin>{}.max_size()) {
+    throw std::overflow_error("power spectrum bin count exceeds vector range");
+  }
+  const std::uint64_t threads = static_cast<std::uint64_t>(thread_count);
+  const std::uint64_t cells = mul(mul(n, n, "FFT mesh xy"), n, "FFT mesh xyz");
+  if (cells > static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) ||
+      cells > static_cast<std::uint64_t>(std::vector<std::complex<double>>{}.max_size()) ||
+      cells > static_cast<std::uint64_t>(std::vector<double>{}.max_size())) {
+    throw std::overflow_error("power spectrum mesh exceeds supported vector or loop range");
+  }
+  const std::uint64_t real = mul(cells, sizeof(double), "FFT real mesh");
+  const std::uint64_t complex = mul(cells, sizeof(std::complex<double>), "FFT complex mesh");
+  PowerSpectrumMemoryEstimate result;
+  result.mesh_coexistence_bytes = add(real, complex, "FFT mesh coexistence");
+  // The built-in backend owns one complex line per worker. The FFTW backend
+  // uses its own opaque planner allocation, charged to the configured external
+  // allowance; reserve the line budget conservatively for either backend.
+  const std::uint64_t lines = mul(mul(n, sizeof(std::complex<double>), "FFT line"),
+                                  threads, "FFT worker lines");
+  const std::uint64_t accumulators = mul(
+      mul(bins, 2U * sizeof(double) + sizeof(std::uint64_t), "FFT bin accumulators"),
+      add(threads, 1U, "FFT worker count"), "FFT worker accumulators");
+  const std::uint64_t result_bins = mul(bins, sizeof(PowerSpectrumEstimateBin), "FFT result bins");
+  const std::uint64_t wrapper_bins = mul(bins, sizeof(PowerSpectrumBin), "FFT wrapper bins");
+  // The real mesh has been released before the per-worker reductions. The
+  // estimator result and wrapper can coexist; account both, not just size().
+  const std::uint64_t reduction_peak = add(
+      add(complex, lines, "FFT transform workspace"),
+      add(accumulators, add(result_bins, wrapper_bins, "FFT results"), "FFT reductions"),
+      "FFT reduction peak");
+  result.owned_peak_bytes = std::max(result.mesh_coexistence_bytes, reduction_peak);
+  return result;
+}
+
+DiagnosticsEngine::DiagnosticsEngine(core::SimulationConfig config,
+                                     core::MemoryGovernor* memory_governor)
+    : m_memory_governor(memory_governor), m_config(std::move(config)) {}
+
+DiagnosticsStateView buildDiagnosticsStateView(
+    const core::SimulationState& state, core::OwnershipValidationWorkspace* scratch) {
+  core::OwnershipValidationWorkspace local_scratch;
+  if (scratch == nullptr) { scratch = &local_scratch; }
+  const bool ownership_ok = state.validateOwnershipInvariants(*scratch);
+  const bool unique_ids_ok = state.validateUniqueParticleIds(*scratch);
+  return DiagnosticsStateView{
+      .particles = ParticleDiagnosticsView{
+          .position_x_comoving = state.particles.position_x_comoving,
+          .position_y_comoving = state.particles.position_y_comoving,
+          .position_z_comoving = state.particles.position_z_comoving,
+          .velocity_x_peculiar = state.particles.velocity_x_peculiar,
+          .velocity_y_peculiar = state.particles.velocity_y_peculiar,
+          .velocity_z_peculiar = state.particles.velocity_z_peculiar,
+          .mass_code = state.particles.mass_code,
+          .species_tag = state.particle_sidecar.species_tag,
+          .homogeneous_dmo_species = state.hasHomogeneousDmoMetadata(),
+          .gravity_softening_comoving = state.particle_sidecar.gravity_softening_comoving,
+      },
+      .gas_cells = GasDiagnosticsView{
+          .center_x_comoving = state.cells.center_x_comoving,
+          .center_y_comoving = state.cells.center_y_comoving,
+          .center_z_comoving = state.cells.center_z_comoving,
+          .mass_code = state.cells.mass_code,
+          .density_code = state.gas_cells.density_code,
+      },
+      .stars = StarFormationHistoryView{
+          .formation_scale_factor = state.star_particles.formation_scale_factor,
+          .birth_mass_code = state.star_particles.birth_mass_code,
+      },
+      .particle_count = static_cast<std::uint64_t>(state.particles.size()),
+      .cell_count = static_cast<std::uint64_t>(state.cells.size()),
+      .star_count = static_cast<std::uint64_t>(state.star_particles.size()),
+      .ownership_invariants_ok = ownership_ok,
+      .unique_particle_ids_ok = unique_ids_ok,
+  };
+}
+
+RunHealthCounters DiagnosticsEngine::computeRunHealth(const DiagnosticsStateView& view) const {
+  RunHealthCounters counters;
+  counters.particle_count = view.particle_count;
+  counters.cell_count = view.cell_count;
+  counters.star_count = view.star_count;
+  counters.ownership_invariants_ok = view.ownership_invariants_ok;
+  counters.unique_particle_ids_ok = view.unique_particle_ids_ok;
+  counters.gravity_softening_sidecar_size_ok =
+      view.particles.gravity_softening_comoving.empty() ||
+      view.particles.gravity_softening_comoving.size() == view.particles.mass_code.size();
+
+  for (std::size_t i = 0; i < view.particles.mass_code.size(); ++i) {
+    if (!finite3(view.particles.position_x_comoving[i], view.particles.position_y_comoving[i],
+                 view.particles.position_z_comoving[i]) ||
+        !finite3(view.particles.velocity_x_peculiar[i], view.particles.velocity_y_peculiar[i],
+                 view.particles.velocity_z_peculiar[i]) ||
+        !std::isfinite(view.particles.mass_code[i])) {
+      ++counters.non_finite_particles;
+    }
+    if (view.particles.mass_code[i] <= 0.0) {
+      ++counters.non_positive_particle_mass;
+    }
+  }
+
+  for (std::size_t i = 0; i < view.gas_cells.mass_code.size(); ++i) {
+    if (!finite3(view.gas_cells.center_x_comoving[i], view.gas_cells.center_y_comoving[i],
+                 view.gas_cells.center_z_comoving[i]) ||
+        !std::isfinite(view.gas_cells.mass_code[i]) || !std::isfinite(view.gas_cells.density_code[i])) {
+      ++counters.non_finite_cells;
+    }
+  }
+  for (const double softening : view.particles.gravity_softening_comoving) {
+    if (!std::isfinite(softening) || softening < 0.0) {
+      ++counters.non_finite_gravity_softening;
+    }
+  }
+  return counters;
+}
+
+RunHealthCounters DiagnosticsEngine::computeRunHealth(const core::SimulationState& state) const {
+  return computeRunHealth(buildDiagnosticsStateView(state));
+}
+
+std::vector<PowerSpectrumBin> DiagnosticsEngine::computePowerSpectrum(
+    const ParticleDiagnosticsView& particles,
+    std::size_t mesh_n,
+    std::size_t bin_count) const {
+  core::MemoryReservation reservation;
+  if (m_memory_governor != nullptr && mesh_n >= 2U && bin_count != 0U) {
+    const auto estimate = estimatePowerSpectrumMemory(
+        mesh_n, bin_count, static_cast<std::size_t>(core::openMpMaximumThreads()));
+    reservation = m_memory_governor->reserve(
+        core::MemoryClass::kDiagnostic, estimate.owned_peak_bytes,
+        "analysis.power_spectrum.wrapper");
+    reservation.commit();
+  }
+  return computePowerSpectrumImpl(particles, mesh_n, bin_count,
+                                  reservation.committed() ? &reservation : nullptr);
+}
+
+std::vector<PowerSpectrumBin> DiagnosticsEngine::computePowerSpectrumImpl(
+    const ParticleDiagnosticsView& particles,
+    std::size_t mesh_n,
+    std::size_t bin_count,
+    const core::MemoryReservation* enclosing_reservation) const {
+  if (mesh_n == 0 || bin_count == 0) {
+    throw std::invalid_argument("power spectrum requires mesh_n > 0 and bin_count > 0");
+  }
+  if (particles.mass_code.empty()) {
+    return {};
+  }
+  const PowerSpectrumEstimate estimate = computePowerSpectrumEstimateImpl(
+      particles,
+      PowerSpectrumEstimateOptions{
+          .mesh_n = mesh_n,
+          .bin_count = bin_count,
+          .mass_assignment = PowerSpectrumMassAssignment::kNearestGridPoint,
+          .window_correction = PowerSpectrumWindowCorrection::kNone,
+          .shot_noise_policy = PowerSpectrumShotNoisePolicy::kReportWithoutSubtraction,
+      }, enclosing_reservation);
+  std::vector<PowerSpectrumBin> bins;
+  bins.reserve(estimate.bins.size());
+  for (const PowerSpectrumEstimateBin& bin : estimate.bins) {
+    if (bin.empty) {
+      continue;
+    }
+    bins.push_back(PowerSpectrumBin{
+        .k_center_code = bin.k_center_code,
+        .power_code_volume = bin.power_code_volume,
+        .mode_count = bin.mode_count,
+    });
+  }
+  return bins;
+}
+
+std::vector<PowerSpectrumBin> DiagnosticsEngine::computePowerSpectrum(
+    const core::SimulationState& state,
+    std::size_t mesh_n,
+    std::size_t bin_count) const {
+  return computePowerSpectrum(buildDiagnosticsStateView(state).particles, mesh_n, bin_count);
+}
+
+PowerSpectrumEstimate DiagnosticsEngine::computePowerSpectrumEstimate(
+    const ParticleDiagnosticsView& particles,
+    const PowerSpectrumEstimateOptions& options) const {
+  return computePowerSpectrumEstimateImpl(particles, options, nullptr);
+}
+
+PowerSpectrumEstimate DiagnosticsEngine::computePowerSpectrumEstimateImpl(
+    const ParticleDiagnosticsView& particles,
+    const PowerSpectrumEstimateOptions& options,
+    const core::MemoryReservation* enclosing_reservation) const {
+  if (options.mesh_n < 2 || options.bin_count == 0) {
+    throw std::invalid_argument("power spectrum estimate requires mesh_n >= 2 and bin_count > 0");
+  }
+  if (options.mesh_n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("power spectrum mesh size exceeds FFT signed dimension range");
+  }
+  if (particles.position_x_comoving.size() != particles.mass_code.size() ||
+      particles.position_y_comoving.size() != particles.mass_code.size() ||
+      particles.position_z_comoving.size() != particles.mass_code.size()) {
+    throw std::invalid_argument("power spectrum estimate particle position/mass lane sizes differ");
+  }
+  if (options.window_correction != PowerSpectrumWindowCorrection::kNone &&
+      options.window_correction != PowerSpectrumWindowCorrection::kDeconvolveAssignmentWindow) {
+    throw std::invalid_argument("power spectrum estimate received an unknown window-correction policy");
+  }
+  if (options.shot_noise_policy != PowerSpectrumShotNoisePolicy::kReportWithoutSubtraction &&
+      options.shot_noise_policy != PowerSpectrumShotNoisePolicy::kSubtractPoisson) {
+    throw std::invalid_argument("power spectrum estimate received an unknown shot-noise policy");
+  }
+
+  const auto memory_estimate = estimatePowerSpectrumMemory(
+      options.mesh_n, options.bin_count,
+      static_cast<std::size_t>(core::openMpMaximumThreads()));
+  core::MemoryReservation local_reservation;
+  if (m_memory_governor != nullptr) {
+    if (enclosing_reservation != nullptr) {
+      if (!enclosing_reservation->committed() ||
+          enclosing_reservation->bytes() < memory_estimate.owned_peak_bytes) {
+        throw std::logic_error("power-spectrum enclosing memory lease is insufficient");
+      }
+    } else {
+      local_reservation = m_memory_governor->reserve(
+          core::MemoryClass::kDiagnostic, memory_estimate.owned_peak_bytes,
+          "analysis.power_spectrum.fft");
+      local_reservation.commit();
+    }
+  }
+
+  const double box_size_code = m_config.cosmology.box_size_mpc_comoving;
+  if (!std::isfinite(box_size_code) || box_size_code <= 0.0) {
+    throw std::invalid_argument("power spectrum estimate requires a finite positive box size");
+  }
+  const std::size_t mesh_n = options.mesh_n;
+  const std::size_t mesh_xy = core::checkedSizeMultiply(
+      mesh_n, mesh_n, "power spectrum FFT mesh xy");
+  const std::size_t mesh_count = core::checkedSizeMultiply(
+      mesh_xy, mesh_n, "power spectrum FFT mesh xyz");
+  const double cell_size_code = box_size_code / static_cast<double>(mesh_n);
+  std::vector<double> mass_mesh(mesh_count, 0.0);
+  double total_mass_code = 0.0;
+  double mass_square_sum_code = 0.0;
+
+  const auto wrap_coordinate = [box_size_code](double coordinate) {
+    double wrapped = std::fmod(coordinate, box_size_code);
+    if (wrapped < 0.0) {
+      wrapped += box_size_code;
+    }
+    if (wrapped >= box_size_code) {
+      wrapped = 0.0;
+    }
+    return wrapped;
+  };
+
+  for (std::size_t particle = 0; particle < particles.mass_code.size(); ++particle) {
+    const double mass_code = particles.mass_code[particle];
+    const double x_code = particles.position_x_comoving[particle];
+    const double y_code = particles.position_y_comoving[particle];
+    const double z_code = particles.position_z_comoving[particle];
+    if (!std::isfinite(mass_code) || mass_code <= 0.0 || !finite3(x_code, y_code, z_code)) {
+      throw std::invalid_argument(
+          "power spectrum estimate requires finite positions and positive finite masses");
+    }
+    const std::array<double, 3> scaled{
+        wrap_coordinate(x_code) / cell_size_code,
+        wrap_coordinate(y_code) / cell_size_code,
+        wrap_coordinate(z_code) / cell_size_code,
+    };
+    if (options.mass_assignment == PowerSpectrumMassAssignment::kNearestGridPoint) {
+      const std::size_t ix = std::min(mesh_n - 1, static_cast<std::size_t>(scaled[0]));
+      const std::size_t iy = std::min(mesh_n - 1, static_cast<std::size_t>(scaled[1]));
+      const std::size_t iz = std::min(mesh_n - 1, static_cast<std::size_t>(scaled[2]));
+      mass_mesh[flatten(ix, iy, iz, mesh_n)] += mass_code;
+    } else if (options.mass_assignment == PowerSpectrumMassAssignment::kCloudInCell) {
+      std::array<std::size_t, 3> lower{};
+      std::array<std::size_t, 3> upper{};
+      std::array<double, 3> upper_weight{};
+      for (std::size_t axis = 0; axis < 3; ++axis) {
+        lower[axis] = std::min(mesh_n - 1, static_cast<std::size_t>(scaled[axis]));
+        upper[axis] = (lower[axis] + 1) % mesh_n;
+        upper_weight[axis] = scaled[axis] - std::floor(scaled[axis]);
+      }
+      for (std::size_t dx = 0; dx < 2; ++dx) {
+        const double wx = dx == 0 ? 1.0 - upper_weight[0] : upper_weight[0];
+        const std::size_t ix = dx == 0 ? lower[0] : upper[0];
+        for (std::size_t dy = 0; dy < 2; ++dy) {
+          const double wy = dy == 0 ? 1.0 - upper_weight[1] : upper_weight[1];
+          const std::size_t iy = dy == 0 ? lower[1] : upper[1];
+          for (std::size_t dz = 0; dz < 2; ++dz) {
+            const double wz = dz == 0 ? 1.0 - upper_weight[2] : upper_weight[2];
+            const std::size_t iz = dz == 0 ? lower[2] : upper[2];
+            mass_mesh[flatten(ix, iy, iz, mesh_n)] += mass_code * wx * wy * wz;
+          }
+        }
+      }
+    } else {
+      throw std::invalid_argument("power spectrum estimate received an unknown mass-assignment policy");
+    }
+    total_mass_code += mass_code;
+    mass_square_sum_code += mass_code * mass_code;
+  }
+  if (!std::isfinite(total_mass_code) || total_mass_code <= 0.0 ||
+      !std::isfinite(mass_square_sum_code)) {
+    throw std::invalid_argument("power spectrum estimate has no finite positive total mass");
+  }
+
+  const double mean_cell_mass_code = total_mass_code / static_cast<double>(mesh_count);
+  std::vector<std::complex<double>> fourier(mesh_count);
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (std::ptrdiff_t index = 0; index < static_cast<std::ptrdiff_t>(mesh_count); ++index) {
+    const std::size_t i = static_cast<std::size_t>(index);
+    fourier[i] = std::complex<double>{mass_mesh[i] / mean_cell_mass_code - 1.0, 0.0};
+  }
+  std::vector<double>().swap(mass_mesh);
+  forwardFft3d(fourier, mesh_n);
+
+  const std::size_t nyquist_mode = mesh_n / 2;
+  const double k_fundamental_code = k_two_pi / box_size_code;
+  const double k_max_code =
+      std::sqrt(3.0) * static_cast<double>(nyquist_mode) * k_fundamental_code;
+  const double bin_width_code = k_max_code / static_cast<double>(options.bin_count);
+  const double volume_code = box_size_code * box_size_code * box_size_code;
+  const double shot_noise_code_volume =
+      volume_code * mass_square_sum_code / (total_mass_code * total_mass_code);
+  const int assignment_window_exponent =
+      options.mass_assignment == PowerSpectrumMassAssignment::kCloudInCell ? 2 : 1;
+
+  std::vector<double> power_sum(options.bin_count, 0.0);
+  std::vector<double> k_sum(options.bin_count, 0.0);
+  std::vector<std::uint64_t> mode_count(options.bin_count, 0);
+
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel
+#endif
+  {
+    std::vector<double> local_power(options.bin_count, 0.0);
+    std::vector<double> local_k(options.bin_count, 0.0);
+    std::vector<std::uint64_t> local_count(options.bin_count, 0);
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (std::ptrdiff_t flat_mode = 0;
+         flat_mode < static_cast<std::ptrdiff_t>(mesh_count);
+         ++flat_mode) {
+      const std::size_t mode = static_cast<std::size_t>(flat_mode);
+      const std::size_t nx = mode / mesh_xy;
+      const std::size_t remainder = mode % mesh_xy;
+      const std::size_t ny = remainder / mesh_n;
+      const std::size_t nz = remainder % mesh_n;
+      const int kx_int = nx <= nyquist_mode
+          ? static_cast<int>(nx)
+          : static_cast<int>(nx) - static_cast<int>(mesh_n);
+      const int ky_int = ny <= nyquist_mode
+          ? static_cast<int>(ny)
+          : static_cast<int>(ny) - static_cast<int>(mesh_n);
+      const int kz_int = nz <= nyquist_mode
+          ? static_cast<int>(nz)
+          : static_cast<int>(nz) - static_cast<int>(mesh_n);
+      if (kx_int == 0 && ky_int == 0 && kz_int == 0) {
+        continue;
+      }
+      const double k_magnitude_code = std::sqrt(
+          static_cast<double>(kx_int) * static_cast<double>(kx_int) +
+          static_cast<double>(ky_int) * static_cast<double>(ky_int) +
+          static_cast<double>(kz_int) * static_cast<double>(kz_int)) *
+          k_fundamental_code;
+      const std::size_t bin_index = std::min(
+          options.bin_count - 1,
+          static_cast<std::size_t>(k_magnitude_code / bin_width_code));
+      const std::complex<double> delta_k = fourier[mode] / static_cast<double>(mesh_count);
+      double power_code_volume = volume_code * std::norm(delta_k);
+      if (options.window_correction ==
+          PowerSpectrumWindowCorrection::kDeconvolveAssignmentWindow) {
+        const auto axis_window = [mesh_n, assignment_window_exponent](int mode_index) {
+          return std::pow(
+              sinc(std::numbers::pi_v<double> * static_cast<double>(mode_index) /
+                   static_cast<double>(mesh_n)),
+              assignment_window_exponent);
+        };
+        const double assignment_window =
+            axis_window(kx_int) * axis_window(ky_int) * axis_window(kz_int);
+        power_code_volume /= std::max(assignment_window * assignment_window, 1.0e-24);
+      }
+      if (options.shot_noise_policy == PowerSpectrumShotNoisePolicy::kSubtractPoisson) {
+        power_code_volume -= shot_noise_code_volume;
+      }
+      local_power[bin_index] += power_code_volume;
+      local_k[bin_index] += k_magnitude_code;
+      ++local_count[bin_index];
+    }
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp critical(cosmosim_power_spectrum_bin_merge)
+#endif
+    {
+      for (std::size_t bin = 0; bin < options.bin_count; ++bin) {
+        power_sum[bin] += local_power[bin];
+        k_sum[bin] += local_k[bin];
+        mode_count[bin] += local_count[bin];
+      }
+    }
+  }
+
+  PowerSpectrumEstimate estimate;
+  estimate.options = options;
+  estimate.box_size_code = box_size_code;
+  estimate.k_fundamental_code = k_fundamental_code;
+  estimate.k_axis_nyquist_code = static_cast<double>(nyquist_mode) * k_fundamental_code;
+  estimate.poisson_shot_noise_code_volume = shot_noise_code_volume;
+  estimate.bins.reserve(options.bin_count);
+  for (std::size_t bin_index = 0; bin_index < options.bin_count; ++bin_index) {
+    const bool empty = mode_count[bin_index] == 0;
+    const double lower_code = static_cast<double>(bin_index) * bin_width_code;
+    const double upper_code = static_cast<double>(bin_index + 1) * bin_width_code;
+    estimate.bins.push_back(PowerSpectrumEstimateBin{
+        .bin_index = bin_index,
+        .k_lower_code = lower_code,
+        .k_upper_code = upper_code,
+        .k_center_code = empty
+            ? 0.5 * (lower_code + upper_code)
+            : k_sum[bin_index] / static_cast<double>(mode_count[bin_index]),
+        .power_code_volume = empty
+            ? 0.0
+            : power_sum[bin_index] / static_cast<double>(mode_count[bin_index]),
+        .mode_count = mode_count[bin_index],
+        .empty = empty,
+    });
+  }
+  return estimate;
+}
+
+PowerSpectrumEstimate DiagnosticsEngine::computePowerSpectrumEstimate(
+    const core::SimulationState& state,
+    const PowerSpectrumEstimateOptions& options) const {
+  return computePowerSpectrumEstimate(buildDiagnosticsStateView(state).particles, options);
+}
+
+PowerSpectrumEstimate DiagnosticsEngine::computePowerSpectrumEstimateReferenceDirectDft(
+    const ParticleDiagnosticsView& particles,
+    const PowerSpectrumEstimateOptions& options) const {
+  if (options.mesh_n < 2 || options.bin_count == 0) {
+    throw std::invalid_argument("power spectrum estimate requires mesh_n >= 2 and bin_count > 0");
+  }
+  if (options.mesh_n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("power spectrum mesh size exceeds signed mode-index range");
+  }
+  if (particles.position_x_comoving.size() != particles.mass_code.size() ||
+      particles.position_y_comoving.size() != particles.mass_code.size() ||
+      particles.position_z_comoving.size() != particles.mass_code.size()) {
+    throw std::invalid_argument("power spectrum estimate particle position/mass lane sizes differ");
+  }
+  if (options.mesh_n > std::numeric_limits<std::size_t>::max() / options.mesh_n ||
+      options.mesh_n * options.mesh_n >
+          std::numeric_limits<std::size_t>::max() / options.mesh_n) {
+    throw std::overflow_error("power spectrum mesh size overflows size_t");
+  }
+
+  const double box_size_code = m_config.cosmology.box_size_mpc_comoving;
+  if (!std::isfinite(box_size_code) || box_size_code <= 0.0) {
+    throw std::invalid_argument("power spectrum estimate requires a finite positive box size");
+  }
+
+  const std::size_t mesh_n = options.mesh_n;
+  const std::size_t mesh_count = mesh_n * mesh_n * mesh_n;
+  const double cell_size_code = box_size_code / static_cast<double>(mesh_n);
+  std::vector<double> mass_mesh(mesh_count, 0.0);
+  double total_mass_code = 0.0;
+  double mass_square_sum_code = 0.0;
+
+  const auto wrap_coordinate = [box_size_code](double coordinate) {
+    double wrapped = std::fmod(coordinate, box_size_code);
+    if (wrapped < 0.0) {
+      wrapped += box_size_code;
+    }
+    if (wrapped >= box_size_code) {
+      wrapped = 0.0;
+    }
+    return wrapped;
+  };
+
+  for (std::size_t particle = 0; particle < particles.mass_code.size(); ++particle) {
+    const double mass_code = particles.mass_code[particle];
+    const double x_code = particles.position_x_comoving[particle];
+    const double y_code = particles.position_y_comoving[particle];
+    const double z_code = particles.position_z_comoving[particle];
+    if (!std::isfinite(mass_code) || mass_code <= 0.0 ||
+        !finite3(x_code, y_code, z_code)) {
+      throw std::invalid_argument("power spectrum estimate requires finite positions and positive finite masses");
+    }
+    const std::array<double, 3> scaled{
+        wrap_coordinate(x_code) / cell_size_code,
+        wrap_coordinate(y_code) / cell_size_code,
+        wrap_coordinate(z_code) / cell_size_code,
+    };
+    if (options.mass_assignment == PowerSpectrumMassAssignment::kNearestGridPoint) {
+      const std::size_t ix = std::min(mesh_n - 1, static_cast<std::size_t>(scaled[0]));
+      const std::size_t iy = std::min(mesh_n - 1, static_cast<std::size_t>(scaled[1]));
+      const std::size_t iz = std::min(mesh_n - 1, static_cast<std::size_t>(scaled[2]));
+      mass_mesh[flatten(ix, iy, iz, mesh_n)] += mass_code;
+    } else if (options.mass_assignment == PowerSpectrumMassAssignment::kCloudInCell) {
+      std::array<std::size_t, 3> lower{};
+      std::array<std::size_t, 3> upper{};
+      std::array<double, 3> upper_weight{};
+      for (std::size_t axis = 0; axis < 3; ++axis) {
+        lower[axis] = std::min(mesh_n - 1, static_cast<std::size_t>(scaled[axis]));
+        upper[axis] = (lower[axis] + 1) % mesh_n;
+        upper_weight[axis] = scaled[axis] - std::floor(scaled[axis]);
+      }
+      for (std::size_t dx = 0; dx < 2; ++dx) {
+        const double wx = dx == 0 ? 1.0 - upper_weight[0] : upper_weight[0];
+        const std::size_t ix = dx == 0 ? lower[0] : upper[0];
+        for (std::size_t dy = 0; dy < 2; ++dy) {
+          const double wy = dy == 0 ? 1.0 - upper_weight[1] : upper_weight[1];
+          const std::size_t iy = dy == 0 ? lower[1] : upper[1];
+          for (std::size_t dz = 0; dz < 2; ++dz) {
+            const double wz = dz == 0 ? 1.0 - upper_weight[2] : upper_weight[2];
+            const std::size_t iz = dz == 0 ? lower[2] : upper[2];
+            mass_mesh[flatten(ix, iy, iz, mesh_n)] += mass_code * wx * wy * wz;
+          }
+        }
+      }
+    } else {
+      throw std::invalid_argument("power spectrum estimate received an unknown mass-assignment policy");
+    }
+    total_mass_code += mass_code;
+    mass_square_sum_code += mass_code * mass_code;
+  }
+  if (!std::isfinite(total_mass_code) || total_mass_code <= 0.0 ||
+      !std::isfinite(mass_square_sum_code)) {
+    throw std::invalid_argument("power spectrum estimate has no finite positive total mass");
+  }
+
+  const double mean_cell_mass_code = total_mass_code / static_cast<double>(mesh_count);
+  std::vector<double> delta(mesh_count, 0.0);
+  for (std::size_t index = 0; index < mesh_count; ++index) {
+    delta[index] = mass_mesh[index] / mean_cell_mass_code - 1.0;
+  }
+
+  const std::size_t nyquist_mode = mesh_n / 2;
+  const double k_fundamental_code = k_two_pi / box_size_code;
+  const double k_max_code =
+      std::sqrt(3.0) * static_cast<double>(nyquist_mode) * k_fundamental_code;
+  const double bin_width_code = k_max_code / static_cast<double>(options.bin_count);
+  const double volume_code = box_size_code * box_size_code * box_size_code;
+  const double shot_noise_code_volume =
+      volume_code * mass_square_sum_code / (total_mass_code * total_mass_code);
+
+  std::vector<double> power_sum(options.bin_count, 0.0);
+  std::vector<double> k_sum(options.bin_count, 0.0);
+  std::vector<std::uint64_t> mode_count(options.bin_count, 0);
+  const int assignment_window_exponent =
+      options.mass_assignment == PowerSpectrumMassAssignment::kCloudInCell ? 2 : 1;
+
+  for (std::size_t nx = 0; nx < mesh_n; ++nx) {
+    const int kx_int = nx <= nyquist_mode
+        ? static_cast<int>(nx)
+        : static_cast<int>(nx) - static_cast<int>(mesh_n);
+    for (std::size_t ny = 0; ny < mesh_n; ++ny) {
+      const int ky_int = ny <= nyquist_mode
+          ? static_cast<int>(ny)
+          : static_cast<int>(ny) - static_cast<int>(mesh_n);
+      for (std::size_t nz = 0; nz < mesh_n; ++nz) {
+        const int kz_int = nz <= nyquist_mode
+            ? static_cast<int>(nz)
+            : static_cast<int>(nz) - static_cast<int>(mesh_n);
+        if (kx_int == 0 && ky_int == 0 && kz_int == 0) {
+          continue;
+        }
+
+        const double k_magnitude_code = std::sqrt(
+            static_cast<double>(kx_int) * static_cast<double>(kx_int) +
+            static_cast<double>(ky_int) * static_cast<double>(ky_int) +
+            static_cast<double>(kz_int) * static_cast<double>(kz_int)) *
+            k_fundamental_code;
+        const std::size_t bin_index = std::min(
+            options.bin_count - 1,
+            static_cast<std::size_t>(k_magnitude_code / bin_width_code));
+        std::complex<double> delta_k{0.0, 0.0};
+        for (std::size_t ix = 0; ix < mesh_n; ++ix) {
+          for (std::size_t iy = 0; iy < mesh_n; ++iy) {
+            for (std::size_t iz = 0; iz < mesh_n; ++iz) {
+              const double phase = -k_two_pi * (
+                  static_cast<double>(kx_int) * static_cast<double>(ix) +
+                  static_cast<double>(ky_int) * static_cast<double>(iy) +
+                  static_cast<double>(kz_int) * static_cast<double>(iz)) /
+                  static_cast<double>(mesh_n);
+              delta_k += delta[flatten(ix, iy, iz, mesh_n)] *
+                  std::complex<double>(std::cos(phase), std::sin(phase));
+            }
+          }
+        }
+        delta_k /= static_cast<double>(mesh_count);
+        double power_code_volume = volume_code * std::norm(delta_k);
+        if (options.window_correction ==
+            PowerSpectrumWindowCorrection::kDeconvolveAssignmentWindow) {
+          const auto axis_window = [mesh_n, assignment_window_exponent](int mode) {
+            return std::pow(
+                sinc(std::numbers::pi_v<double> * static_cast<double>(mode) /
+                     static_cast<double>(mesh_n)),
+                assignment_window_exponent);
+          };
+          const double assignment_window =
+              axis_window(kx_int) * axis_window(ky_int) * axis_window(kz_int);
+          power_code_volume /= std::max(assignment_window * assignment_window, 1.0e-24);
+        } else if (options.window_correction != PowerSpectrumWindowCorrection::kNone) {
+          throw std::invalid_argument("power spectrum estimate received an unknown window-correction policy");
+        }
+        if (options.shot_noise_policy == PowerSpectrumShotNoisePolicy::kSubtractPoisson) {
+          power_code_volume -= shot_noise_code_volume;
+        } else if (options.shot_noise_policy !=
+                   PowerSpectrumShotNoisePolicy::kReportWithoutSubtraction) {
+          throw std::invalid_argument("power spectrum estimate received an unknown shot-noise policy");
+        }
+        power_sum[bin_index] += power_code_volume;
+        k_sum[bin_index] += k_magnitude_code;
+        ++mode_count[bin_index];
+      }
+    }
+  }
+
+  PowerSpectrumEstimate estimate;
+  estimate.options = options;
+  estimate.box_size_code = box_size_code;
+  estimate.k_fundamental_code = k_fundamental_code;
+  estimate.k_axis_nyquist_code = static_cast<double>(nyquist_mode) * k_fundamental_code;
+  estimate.poisson_shot_noise_code_volume = shot_noise_code_volume;
+  estimate.bins.reserve(options.bin_count);
+  for (std::size_t bin_index = 0; bin_index < options.bin_count; ++bin_index) {
+    const bool empty = mode_count[bin_index] == 0;
+    const double lower_code = static_cast<double>(bin_index) * bin_width_code;
+    const double upper_code = static_cast<double>(bin_index + 1) * bin_width_code;
+    estimate.bins.push_back(PowerSpectrumEstimateBin{
+        .bin_index = bin_index,
+        .k_lower_code = lower_code,
+        .k_upper_code = upper_code,
+        .k_center_code = empty
+            ? 0.5 * (lower_code + upper_code)
+            : k_sum[bin_index] / static_cast<double>(mode_count[bin_index]),
+        .power_code_volume = empty
+            ? 0.0
+            : power_sum[bin_index] / static_cast<double>(mode_count[bin_index]),
+        .mode_count = mode_count[bin_index],
+        .empty = empty,
+    });
+  }
+  return estimate;
+}
+
+PowerSpectrumEstimate DiagnosticsEngine::computePowerSpectrumEstimateReferenceDirectDft(
+    const core::SimulationState& state,
+    const PowerSpectrumEstimateOptions& options) const {
+  return computePowerSpectrumEstimateReferenceDirectDft(
+      buildDiagnosticsStateView(state).particles, options);
+}
+
+std::vector<StarFormationHistoryBin> DiagnosticsEngine::computeStarFormationHistory(
+    const StarFormationHistoryView& stars,
+    std::size_t bin_count) const {
+  if (bin_count == 0) {
+    throw std::invalid_argument("sf history requires bin_count > 0");
+  }
+
+  std::vector<double> mass_sum(bin_count, 0.0);
+  for (std::size_t i = 0; i < stars.birth_mass_code.size(); ++i) {
+    const double a = std::clamp(stars.formation_scale_factor[i], 0.0, 1.0);
+    const std::size_t bin = std::min(bin_count - 1, static_cast<std::size_t>(a * static_cast<double>(bin_count)));
+    mass_sum[bin] += stars.birth_mass_code[i];
+  }
+
+  std::vector<StarFormationHistoryBin> result;
+  result.reserve(bin_count);
+  for (std::size_t i = 0; i < bin_count; ++i) {
+    result.push_back(StarFormationHistoryBin{
+        .scale_factor_center = (static_cast<double>(i) + 0.5) / static_cast<double>(bin_count),
+        .formed_mass_code = mass_sum[i],
+    });
+  }
+  return result;
+}
+
+std::vector<StarFormationHistoryBin> DiagnosticsEngine::computeStarFormationHistory(
+    const core::SimulationState& state,
+    std::size_t bin_count) const {
+  return computeStarFormationHistory(buildDiagnosticsStateView(state).stars, bin_count);
+}
+
+AngularMomentumBudget DiagnosticsEngine::computeAngularMomentumBudget(const ParticleDiagnosticsView& particles) const {
+  AngularMomentumBudget budget;
+  for (std::size_t i = 0; i < particles.mass_code.size(); ++i) {
+    const double mass = particles.mass_code[i];
+    const std::array<double, 3> r = {
+        particles.position_x_comoving[i],
+        particles.position_y_comoving[i],
+        particles.position_z_comoving[i]};
+    const std::array<double, 3> v = {
+        particles.velocity_x_peculiar[i],
+        particles.velocity_y_peculiar[i],
+        particles.velocity_z_peculiar[i]};
+
+    const std::array<double, 3> l = {
+        mass * (r[1] * v[2] - r[2] * v[1]),
+        mass * (r[2] * v[0] - r[0] * v[2]),
+        mass * (r[0] * v[1] - r[1] * v[0])};
+
+    for (std::size_t j = 0; j < 3; ++j) {
+      budget.total_l_code[j] += l[j];
+    }
+
+    const auto species = particles.homogeneous_dmo_species
+        ? core::ParticleSpecies::kDarkMatter
+        : static_cast<core::ParticleSpecies>(particles.species_tag[i]);
+    std::array<double, 3>* target = nullptr;
+    switch (species) {
+      case core::ParticleSpecies::kDarkMatter:
+        target = &budget.dark_matter_l_code;
+        break;
+      case core::ParticleSpecies::kGas:
+        target = &budget.gas_l_code;
+        break;
+      case core::ParticleSpecies::kStar:
+        target = &budget.star_l_code;
+        break;
+      case core::ParticleSpecies::kBlackHole:
+        target = &budget.black_hole_l_code;
+        break;
+      case core::ParticleSpecies::kTracer:
+        break;
+    }
+    if (target != nullptr) {
+      for (std::size_t j = 0; j < 3; ++j) {
+        (*target)[j] += l[j];
+      }
+    }
+  }
+  return budget;
+}
+
+AngularMomentumBudget DiagnosticsEngine::computeAngularMomentumBudget(const core::SimulationState& state) const {
+  return computeAngularMomentumBudget(buildDiagnosticsStateView(state).particles);
+}
+
+std::vector<double> DiagnosticsEngine::computeGasXySliceDensity(
+    const GasDiagnosticsView& gas_cells,
+    std::size_t grid_n) const {
+  auto accumulation = accumulateGasXySliceDensity(
+      gas_cells, grid_n, m_config.cosmology.box_size_mpc_comoving);
+  for (std::size_t i = 0; i < accumulation.density_sum.size(); ++i) {
+    if (accumulation.sample_count[i] != 0U) {
+      accumulation.density_sum[i] /=
+          static_cast<double>(accumulation.sample_count[i]);
+    }
+  }
+  return accumulation.density_sum;
+}
+
+std::vector<double> DiagnosticsEngine::computeGasXySliceDensity(
+    const core::SimulationState& state,
+    std::size_t grid_n) const {
+  return computeGasXySliceDensity(buildDiagnosticsStateView(state).gas_cells, grid_n);
+}
+
+std::vector<double> DiagnosticsEngine::computeGasXyProjectionDensity(
+    const GasDiagnosticsView& gas_cells,
+    std::size_t grid_n) const {
+  const double box = m_config.cosmology.box_size_mpc_comoving;
+  const double cell_size = box / static_cast<double>(grid_n);
+
+  std::vector<double> projection(grid_n * grid_n, 0.0);
+  for (std::size_t i = 0; i < gas_cells.mass_code.size(); ++i) {
+    const std::size_t ix = std::min(grid_n - 1, static_cast<std::size_t>(std::fmod(std::fmod(gas_cells.center_x_comoving[i], box) + box, box) / cell_size));
+    const std::size_t iy = std::min(grid_n - 1, static_cast<std::size_t>(std::fmod(std::fmod(gas_cells.center_y_comoving[i], box) + box, box) / cell_size));
+    projection[flatten2(ix, iy, grid_n)] += gas_cells.density_code[i];
+  }
+
+  return projection;
+}
+
+std::vector<double> DiagnosticsEngine::computeGasXyProjectionDensity(
+    const core::SimulationState& state,
+    std::size_t grid_n) const {
+  return computeGasXyProjectionDensity(buildDiagnosticsStateView(state).gas_cells, grid_n);
+}
+
+std::uint64_t DiagnosticsEngine::estimateBundleIncrementalBytes(
+    DiagnosticClass diagnostic_class, const core::SimulationState& state) const {
+  const auto add = [](std::uint64_t lhs, std::uint64_t rhs) {
+    return core::checkedMemoryBytesAdd(lhs, rhs, "analysis bundle incremental peak");
+  };
+  const auto mul = [](std::uint64_t lhs, std::uint64_t rhs) {
+    if (lhs != 0U && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+      throw std::overflow_error("analysis bundle byte count overflow");
+    }
+    return lhs * rhs;
+  };
+  // Bounded metadata allowance: labels, report entries, JSON formatting and
+  // filesystem bookkeeping. Population-scale scientific arrays are explicit
+  // below. This is an engineering allowance, not a physical-memory measurement.
+  std::uint64_t bytes = 8U * 1024U * 1024U;
+  if (diagnostic_class != DiagnosticClass::kRunHealth) {
+    const auto bins = static_cast<std::uint64_t>(m_config.analysis.sf_history_bin_count);
+    const auto n = static_cast<std::uint64_t>(m_config.analysis.quicklook_grid_n);
+    bytes = add(bytes, mul(bins, sizeof(double) + sizeof(StarFormationHistoryBin)));
+    // Two persistent image arrays and a temporary count array coexist.
+    bytes = add(bytes, mul(mul(n, n), 2U * sizeof(double) + sizeof(std::uint32_t)));
+  }
+  if (diagnostic_class == DiagnosticClass::kScienceHeavy &&
+      m_config.analysis.diagnostics_execution_policy ==
+          core::AnalysisConfig::DiagnosticsExecutionPolicy::kAllIncludingProvisional) {
+    bytes = add(bytes, estimatePowerSpectrumMemory(
+        static_cast<std::size_t>(m_config.analysis.power_spectrum_mesh_n),
+        static_cast<std::size_t>(m_config.analysis.power_spectrum_bin_count),
+        static_cast<std::size_t>(core::openMpMaximumThreads())).owned_peak_bytes);
+  }
+  bytes = add(bytes, core::OwnershipValidationWorkspace::requiredBytes(
+      state.particles.size(), state.cells.size(),
+      state.star_particles.size() != 0U, state.black_holes.size() != 0U,
+      state.tracers.size() != 0U,
+      state.patches.size() != 0U && state.cells.size() != 0U,
+      !state.hasCertifiedUniqueParticleIds()));
+  return bytes;
+}
+
+DiagnosticsBundle DiagnosticsEngine::generateBundle(
+    const core::SimulationState& state,
+    std::uint64_t step_index,
+    double scale_factor,
+    DiagnosticClass diagnostic_class,
+    const core::TransientStepWorkspace* workspace,
+    core::MemoryReservation* enclosing_reservation,
+    bool allow_power_spectrum) const {
+  core::MemoryReservation local_reservation;
+  core::MemoryReservation* reservation = enclosing_reservation != nullptr
+      ? enclosing_reservation : &local_reservation;
+  if (m_memory_governor != nullptr) {
+    const std::uint64_t required_bytes =
+        estimateBundleIncrementalBytes(diagnostic_class, state);
+    if (reservation->committed()) {
+      if (reservation->bytes() < required_bytes) {
+        throw std::logic_error("analysis bundle enclosing lease is insufficient");
+      }
+    } else {
+      if (reservation->valid()) {
+        throw std::logic_error("analysis bundle requires an empty or committed lease");
+      }
+      *reservation = m_memory_governor->reserve(
+          core::MemoryClass::kDiagnostic, required_bytes,
+          "analysis.diagnostics.bundle");
+      reservation->commit();
+    }
+  }
+  core::OwnershipValidationWorkspace validation_scratch;
+  validation_scratch.resize(state.particles.size(), state.cells.size());
+  DiagnosticsBundle bundle;
+  bundle.step_index = step_index;
+  bundle.scale_factor = scale_factor;
+  bundle.diagnostic_class = diagnostic_class;
+  bundle.diagnostics_execution_policy = m_config.analysis.diagnostics_execution_policy;
+  const DiagnosticsStateView view = buildDiagnosticsStateView(state, &validation_scratch);
+  bundle.health = computeRunHealth(view);
+  bundle.memory_report = core::collectSimulationMemoryReport(state, workspace);
+  bundle.records.push_back(DiagnosticRecord{
+      .name = "run_health_counters",
+      .tier = DiagnosticTier::kInfrastructureHealth,
+      .maturity = DiagnosticMaturity::kProduction,
+      .scalability = DiagnosticScalability::kCheap,
+      .executed = true,
+      .policy_note = "always_on_for_integrity_checks",
+  });
+  bundle.records.push_back(DiagnosticRecord{
+      .name = "gravity_health_summary",
+      .tier = DiagnosticTier::kInfrastructureHealth,
+      .maturity = DiagnosticMaturity::kProduction,
+      .scalability = DiagnosticScalability::kCheap,
+      .executed = true,
+      .policy_note = "always_on_gravity_state_sanity",
+  });
+
+  if (diagnostic_class == DiagnosticClass::kScienceLight || diagnostic_class == DiagnosticClass::kScienceHeavy) {
+    bundle.star_formation_history =
+        computeStarFormationHistory(view.stars, static_cast<std::size_t>(m_config.analysis.sf_history_bin_count));
+    bundle.records.push_back(DiagnosticRecord{
+        .name = "star_formation_history",
+        .tier = DiagnosticTier::kValidatedScience,
+        .maturity = DiagnosticMaturity::kValidated,
+        .scalability = DiagnosticScalability::kModerate,
+        .executed = true,
+        .policy_note = "validated_lightweight_science",
+    });
+    bundle.angular_momentum = computeAngularMomentumBudget(view.particles);
+    bundle.records.push_back(DiagnosticRecord{
+        .name = "angular_momentum_budget",
+        .tier = DiagnosticTier::kValidatedScience,
+        .maturity = DiagnosticMaturity::kValidated,
+        .scalability = DiagnosticScalability::kModerate,
+        .executed = true,
+        .policy_note = "validated_lightweight_science",
+    });
+    bundle.quicklook_grid_n = static_cast<std::size_t>(m_config.analysis.quicklook_grid_n);
+    auto slice_accumulation = accumulateGasXySliceDensity(
+        view.gas_cells, bundle.quicklook_grid_n,
+        m_config.cosmology.box_size_mpc_comoving);
+    bundle.xy_slice_sample_count = std::move(slice_accumulation.sample_count);
+    bundle.xy_slice_density_code = std::move(slice_accumulation.density_sum);
+    for (std::size_t i = 0; i < bundle.xy_slice_density_code.size(); ++i) {
+      if (bundle.xy_slice_sample_count[i] != 0U) {
+        bundle.xy_slice_density_code[i] /=
+            static_cast<double>(bundle.xy_slice_sample_count[i]);
+      }
+    }
+    bundle.xy_projection_density_code = computeGasXyProjectionDensity(view.gas_cells, bundle.quicklook_grid_n);
+    bundle.records.push_back(DiagnosticRecord{
+        .name = "gas_xy_slice_density",
+        .tier = DiagnosticTier::kValidatedScience,
+        .maturity = DiagnosticMaturity::kValidated,
+        .scalability = DiagnosticScalability::kModerate,
+        .executed = true,
+        .policy_note = "validated_lightweight_science",
+    });
+    bundle.records.push_back(DiagnosticRecord{
+        .name = "gas_xy_projection_density",
+        .tier = DiagnosticTier::kValidatedScience,
+        .maturity = DiagnosticMaturity::kValidated,
+        .scalability = DiagnosticScalability::kModerate,
+        .executed = true,
+        .policy_note = "validated_lightweight_science",
+    });
+  }
+
+  if (diagnostic_class == DiagnosticClass::kScienceHeavy) {
+    // The FFT estimator is computationally production-scalable but remains
+    // scientifically provisional. The opt-in policy therefore controls scheduling,
+    // not which numerical backend is used once scheduled.
+    const bool power_spectrum_scheduled =
+        allow_power_spectrum &&
+        (m_config.analysis.diagnostics_execution_policy ==
+         core::AnalysisConfig::DiagnosticsExecutionPolicy::kAllIncludingProvisional);
+    if (power_spectrum_scheduled) {
+      bundle.power_spectrum = computePowerSpectrumImpl(
+          view.particles,
+          static_cast<std::size_t>(m_config.analysis.power_spectrum_mesh_n),
+          static_cast<std::size_t>(m_config.analysis.power_spectrum_bin_count),
+          reservation->committed() ? reservation : nullptr);
+    }
+    bundle.records.push_back(DiagnosticRecord{
+        .name = "power_spectrum",
+        .tier = DiagnosticTier::kProvisionalScience,
+        .implementation_maturity = DiagnosticImplementationMaturity::kProductionScalable,
+        .maturity = DiagnosticMaturity::kProvisional,
+        .scalability = DiagnosticScalability::kScalableFft,
+        .executed = power_spectrum_scheduled,
+        .policy_note = power_spectrum_scheduled
+            ? "scientifically_provisional_scalable_fft"
+            : (allow_power_spectrum
+                ? "blocked_by_scientific_validation_policy"
+                : "unsupported_under_mpi_requires_global_density_fft"),
+    });
+  }
+
+  return bundle;
+}
+
+void reduceDiagnosticsBundleAcrossRanks(
+    DiagnosticsBundle& bundle,
+    const parallel::MpiContext& mpi_context) {
+  const int rank_count = std::max(mpi_context.worldSize(), 1);
+
+  std::array<std::uint64_t, 7> additive_counts{
+      bundle.health.particle_count,
+      bundle.health.cell_count,
+      bundle.health.star_count,
+      bundle.health.non_finite_particles,
+      bundle.health.non_finite_cells,
+      bundle.health.non_finite_gravity_softening,
+      bundle.health.non_positive_particle_mass,
+  };
+  mpi_context.allreduceSumUint64sInPlace(additive_counts);
+  bundle.health.particle_count = additive_counts[0];
+  bundle.health.cell_count = additive_counts[1];
+  bundle.health.star_count = additive_counts[2];
+  bundle.health.non_finite_particles = additive_counts[3];
+  bundle.health.non_finite_cells = additive_counts[4];
+  bundle.health.non_finite_gravity_softening = additive_counts[5];
+  bundle.health.non_positive_particle_mass = additive_counts[6];
+
+  bundle.health.ownership_invariants_failed_ranks = mpi_context.allreduceSumUint64(
+      bundle.health.ownership_invariants_ok ? 0U : 1U);
+  bundle.health.unique_particle_ids_failed_ranks = mpi_context.allreduceSumUint64(
+      bundle.health.unique_particle_ids_ok ? 0U : 1U);
+  bundle.health.gravity_softening_sidecar_size_failed_ranks = mpi_context.allreduceSumUint64(
+      bundle.health.gravity_softening_sidecar_size_ok ? 0U : 1U);
+  bundle.health.ownership_invariants_ok =
+      bundle.health.ownership_invariants_failed_ranks == 0U;
+  bundle.health.unique_particle_ids_ok =
+      bundle.health.unique_particle_ids_failed_ranks == 0U;
+  bundle.health.gravity_softening_sidecar_size_ok =
+      bundle.health.gravity_softening_sidecar_size_failed_ranks == 0U;
+
+  std::array<double, 15> angular{};
+  std::size_t angular_index = 0U;
+  const auto pack = [&](const std::array<double, 3>& vector) {
+    for (double value : vector) {
+      angular[angular_index++] = value;
+    }
+  };
+  pack(bundle.angular_momentum.total_l_code);
+  pack(bundle.angular_momentum.gas_l_code);
+  pack(bundle.angular_momentum.star_l_code);
+  pack(bundle.angular_momentum.dark_matter_l_code);
+  pack(bundle.angular_momentum.black_hole_l_code);
+  mpi_context.allreduceSumDoublesInPlace(angular);
+  angular_index = 0U;
+  const auto unpack = [&](std::array<double, 3>& vector) {
+    for (double& value : vector) {
+      value = angular[angular_index++];
+    }
+  };
+  unpack(bundle.angular_momentum.total_l_code);
+  unpack(bundle.angular_momentum.gas_l_code);
+  unpack(bundle.angular_momentum.star_l_code);
+  unpack(bundle.angular_momentum.dark_matter_l_code);
+  unpack(bundle.angular_momentum.black_hole_l_code);
+
+  if (!bundle.star_formation_history.empty()) {
+    std::vector<double> formed_mass(bundle.star_formation_history.size(), 0.0);
+    for (std::size_t i = 0; i < formed_mass.size(); ++i) {
+      formed_mass[i] = bundle.star_formation_history[i].formed_mass_code;
+    }
+    mpi_context.allreduceSumDoublesInPlace(formed_mass);
+    for (std::size_t i = 0; i < formed_mass.size(); ++i) {
+      bundle.star_formation_history[i].formed_mass_code = formed_mass[i];
+    }
+  }
+
+  if (!bundle.xy_slice_density_code.empty()) {
+    if (bundle.xy_slice_sample_count.size() != bundle.xy_slice_density_code.size()) {
+      throw std::logic_error("distributed diagnostics slice sample-count shape mismatch");
+    }
+    for (std::size_t i = 0; i < bundle.xy_slice_density_code.size(); ++i) {
+      bundle.xy_slice_density_code[i] *=
+          static_cast<double>(bundle.xy_slice_sample_count[i]);
+    }
+    mpi_context.allreduceSumDoublesInPlace(bundle.xy_slice_density_code);
+    mpi_context.allreduceSumUint64sInPlace(bundle.xy_slice_sample_count);
+    for (std::size_t i = 0; i < bundle.xy_slice_density_code.size(); ++i) {
+      if (bundle.xy_slice_sample_count[i] != 0U) {
+        bundle.xy_slice_density_code[i] /=
+            static_cast<double>(bundle.xy_slice_sample_count[i]);
+      }
+    }
+  }
+  if (!bundle.xy_projection_density_code.empty()) {
+    mpi_context.allreduceSumDoublesInPlace(bundle.xy_projection_density_code);
+  }
+
+  if (rank_count > 1 && !bundle.power_spectrum.empty()) {
+    bundle.power_spectrum.clear();
+    for (DiagnosticRecord& record : bundle.records) {
+      if (record.name == "power_spectrum") {
+        record.executed = false;
+        record.policy_note =
+            "unsupported_under_mpi_requires_global_density_fft";
+      }
+    }
+  }
+  bundle.globally_reduced = true;
+  bundle.contributing_rank_count = rank_count;
+}
+
+void DiagnosticsEngine::writeBundle(const DiagnosticsBundle& bundle) const {
+  const std::filesystem::path output_path = bundlePath(bundle);
+  std::filesystem::create_directories(output_path.parent_path());
+  std::filesystem::path output_partial_path = output_path;
+  output_partial_path += ".part";
+
+  std::ofstream out(output_partial_path, std::ios::trunc);
+  if (!out) {
+    throw std::runtime_error("failed to open diagnostics bundle path: " + output_partial_path.string());
+  }
+  out << std::setprecision(17);
+  out << "{\n";
+  out << "  \"schema_version\": 1,\n";
+  out << "  \"run_name\": \"" << m_config.output.run_name << "\",\n";
+  out << "  \"diagnostic_class\": \"" << diagnosticClassLabel(bundle.diagnostic_class) << "\",\n";
+  out << "  \"diagnostics_execution_policy\": \"" << executionPolicyLabel(bundle.diagnostics_execution_policy)
+      << "\",\n";
+  out << "  \"step_index\": " << bundle.step_index << ",\n";
+  out << "  \"scale_factor\": " << bundle.scale_factor << ",\n";
+  out << "  \"scope\": \"" << (bundle.globally_reduced ? "global" : "rank_local") << "\",\n";
+  out << "  \"contributing_rank_count\": " << bundle.contributing_rank_count << ",\n";
+  out << "  \"units\": {\"frame\": \"comoving\", \"mass\": \"code\", \"length\": \"code\"},\n";
+  out << "  \"health\": {\"particle_count\": " << bundle.health.particle_count
+      << ", \"cell_count\": " << bundle.health.cell_count << ", \"star_count\": " << bundle.health.star_count
+      << ", \"ownership_invariants_ok\": " << (bundle.health.ownership_invariants_ok ? "true" : "false")
+      << ", \"unique_particle_ids_ok\": " << (bundle.health.unique_particle_ids_ok ? "true" : "false")
+      << ", \"gravity_softening_sidecar_size_ok\": "
+      << (bundle.health.gravity_softening_sidecar_size_ok ? "true" : "false")
+      << ", \"non_finite_particles\": " << bundle.health.non_finite_particles
+      << ", \"non_finite_cells\": " << bundle.health.non_finite_cells
+      << ", \"non_finite_gravity_softening\": " << bundle.health.non_finite_gravity_softening
+      << ", \"non_positive_particle_mass\": " << bundle.health.non_positive_particle_mass
+      << ", \"ownership_invariants_failed_ranks\": " << bundle.health.ownership_invariants_failed_ranks
+      << ", \"unique_particle_ids_failed_ranks\": " << bundle.health.unique_particle_ids_failed_ranks
+      << ", \"gravity_softening_sidecar_size_failed_ranks\": "
+      << bundle.health.gravity_softening_sidecar_size_failed_ranks << "},\n";
+
+  out << "  \"memory_report\": {\n";
+  out << "    \"persistent_total_bytes\": " << bundle.memory_report.totals.persistent_total_bytes << ",\n";
+  out << "    \"transient_total_bytes\": " << bundle.memory_report.totals.transient_total_bytes << ",\n";
+  out << "    \"publisher_rank_local_owned_bytes\": "
+      << (bundle.memory_report.totals.persistent_total_bytes + bundle.memory_report.totals.transient_total_bytes) << ",\n";
+  out << "    \"distributed\": {\"valid\": "
+      << (bundle.memory_report.distributed.valid ? "true" : "false")
+      << ", \"rank_count\": " << bundle.memory_report.distributed.rank_count
+      << ", \"rank_sum_owned_bytes\": " << bundle.memory_report.distributed.global_sum_owned_bytes
+      << ", \"rank_max_owned_bytes\": " << bundle.memory_report.distributed.rank_max_owned_bytes
+      << ", \"max_mean_imbalance\": " << bundle.memory_report.distributed.max_to_mean_imbalance_ratio
+      << "},\n";
+  out << "    \"subsystems\": [";
+  for (std::size_t i = 0; i < static_cast<std::size_t>(core::MemorySubsystem::kCount); ++i) {
+    const auto subsystem = static_cast<core::MemorySubsystem>(i);
+    out << (i == 0 ? "\n" : ",\n");
+    out << "      {\"name\": \"" << core::memorySubsystemLabel(subsystem)
+        << "\", \"persistent_bytes\": " << bundle.memory_report.totals.persistent_by_subsystem[i]
+        << ", \"transient_bytes\": " << bundle.memory_report.totals.transient_by_subsystem[i] << "}";
+  }
+  out << "\n    ],\n";
+  out << "    \"notes\": [";
+  for (std::size_t i = 0; i < bundle.memory_report.notes.size(); ++i) {
+    out << (i == 0 ? "\n" : ",\n");
+    out << "      \"" << bundle.memory_report.notes[i] << "\"";
+  }
+  out << "\n    ]\n";
+  out << "  },\n";
+  out << "  \"diagnostic_records\": [";
+  for (std::size_t i = 0; i < bundle.records.size(); ++i) {
+    const auto& record = bundle.records[i];
+    out << (i == 0 ? "" : ", ") << "{\"name\": \"" << record.name << "\", \"tier\": \""
+        << diagnosticTierLabel(record.tier) << "\", \"implementation_maturity\": \""
+        << diagnosticImplementationMaturityLabel(record.implementation_maturity)
+        << "\", \"scientific_maturity\": \"" << diagnosticMaturityLabel(record.maturity)
+        << "\", \"maturity\": \"" << diagnosticMaturityLabel(record.maturity)
+        << "\", \"scalability\": \"" << diagnosticScalabilityLabel(record.scalability)
+        << "\", \"executed\": " << (record.executed ? "true" : "false") << ", \"policy_note\": \""
+        << record.policy_note << "\"}";
+  }
+  out << "],\n";
+
+  out << "  \"angular_momentum_budget\": {\"total_norm\": " << magnitude(bundle.angular_momentum.total_l_code)
+      << ", \"gas_norm\": " << magnitude(bundle.angular_momentum.gas_l_code)
+      << ", \"star_norm\": " << magnitude(bundle.angular_momentum.star_l_code)
+      << ", \"dark_matter_norm\": " << magnitude(bundle.angular_momentum.dark_matter_l_code)
+      << ", \"black_hole_norm\": " << magnitude(bundle.angular_momentum.black_hole_l_code) << "},\n";
+
+  out << "  \"power_spectrum\": [";
+  for (std::size_t i = 0; i < bundle.power_spectrum.size(); ++i) {
+    const auto& b = bundle.power_spectrum[i];
+    out << (i == 0 ? "" : ", ") << "{\"k_code\": " << b.k_center_code << ", \"p_code_volume\": "
+        << b.power_code_volume << ", \"mode_count\": " << b.mode_count << "}";
+  }
+  out << "],\n";
+
+  out << "  \"sf_history\": [";
+  for (std::size_t i = 0; i < bundle.star_formation_history.size(); ++i) {
+    const auto& b = bundle.star_formation_history[i];
+    out << (i == 0 ? "" : ", ")
+        << "{\"scale_factor\": " << b.scale_factor_center << ", \"formed_mass_code\": " << b.formed_mass_code
+        << "}";
+  }
+  out << "]\n";
+  out << "}\n";
+  out.close();
+  if (!out) {
+    throw std::runtime_error("failed while writing diagnostics bundle path: " + output_partial_path.string());
+  }
+  std::error_code bundle_remove_error;
+  std::filesystem::remove(output_path, bundle_remove_error);
+  std::error_code bundle_rename_error;
+  std::filesystem::rename(output_partial_path, output_path, bundle_rename_error);
+  if (bundle_rename_error) {
+    throw std::runtime_error("failed to publish diagnostics bundle path: " + bundle_rename_error.message());
+  }
+
+  if (!bundle.star_formation_history.empty()) {
+    const std::filesystem::path history_path =
+        diagnosticsOutputDirectory().parent_path() / "sfr_history.csv";
+    std::filesystem::path partial_path = history_path;
+    partial_path += ".part";
+    std::ofstream history(partial_path, std::ios::trunc);
+    if (!history) {
+      throw std::runtime_error(
+          "failed to open star-formation history path: " + partial_path.string());
+    }
+    history << std::setprecision(17);
+    history << "scale_factor,redshift,formed_mass_code,cumulative_stellar_birth_mass_code\n";
+    double cumulative_birth_mass_code = 0.0;
+    for (const StarFormationHistoryBin& bin : bundle.star_formation_history) {
+      cumulative_birth_mass_code += bin.formed_mass_code;
+      const double redshift = bin.scale_factor_center > 0.0
+          ? 1.0 / bin.scale_factor_center - 1.0
+          : std::numeric_limits<double>::infinity();
+      history << bin.scale_factor_center << ',' << redshift << ','
+              << bin.formed_mass_code << ',' << cumulative_birth_mass_code << '\n';
+    }
+    history.close();
+    if (!history) {
+      throw std::runtime_error(
+          "failed while writing star-formation history path: " + partial_path.string());
+    }
+    std::error_code remove_error;
+    std::filesystem::remove(history_path, remove_error);
+    std::error_code rename_error;
+    std::filesystem::rename(partial_path, history_path, rename_error);
+    if (rename_error) {
+      throw std::runtime_error(
+          "failed to finalize star-formation history path: " + rename_error.message());
+    }
+  }
+
+  if (!bundle.xy_projection_density_code.empty()) {
+    const std::filesystem::path quicklook = quicklookPath(bundle);
+    std::filesystem::path quicklook_partial = quicklook;
+    quicklook_partial += ".part";
+    std::ofstream csv(quicklook_partial, std::ios::trunc);
+    if (!csv) {
+      throw std::runtime_error("failed to open quicklook path: " + quicklook_partial.string());
+    }
+    const std::size_t n = bundle.quicklook_grid_n;
+    for (std::size_t ix = 0; ix < n; ++ix) {
+      for (std::size_t iy = 0; iy < n; ++iy) {
+        if (iy > 0) {
+          csv << ',';
+        }
+        csv << bundle.xy_projection_density_code[flatten2(ix, iy, n)];
+      }
+      csv << '\n';
+    }
+    csv.close();
+    if (!csv) {
+      throw std::runtime_error("failed while writing quicklook path: " + quicklook_partial.string());
+    }
+    std::error_code quicklook_remove_error;
+    std::filesystem::remove(quicklook, quicklook_remove_error);
+    std::error_code quicklook_rename_error;
+    std::filesystem::rename(quicklook_partial, quicklook, quicklook_rename_error);
+    if (quicklook_rename_error) {
+      throw std::runtime_error("failed to publish quicklook path: " + quicklook_rename_error.message());
+    }
+  }
+}
+
+void DiagnosticsEngine::enforceRetentionPolicy() const {
+  const std::filesystem::path output_dir = diagnosticsOutputDirectory();
+  if (!std::filesystem::exists(output_dir)) {
+    return;
+  }
+
+  std::vector<std::filesystem::path> json_files;
+  for (const auto& entry : std::filesystem::directory_iterator(output_dir)) {
+    if (entry.is_regular_file() && entry.path().extension() == ".json") {
+      json_files.push_back(entry.path());
+    }
+  }
+
+  std::sort(json_files.begin(), json_files.end());
+  const std::size_t keep = static_cast<std::size_t>(m_config.analysis.retention_bundle_count);
+  if (json_files.size() <= keep) {
+    return;
+  }
+
+  const std::size_t remove_count = json_files.size() - keep;
+  for (std::size_t i = 0; i < remove_count; ++i) {
+    const std::filesystem::path to_remove = json_files[i];
+    std::filesystem::remove(to_remove);
+
+    std::filesystem::path quicklook = to_remove;
+    quicklook.replace_extension(".csv");
+    std::filesystem::remove(quicklook);
+  }
+}
+
+std::filesystem::path DiagnosticsEngine::diagnosticsOutputDirectory() const {
+  return std::filesystem::path(m_config.output.output_directory) / m_config.output.run_name / "diagnostics";
+}
+
+std::filesystem::path DiagnosticsEngine::bundlePath(const DiagnosticsBundle& bundle) const {
+  std::ostringstream filename;
+  filename << m_config.analysis.diagnostics_stem << "_" << diagnosticClassLabel(bundle.diagnostic_class) << "_step_"
+           << std::setw(8) << std::setfill('0') << bundle.step_index << ".json";
+  return diagnosticsOutputDirectory() / filename.str();
+}
+
+std::filesystem::path DiagnosticsEngine::quicklookPath(const DiagnosticsBundle& bundle) const {
+  std::filesystem::path json = bundlePath(bundle);
+  json.replace_extension(".csv");
+  return json;
+}
+
+DiagnosticsCallback::DiagnosticsCallback(core::SimulationConfig config)
+    : m_engine(config), m_config(std::move(config)) {}
+
+std::string_view DiagnosticsCallback::callbackName() const { return "analysis_diagnostics"; }
+
+std::span<const core::IntegrationStage> DiagnosticsCallback::integrationStages() const {
+  static constexpr std::array stages{core::IntegrationStage::kAnalysisHooks};
+  return stages;
+}
+
+std::span<const core::StageContract> DiagnosticsCallback::stageContracts() const {
+  static constexpr std::array contracts{core::StageContract{
+      .stage = core::IntegrationStage::kAnalysisHooks,
+      .required_inputs = core::StageDataDomain::kParticles | core::StageDataDomain::kGasCells,
+      .mutated_state = core::StageDataDomain::kDiagnostics,
+      .produced_outputs = core::StageDataDomain::kDiagnostics,
+      .allowed_side_effects = core::StageDataDomain::kDiagnostics,
+      .sync_requirements = core::StageSyncRequirement::kGlobal,
+      .active_set_family = core::StageActiveSetFamily::kNone,
+      .restart_safety = core::StageSafety::kSafe,
+      .output_safety = core::StageSafety::kSafe,
+      .owner = core::StageSubsystem::kAnalysis,
+  }};
+  return contracts;
+}
+
+void DiagnosticsCallback::onStage(core::StepContext& context) {
+  if (context.stage != core::IntegrationStage::kAnalysisHooks) {
+    throw std::logic_error("analysis diagnostics handler received an unregistered stage");
+  }
+  if (!m_config.analysis.enable_diagnostics) {
+    return;
+  }
+
+  const std::uint64_t step = context.integrator_state.step_index;
+
+  if (step % static_cast<std::uint64_t>(m_config.analysis.run_health_interval_steps) == 0) {
+    runDiagnostics(context, DiagnosticClass::kRunHealth);
+  }
+  if (step % static_cast<std::uint64_t>(m_config.analysis.science_light_interval_steps) == 0) {
+    if (m_config.analysis.diagnostics_execution_policy !=
+        core::AnalysisConfig::DiagnosticsExecutionPolicy::kRunHealthOnly) {
+      runDiagnostics(context, DiagnosticClass::kScienceLight);
+    }
+  }
+  if (step % static_cast<std::uint64_t>(m_config.analysis.science_heavy_interval_steps) == 0) {
+    if (m_config.analysis.diagnostics_execution_policy ==
+        core::AnalysisConfig::DiagnosticsExecutionPolicy::kAllIncludingProvisional) {
+      runDiagnostics(context, DiagnosticClass::kScienceHeavy);
+    }
+  }
+
+  m_engine.enforceRetentionPolicy();
+}
+
+const DiagnosticsTiming& DiagnosticsCallback::timing() const noexcept { return m_timing; }
+
+void DiagnosticsCallback::runDiagnostics(core::StepContext& context, DiagnosticClass diagnostic_class) {
+  const auto begin = std::chrono::steady_clock::now();
+  const DiagnosticsBundle bundle = m_engine.generateBundle(
+      context.state,
+      context.integrator_state.step_index,
+      context.integrator_state.current_scale_factor,
+      diagnostic_class,
+      context.workspace);
+  m_engine.writeBundle(bundle);
+  const auto end = std::chrono::steady_clock::now();
+  const double elapsed_ms =
+      static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count()) / 1000.0;
+
+  if (diagnostic_class == DiagnosticClass::kRunHealth) {
+    m_timing.cumulative_run_health_ms += elapsed_ms;
+    ++m_timing.run_health_calls;
+  } else if (diagnostic_class == DiagnosticClass::kScienceLight) {
+    m_timing.cumulative_light_ms += elapsed_ms;
+    ++m_timing.light_calls;
+  } else {
+    m_timing.cumulative_heavy_ms += elapsed_ms;
+    ++m_timing.heavy_calls;
+  }
+}
+
+}  // namespace cosmosim::analysis

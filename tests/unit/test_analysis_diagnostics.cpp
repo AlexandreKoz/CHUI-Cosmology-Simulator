@@ -1,0 +1,501 @@
+#include <cassert>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <numeric>
+#include <limits>
+#include <stdexcept>
+
+#include "cosmosim/core/memory_governor.hpp"
+
+#include "cosmosim/analysis/diagnostics.hpp"
+
+namespace {
+
+cosmosim::core::SimulationConfig makeConfig() {
+  auto config = cosmosim::core::makeUnvalidatedSimulationConfigForTests();
+  config.output.run_name = "unit_analysis";
+  config.output.output_directory = "test_outputs";
+  config.cosmology.box_size_mpc_comoving = 1.0;
+  config.analysis.power_spectrum_mesh_n = 4;
+  config.analysis.power_spectrum_bin_count = 4;
+  config.analysis.quicklook_grid_n = 4;
+  config.analysis.sf_history_bin_count = 4;
+  config.analysis.diagnostics_stem = "diag";
+  return config;
+}
+
+cosmosim::core::SimulationState makeSingleModeState() {
+  cosmosim::core::SimulationState state;
+  state.resizeParticles(4);
+  state.resizeCells(4);
+  state.species.count_by_species = {4, 0, 0, 0, 0};
+  for (std::size_t i = 0; i < 4; ++i) {
+    state.particle_sidecar.particle_id[i] = 100 + i;
+    state.particle_sidecar.species_tag[i] = static_cast<std::uint32_t>(cosmosim::core::ParticleSpecies::kDarkMatter);
+    state.particles.mass_code[i] = 1.0;
+    state.particles.position_y_comoving[i] = 0.125;
+    state.particles.position_z_comoving[i] = 0.125;
+  }
+
+  state.particles.position_x_comoving[0] = 0.125;
+  state.particles.position_x_comoving[1] = 0.125;
+  state.particles.position_x_comoving[2] = 0.625;
+  state.particles.position_x_comoving[3] = 0.625;
+
+  for (std::size_t i = 0; i < 4; ++i) {
+    state.cells.center_x_comoving[i] = (static_cast<double>(i) + 0.5) / 4.0;
+    state.cells.center_y_comoving[i] = 0.125;
+    state.cells.center_z_comoving[i] = 0.5;
+    state.cells.mass_code[i] = 1.0;
+    state.gas_cells.density_code[i] = 2.0 + static_cast<double>(i);
+  }
+
+  state.rebuildSpeciesIndex();
+  return state;
+}
+
+void testPowerSpectrumHasSignalAndFiniteModes() {
+  cosmosim::analysis::DiagnosticsEngine engine(makeConfig());
+  const cosmosim::core::SimulationState state = makeSingleModeState();
+
+  const auto bins = engine.computePowerSpectrum(state, 4, 4);
+  assert(!bins.empty());
+
+  double summed_power = 0.0;
+  std::uint64_t total_modes = 0;
+  for (const auto& bin : bins) {
+    assert(std::isfinite(bin.k_center_code));
+    assert(std::isfinite(bin.power_code_volume));
+    assert(bin.mode_count > 0);
+    summed_power += bin.power_code_volume;
+    total_modes += bin.mode_count;
+  }
+
+  assert(summed_power > 0.0);
+  assert(total_modes > 0);
+}
+
+void testPowerOfTwoFallbackMeshEightExecutes() {
+  auto config = makeConfig();
+  config.analysis.power_spectrum_mesh_n = 8;
+  config.analysis.power_spectrum_bin_count = 6;
+  cosmosim::analysis::DiagnosticsEngine engine(config);
+  const auto state = makeSingleModeState();
+  const auto estimate = engine.computePowerSpectrumEstimate(
+      state, cosmosim::analysis::PowerSpectrumEstimateOptions{
+                 .mesh_n = 8,
+                 .bin_count = 6,
+                 .mass_assignment =
+                     cosmosim::analysis::PowerSpectrumMassAssignment::kCloudInCell,
+                 .window_correction = cosmosim::analysis::PowerSpectrumWindowCorrection::kNone,
+                 .shot_noise_policy =
+                     cosmosim::analysis::PowerSpectrumShotNoisePolicy::kReportWithoutSubtraction,
+             });
+  assert(estimate.options.mesh_n == 8);
+  assert(estimate.bins.size() == 6);
+  std::uint64_t modes = 0;
+  for (const auto& bin : estimate.bins) {
+    modes += bin.mode_count;
+    assert(std::isfinite(bin.power_code_volume));
+  }
+  assert(modes == 8U * 8U * 8U - 1U);
+}
+
+void testDetailedPowerSpectrumContractAndEmptyBins() {
+  cosmosim::analysis::DiagnosticsEngine engine(makeConfig());
+  const cosmosim::core::SimulationState state = makeSingleModeState();
+  const cosmosim::analysis::PowerSpectrumEstimateOptions options{
+      .mesh_n = 4,
+      .bin_count = 8,
+      .mass_assignment = cosmosim::analysis::PowerSpectrumMassAssignment::kCloudInCell,
+      .window_correction =
+          cosmosim::analysis::PowerSpectrumWindowCorrection::kDeconvolveAssignmentWindow,
+      .shot_noise_policy =
+          cosmosim::analysis::PowerSpectrumShotNoisePolicy::kReportWithoutSubtraction,
+  };
+  const auto estimate = engine.computePowerSpectrumEstimate(state, options);
+  const auto reference = engine.computePowerSpectrumEstimateReferenceDirectDft(state, options);
+  assert(reference.bins.size() == estimate.bins.size());
+  for (std::size_t i = 0; i < estimate.bins.size(); ++i) {
+    assert(reference.bins[i].mode_count == estimate.bins[i].mode_count);
+    assert(std::abs(reference.bins[i].power_code_volume - estimate.bins[i].power_code_volume) < 1.0e-10);
+  }
+
+  assert(estimate.options.mesh_n == options.mesh_n);
+  assert(estimate.options.bin_count == options.bin_count);
+  assert(estimate.bins.size() == options.bin_count);
+  assert(cosmosim::analysis::powerSpectrumMassAssignmentLabel(estimate.options.mass_assignment) == "cic");
+  assert(
+      cosmosim::analysis::powerSpectrumWindowCorrectionLabel(estimate.options.window_correction) ==
+      "deconvolve_assignment_window");
+  assert(
+      cosmosim::analysis::powerSpectrumShotNoisePolicyLabel(estimate.options.shot_noise_policy) ==
+      "poisson_reported_not_subtracted");
+  assert(cosmosim::analysis::powerSpectrumKUnits() == "code_length^-1");
+  assert(cosmosim::analysis::powerSpectrumPowerUnits() == "code_length^3");
+  assert(!cosmosim::analysis::powerSpectrumFourierNormalization().empty());
+  assert(std::abs(estimate.poisson_shot_noise_code_volume - 0.25) < 1.0e-15);
+
+  std::uint64_t mode_count = 0;
+  std::size_t empty_bin_count = 0;
+  for (std::size_t bin_index = 0; bin_index < estimate.bins.size(); ++bin_index) {
+    const auto& bin = estimate.bins[bin_index];
+    assert(bin.bin_index == bin_index);
+    assert(bin.k_lower_code < bin.k_upper_code);
+    assert(bin.k_center_code >= bin.k_lower_code);
+    assert(bin.k_center_code <= bin.k_upper_code);
+    assert(std::isfinite(bin.power_code_volume));
+    assert(bin.empty == (bin.mode_count == 0));
+    if (bin.empty) {
+      ++empty_bin_count;
+      assert(bin.power_code_volume == 0.0);
+    }
+    mode_count += bin.mode_count;
+  }
+  assert(mode_count == options.mesh_n * options.mesh_n * options.mesh_n - 1U);
+  assert(empty_bin_count > 0);
+
+  auto subtract_options = options;
+  subtract_options.shot_noise_policy =
+      cosmosim::analysis::PowerSpectrumShotNoisePolicy::kSubtractPoisson;
+  const auto subtracted = engine.computePowerSpectrumEstimate(state, subtract_options);
+  for (std::size_t bin_index = 0; bin_index < estimate.bins.size(); ++bin_index) {
+    if (estimate.bins[bin_index].empty) {
+      assert(subtracted.bins[bin_index].empty);
+      continue;
+    }
+    assert(
+        std::abs(
+            subtracted.bins[bin_index].power_code_volume -
+            (estimate.bins[bin_index].power_code_volume -
+             estimate.poisson_shot_noise_code_volume)) <
+        1.0e-12);
+  }
+}
+
+void testDerivedDiagnosticsSanity() {
+  cosmosim::core::SimulationConfig config = makeConfig();
+  cosmosim::analysis::DiagnosticsEngine engine(config);
+  cosmosim::core::SimulationState state = makeSingleModeState();
+
+  state.star_particles.resize(2);
+  state.star_particles.formation_scale_factor[0] = 0.2;
+  state.star_particles.formation_scale_factor[1] = 0.8;
+  state.star_particles.birth_mass_code[0] = 2.0;
+  state.star_particles.birth_mass_code[1] = 3.0;
+
+  state.particles.velocity_y_peculiar[0] = 1.0;
+  state.particles.position_x_comoving[0] = 0.25;
+
+  const auto sfh = engine.computeStarFormationHistory(state, 4);
+  double formed = 0.0;
+  for (const auto& bin : sfh) {
+    formed += bin.formed_mass_code;
+  }
+  assert(std::abs(formed - 5.0) < 1.0e-12);
+
+  const auto angular = engine.computeAngularMomentumBudget(state);
+  const double l_norm =
+      std::sqrt(angular.total_l_code[0] * angular.total_l_code[0] + angular.total_l_code[1] * angular.total_l_code[1] +
+                angular.total_l_code[2] * angular.total_l_code[2]);
+  assert(std::isfinite(l_norm));
+  assert(l_norm > 0.0);
+
+  const auto bundle = engine.generateBundle(state, 4, 0.7, cosmosim::analysis::DiagnosticClass::kScienceLight);
+  assert(bundle.xy_projection_density_code.size() == 16);
+  assert(bundle.xy_slice_density_code.size() == 16);
+  assert(!bundle.records.empty());
+  assert(bundle.records.front().name == "run_health_counters");
+
+  assert(bundle.memory_report.totals.persistent_total_bytes > 0);
+  assert(bundle.memory_report.totals.transient_total_bytes == 0);
+}
+
+void testProvisionalHeavyDiagnosticsRequireExplicitPolicy() {
+  cosmosim::core::SimulationConfig config = makeConfig();
+  config.analysis.diagnostics_execution_policy =
+      cosmosim::core::AnalysisConfig::DiagnosticsExecutionPolicy::kRunHealthAndLightScience;
+  config.analysis.enable_diagnostics = true;
+  config.analysis.run_health_interval_steps = 1;
+  config.analysis.science_light_interval_steps = 1;
+  config.analysis.science_heavy_interval_steps = 1;
+  config.output.run_name = "unit_analysis_policy_default";
+
+  const std::filesystem::path output_root =
+      std::filesystem::path(config.output.output_directory) / config.output.run_name;
+  std::filesystem::remove_all(output_root);
+
+  cosmosim::analysis::DiagnosticsCallback callback(config);
+  cosmosim::core::SimulationState state = makeSingleModeState();
+  cosmosim::core::IntegratorState integrator_state;
+  integrator_state.current_scale_factor = 0.5;
+  integrator_state.step_index = 0;
+
+  std::vector<std::uint32_t> particle_indices(state.particles.size());
+  std::vector<std::uint32_t> cell_indices(state.cells.size());
+  for (std::size_t i = 0; i < particle_indices.size(); ++i) {
+    particle_indices[i] = static_cast<std::uint32_t>(i);
+  }
+  for (std::size_t i = 0; i < cell_indices.size(); ++i) {
+    cell_indices[i] = static_cast<std::uint32_t>(i);
+  }
+
+  const cosmosim::core::ActiveSetDescriptor active{
+      .particle_indices = particle_indices,
+      .cell_indices = cell_indices,
+      .particles_are_subset = false,
+      .cells_are_subset = false,
+  };
+  cosmosim::core::StepContext context{
+      .state = state,
+      .integrator_state = integrator_state,
+      .active_set = active,
+      .workspace = nullptr,
+      .cosmology_background = nullptr,
+      .mode_policy = nullptr,
+      .stage = cosmosim::core::IntegrationStage::kAnalysisHooks,
+  };
+
+  callback.onStage(context);
+  const auto timing = callback.timing();
+  assert(timing.heavy_calls == 0);
+  assert(timing.light_calls == 1);
+  assert(timing.run_health_calls == 1);
+
+  bool found_heavy_bundle = false;
+  for (const auto& entry : std::filesystem::directory_iterator(output_root / "diagnostics")) {
+    if (entry.path().filename().string().find("science_heavy") != std::string::npos) {
+      found_heavy_bundle = true;
+    }
+  }
+  assert(!found_heavy_bundle);
+
+  bool found_memory_key = false;
+  for (const auto& entry : std::filesystem::directory_iterator(output_root / "diagnostics")) {
+    if (entry.path().extension() != ".json") { continue; }
+    std::ifstream in(entry.path());
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (text.find("\"memory_report\"") != std::string::npos &&
+        text.find("\"persistent_total_bytes\"") != std::string::npos &&
+        text.find("\"transient_total_bytes\"") != std::string::npos) {
+      found_memory_key = true;
+      break;
+    }
+  }
+  assert(found_memory_key);
+
+  std::filesystem::remove_all(output_root);
+}
+
+
+void testStarFormationHistoryCsvUsesBirthState() {
+  cosmosim::core::SimulationConfig config = makeConfig();
+  config.output.run_name = "unit_sfr_history";
+  const std::filesystem::path output_root =
+      std::filesystem::path(config.output.output_directory) / config.output.run_name;
+  std::filesystem::remove_all(output_root);
+
+  cosmosim::analysis::DiagnosticsEngine engine(config);
+  cosmosim::core::SimulationState state = makeSingleModeState();
+  state.star_particles.resize(2);
+  state.star_particles.formation_scale_factor[0] = 0.2;
+  state.star_particles.formation_scale_factor[1] = 0.8;
+  state.star_particles.birth_mass_code[0] = 2.0;
+  state.star_particles.birth_mass_code[1] = 3.0;
+  const auto bundle = engine.generateBundle(
+      state, 4, 0.9, cosmosim::analysis::DiagnosticClass::kScienceLight);
+  engine.writeBundle(bundle);
+
+  const std::filesystem::path history_path = output_root / "sfr_history.csv";
+  assert(std::filesystem::exists(history_path));
+  std::ifstream history(history_path);
+  const std::string text(
+      (std::istreambuf_iterator<char>(history)), std::istreambuf_iterator<char>());
+  assert(text.find(
+      "scale_factor,redshift,formed_mass_code,cumulative_stellar_birth_mass_code") !=
+      std::string::npos);
+  assert(text.find(",2,2\n") != std::string::npos);
+  assert(text.find(",3,5\n") != std::string::npos);
+  assert(!std::filesystem::exists(history_path.string() + ".part"));
+  std::filesystem::remove_all(output_root);
+}
+
+void testEngineLevelHeavyDiagnosticsQuarantineAndTruthfulRecords() {
+  cosmosim::core::SimulationConfig blocked_config = makeConfig();
+  blocked_config.analysis.diagnostics_execution_policy =
+      cosmosim::core::AnalysisConfig::DiagnosticsExecutionPolicy::kRunHealthAndLightScience;
+
+  cosmosim::analysis::DiagnosticsEngine blocked_engine(blocked_config);
+  const cosmosim::core::SimulationState state = makeSingleModeState();
+
+  const auto blocked_bundle =
+      blocked_engine.generateBundle(state, 7, 0.6, cosmosim::analysis::DiagnosticClass::kScienceHeavy);
+  assert(blocked_bundle.power_spectrum.empty());
+
+  bool found_power_record = false;
+  for (const auto& record : blocked_bundle.records) {
+    if (record.name == "power_spectrum") {
+      found_power_record = true;
+      assert(record.tier == cosmosim::analysis::DiagnosticTier::kProvisionalScience);
+      assert(record.implementation_maturity ==
+             cosmosim::analysis::DiagnosticImplementationMaturity::kProductionScalable);
+      assert(record.maturity == cosmosim::analysis::DiagnosticMaturity::kProvisional);
+      assert(record.scalability == cosmosim::analysis::DiagnosticScalability::kScalableFft);
+      assert(!record.executed);
+      assert(record.policy_note == "blocked_by_scientific_validation_policy");
+    }
+  }
+  assert(found_power_record);
+
+  cosmosim::core::SimulationConfig allowed_config = makeConfig();
+  allowed_config.analysis.diagnostics_execution_policy =
+      cosmosim::core::AnalysisConfig::DiagnosticsExecutionPolicy::kAllIncludingProvisional;
+  cosmosim::analysis::DiagnosticsEngine allowed_engine(allowed_config);
+  const auto allowed_bundle =
+      allowed_engine.generateBundle(state, 7, 0.6, cosmosim::analysis::DiagnosticClass::kScienceHeavy);
+  assert(!allowed_bundle.power_spectrum.empty());
+  found_power_record = false;
+  for (const auto& record : allowed_bundle.records) {
+    if (record.name == "power_spectrum") {
+      found_power_record = true;
+      assert(record.executed);
+      assert(record.implementation_maturity ==
+             cosmosim::analysis::DiagnosticImplementationMaturity::kProductionScalable);
+      assert(record.maturity == cosmosim::analysis::DiagnosticMaturity::kProvisional);
+      assert(record.scalability == cosmosim::analysis::DiagnosticScalability::kScalableFft);
+      assert(record.policy_note == "scientifically_provisional_scalable_fft");
+    }
+  }
+  assert(found_power_record);
+}
+
+void testMetalBudgetDiagnosticsCloseReturnedDepositAndCarry() {
+  cosmosim::core::SimulationState state;
+  state.resizeCells(2);
+  state.cells.mass_code[0] = 10.0;
+  state.cells.mass_code[1] = 20.0;
+  state.gas_cells.metal_mass_code[0] = 0.1;
+  state.gas_cells.metal_mass_code[1] = 0.0;
+  state.star_particles.resize(1);
+  state.star_particles.birth_mass_code[0] = 5.0;
+  state.star_particles.metallicity_mass_fraction[0] = 0.02;
+  state.star_particles.stellar_returned_metals_cumulative_code[0] = 0.03;
+  state.star_particles.stellar_newly_synthesized_metals_cumulative_code[0] = 0.01;
+  state.star_particles.stellar_deposited_metals_cumulative_code[0] = 0.025;
+  state.star_particles.enrichment_carry_metals_code[0] = 0.005;
+
+  const auto diagnostics =
+      cosmosim::analysis::computeMetalBudgetDiagnostics(state);
+  assert(std::abs(diagnostics.gas_metal_mass_code - 0.1) < 1.0e-15);
+  assert(std::abs(diagnostics.stellar_birth_metal_mass_code - 0.1) < 1.0e-15);
+  assert(std::abs(diagnostics.stellar_locked_metal_mass_code - 0.08) < 1.0e-15);
+  assert(std::abs(diagnostics.enrichment_deposition_residual_code) < 1.0e-15);
+  assert(std::abs(diagnostics.mass_weighted_mean_gas_metallicity -
+                  (0.1 / 30.0)) < 1.0e-15);
+  assert(std::abs(diagnostics.metal_free_gas_mass_fraction - (2.0 / 3.0)) < 1.0e-15);
+  assert(diagnostics.invalid_gas_states == 0U);
+
+  const double initial_metals = 0.1 + 0.1;
+  const double residual = cosmosim::analysis::globalMetalAuditResidualCode(
+      diagnostics, initial_metals, 0.0);
+  assert(std::abs(residual + 0.025) < 1.0e-15);
+}
+
+void testGovernedDiagnosticMemoryAndScientificEquivalence() {
+  using namespace cosmosim;
+  const auto mesh = analysis::estimatePowerSpectrumMemory(256U, 16U, 1U);
+  assert(mesh.mesh_coexistence_bytes == 402653184ULL);
+  assert(mesh.owned_peak_bytes >= mesh.mesh_coexistence_bytes);
+  assert(analysis::estimatePowerSpectrumMemory(512U, 16U, 1U)
+             .mesh_coexistence_bytes == 3221225472ULL);
+  bool overflow_rejected = false;
+  try {
+    (void)analysis::estimatePowerSpectrumMemory(
+        static_cast<std::size_t>(std::numeric_limits<int>::max()), 16U, 1U);
+  } catch (const std::overflow_error&) { overflow_rejected = true; }
+  assert(overflow_rejected);
+
+  auto config = makeConfig();
+  config.analysis.diagnostics_execution_policy =
+      core::AnalysisConfig::DiagnosticsExecutionPolicy::kAllIncludingProvisional;
+  config.analysis.enable_diagnostics = true;
+  config.analysis.power_spectrum_mesh_n = 8;
+  config.analysis.power_spectrum_bin_count = 6;
+  const auto state = makeSingleModeState();
+  core::MemoryGovernor unlimited;
+  analysis::DiagnosticsEngine governed(config, &unlimited);
+  analysis::DiagnosticsEngine reference(config);
+  const auto required = governed.estimateBundleIncrementalBytes(
+      analysis::DiagnosticClass::kScienceHeavy, state);
+  assert(required >= core::OwnershipValidationWorkspace::requiredBytes(4U, 4U));
+  const auto expected = reference.generateBundle(
+      state, 4U, 0.7, analysis::DiagnosticClass::kScienceHeavy);
+  const auto actual = governed.generateBundle(
+      state, 4U, 0.7, analysis::DiagnosticClass::kScienceHeavy);
+  assert(unlimited.snapshot().committed_bytes == 0U);
+  assert(actual.power_spectrum.size() == expected.power_spectrum.size());
+  for (std::size_t i = 0; i < actual.power_spectrum.size(); ++i) {
+    assert(actual.power_spectrum[i].mode_count == expected.power_spectrum[i].mode_count);
+    assert(std::abs(actual.power_spectrum[i].k_center_code -
+                    expected.power_spectrum[i].k_center_code) < 1.0e-10);
+    assert(std::abs(actual.power_spectrum[i].power_code_volume -
+                    expected.power_spectrum[i].power_code_volume) < 1.0e-10);
+  }
+  assert(actual.health.ownership_invariants_ok == expected.health.ownership_invariants_ok);
+  assert(actual.health.unique_particle_ids_ok == expected.health.unique_particle_ids_ok);
+
+  // The successful reference pass above certifies particle-ID uniqueness, so
+  // the next bundle legitimately needs less validation scratch. Recompute the
+  // current request before constructing the one-byte-short admission case.
+  analysis::DiagnosticsEngine estimate_engine(config);
+  const auto constrained_required = estimate_engine.estimateBundleIncrementalBytes(
+      analysis::DiagnosticClass::kScienceHeavy, state);
+  assert(constrained_required <= required);
+  core::MemoryGovernor constrained(core::MemoryGovernorPolicy{
+      .hard_limit_bytes = constrained_required + 4096U});
+  constrained.setBaselineOwnedBytes(4097U);
+  analysis::DiagnosticsEngine constrained_engine(config, &constrained);
+  bool rejected = false;
+  try {
+    (void)constrained_engine.generateBundle(
+        state, 4U, 0.7, analysis::DiagnosticClass::kScienceHeavy);
+  } catch (const core::MemoryAdmissionError&) { rejected = true; }
+  assert(rejected);
+  assert(constrained.snapshot().committed_bytes == 0U);
+  constrained.setBaselineOwnedBytes(4096U);
+  const auto recovered = constrained_engine.generateBundle(
+      state, 5U, 0.7, analysis::DiagnosticClass::kScienceHeavy);
+  assert(recovered.power_spectrum.size() == expected.power_spectrum.size());
+  assert(constrained.snapshot().committed_bytes == 0U);
+
+  core::OwnershipValidationWorkspace scratch;
+  assert(scratch.ownedCapacityBytes() == 0U);
+  scratch.resize(4U, 4U);
+  assert(scratch.ownedCapacityBytes() >=
+         core::OwnershipValidationWorkspace::requiredBytes(
+             4U, 4U, false, false, false, false, false));
+  assert(state.validateUniqueParticleIds(scratch));
+  assert(state.validateOwnershipInvariants(scratch) ==
+         state.validateOwnershipInvariants());
+  auto invalid = makeSingleModeState();
+  invalid.particle_sidecar.particle_id[1] = invalid.particle_sidecar.particle_id[0];
+  assert(!invalid.validateUniqueParticleIds());
+  assert(!invalid.validateUniqueParticleIds(scratch));
+  assert(!invalid.validateOwnershipInvariants(scratch));
+}
+
+}  // namespace
+
+int main() {
+  testPowerSpectrumHasSignalAndFiniteModes();
+  testPowerOfTwoFallbackMeshEightExecutes();
+  testDetailedPowerSpectrumContractAndEmptyBins();
+  testDerivedDiagnosticsSanity();
+  testProvisionalHeavyDiagnosticsRequireExplicitPolicy();
+  testStarFormationHistoryCsvUsesBirthState();
+  testEngineLevelHeavyDiagnosticsQuarantineAndTruthfulRecords();
+  testMetalBudgetDiagnosticsCloseReturnedDepositAndCarry();
+  testGovernedDiagnosticMemoryAndScientificEquivalence();
+  return 0;
+}

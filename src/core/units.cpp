@@ -1,0 +1,194 @@
+#include "cosmosim/core/units.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <stdexcept>
+
+#include "cosmosim/core/constants.hpp"
+
+namespace cosmosim::core {
+namespace {
+
+[[nodiscard]] std::string toLower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+[[nodiscard]] double lengthSiPerCodeFromName(const std::string& name) {
+  const std::string unit = toLower(name);
+  if (unit == "m") {
+    return 1.0;
+  }
+  if (unit == "cm") {
+    return constants::k_centimeter_si;
+  }
+  if (unit == "kpc") {
+    return constants::k_kiloparsec_si;
+  }
+  if (unit == "mpc") {
+    return constants::k_megaparsec_si;
+  }
+  throw std::invalid_argument("unsupported length unit: " + name);
+}
+
+[[nodiscard]] double massSiPerCodeFromName(const std::string& name) {
+  const std::string unit = toLower(name);
+  if (unit == "kg") {
+    return 1.0;
+  }
+  if (unit == "g") {
+    return constants::k_gram_si;
+  }
+  if (unit == "msun") {
+    return constants::k_solar_mass_si;
+  }
+  throw std::invalid_argument("unsupported mass unit: " + name);
+}
+
+[[nodiscard]] double velocitySiPerCodeFromName(const std::string& name) {
+  const std::string unit = toLower(name);
+  if (unit == "m_s") {
+    return 1.0;
+  }
+  if (unit == "cm_s") {
+    return constants::k_centimeter_si;
+  }
+  if (unit == "km_s") {
+    return constants::k_kilometer_si;
+  }
+  throw std::invalid_argument("unsupported velocity unit: " + name);
+}
+
+}  // namespace
+
+void UnitSystem::validate() const {
+  if (!std::isfinite(length_si_per_code) || !(length_si_per_code > 0.0) ||
+      !std::isfinite(mass_si_per_code) || !(mass_si_per_code > 0.0) ||
+      !std::isfinite(velocity_si_per_code) || !(velocity_si_per_code > 0.0)) {
+    throw std::invalid_argument("UnitSystem conversion factors must be finite and positive");
+  }
+}
+
+[[nodiscard]] double requireFiniteValue(double value, const char* label) {
+  if (!std::isfinite(value)) {
+    throw std::invalid_argument(std::string(label) + " must be finite");
+  }
+  return value;
+}
+
+[[nodiscard]] double requireScaleFactor(double scale_factor) {
+  if (!std::isfinite(scale_factor) || !(scale_factor > 0.0)) {
+    throw std::invalid_argument("scale_factor must be finite and positive");
+  }
+  return scale_factor;
+}
+
+double UnitSystem::lengthCodeToSi(double length_code) const {
+  validate();
+  return requireFiniteValue(length_code, "length_code") * length_si_per_code;
+}
+
+double UnitSystem::lengthSiToCode(double length_si) const {
+  validate();
+  return requireFiniteValue(length_si, "length_si") / length_si_per_code;
+}
+
+double UnitSystem::massCodeToSi(double mass_code) const {
+  validate();
+  return requireFiniteValue(mass_code, "mass_code") * mass_si_per_code;
+}
+
+double UnitSystem::massSiToCode(double mass_si) const {
+  validate();
+  return requireFiniteValue(mass_si, "mass_si") / mass_si_per_code;
+}
+
+double UnitSystem::velocityCodeToSi(double velocity_code) const {
+  validate();
+  return requireFiniteValue(velocity_code, "velocity_code") * velocity_si_per_code;
+}
+
+double UnitSystem::velocitySiToCode(double velocity_si) const {
+  validate();
+  return requireFiniteValue(velocity_si, "velocity_si") / velocity_si_per_code;
+}
+
+double UnitSystem::timeSiPerCode() const {
+  validate();
+  return length_si_per_code / velocity_si_per_code;
+}
+
+double UnitSystem::timeCodeToSi(double time_code) const {
+  return requireFiniteValue(time_code, "time_code") * timeSiPerCode();
+}
+
+double UnitSystem::timeSiToCode(double time_si) const {
+  return requireFiniteValue(time_si, "time_si") / timeSiPerCode();
+}
+
+double UnitSystem::densityCodeToSi(double density_code) const {
+  validate();
+  const double density_si_per_code = mass_si_per_code / (length_si_per_code * length_si_per_code * length_si_per_code);
+  return requireFiniteValue(density_code, "density_code") * density_si_per_code;
+}
+
+double UnitSystem::densitySiToCode(double density_si) const {
+  validate();
+  const double density_si_per_code = mass_si_per_code / (length_si_per_code * length_si_per_code * length_si_per_code);
+  return requireFiniteValue(density_si, "density_si") / density_si_per_code;
+}
+
+double UnitSystem::densityCodeToCgs(double density_code) const {
+  const double density_si = densityCodeToSi(density_code);
+  return density_si * 1.0e-3;
+}
+
+UnitSystem makeUnitSystem(
+    const std::string& length_unit,
+    const std::string& mass_unit,
+    const std::string& velocity_unit) {
+  UnitSystem units;
+  units.length_unit = toLower(length_unit);
+  units.mass_unit = toLower(mass_unit);
+  units.velocity_unit = toLower(velocity_unit);
+
+  units.length_si_per_code = lengthSiPerCodeFromName(units.length_unit);
+  units.mass_si_per_code = massSiPerCodeFromName(units.mass_unit);
+  units.velocity_si_per_code = velocitySiPerCodeFromName(units.velocity_unit);
+  units.validate();
+  return units;
+}
+
+double newtonGravitationalConstantCode(const UnitSystem& units) {
+  const double time_si_per_code = units.timeSiPerCode();
+  const double denominator = units.length_si_per_code *
+      units.length_si_per_code * units.length_si_per_code;
+  const double result = constants::k_newton_g_si * units.mass_si_per_code *
+      time_si_per_code * time_si_per_code / denominator;
+  if (!std::isfinite(result) || !(result > 0.0)) {
+    throw std::invalid_argument(
+        "code-unit conversion produced a non-finite or non-positive Newton constant");
+  }
+  return result;
+}
+
+double comovingToPhysicalLength(double x_comoving, double scale_factor) {
+  return requireScaleFactor(scale_factor) * requireFiniteValue(x_comoving, "x_comoving");
+}
+
+double physicalToComovingLength(double r_phys, double scale_factor) {
+  return requireFiniteValue(r_phys, "r_phys") / requireScaleFactor(scale_factor);
+}
+
+double peculiarVelocityFromComovingRate(double dx_comoving_dt, double scale_factor) {
+  return requireScaleFactor(scale_factor) * requireFiniteValue(dx_comoving_dt, "dx_comoving_dt");
+}
+
+double comovingRateFromPeculiarVelocity(double v_pec, double scale_factor) {
+  return requireFiniteValue(v_pec, "v_pec") / requireScaleFactor(scale_factor);
+}
+
+}  // namespace cosmosim::core

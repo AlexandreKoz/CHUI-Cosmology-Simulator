@@ -1,0 +1,491 @@
+#include <atomic>
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <limits>
+#include <memory_resource>
+#include "cosmosim/core/governed_scratch_arena.hpp"
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "cosmosim/core/memory_governor.hpp"
+
+namespace {
+
+using cosmosim::core::MemoryClass;
+using cosmosim::core::MemoryGovernor;
+using cosmosim::core::MemoryGovernorPolicy;
+using cosmosim::core::MemoryPressure;
+
+void testUnlimitedBudgetAccounting() {
+  MemoryGovernor governor;
+  governor.setBaselineOwnedBytes(123U);
+  auto reservation = governor.reserve(MemoryClass::kScratchArena, 4096U, "unit.unlimited");
+  auto pending = governor.snapshot();
+  assert(pending.hard_limit_bytes == 0U);
+  assert(pending.baseline_owned_bytes == 123U);
+  assert(pending.reserved_bytes == 4096U);
+  assert(pending.committed_bytes == 0U);
+  assert(pending.accounted_bytes == 4219U);
+  assert(pending.headroom_bytes == std::numeric_limits<std::uint64_t>::max());
+  assert(pending.pressure == MemoryPressure::kGreen);
+
+  reservation.commit();
+  const auto committed = governor.snapshot();
+  assert(committed.reserved_bytes == 0U);
+  assert(committed.committed_bytes == 4096U);
+  assert(committed.pressure == MemoryPressure::kGreen);
+  reservation.release();
+  assert(governor.snapshot().committed_bytes == 0U);
+}
+
+void testAdmissionBoundariesAndZeroByteReservation() {
+  MemoryGovernor governor(MemoryGovernorPolicy{.hard_limit_bytes = 1024U});
+  auto zero = governor.reserve(MemoryClass::kDiagnostic, 0U, "unit.zero");
+  assert(zero.pending());
+  assert(governor.snapshot().reserved_bytes == 0U);
+  zero.commit();
+  assert(zero.committed());
+  zero.release();
+
+  auto exact = governor.reserve(MemoryClass::kPhaseResident, 1024U, "unit.exact");
+  assert(governor.snapshot().reserved_bytes == 1024U);
+  exact.commit();
+  assert(governor.snapshot().committed_bytes == 1024U);
+
+  bool rejected = false;
+  try {
+    (void)governor.reserve(MemoryClass::kCommunication, 1U, "unit.one_over");
+  } catch (const cosmosim::core::MemoryAdmissionError& error) {
+    rejected = true;
+    const std::string message = error.what();
+    assert(message.find("owner=unit.one_over") != std::string::npos);
+    assert(message.find("class=communication") != std::string::npos);
+    assert(message.find("requested_bytes=1") != std::string::npos);
+    assert(message.find("hard_limit_bytes=1024") != std::string::npos);
+    assert(message.find("pressure=trip") != std::string::npos);
+  }
+  assert(rejected);
+  assert(governor.snapshot().rejection_count == 1U);
+  exact.release();
+}
+
+void testSafetyMarginMatchesPreflightStyleAdmission() {
+  MemoryGovernor governor(MemoryGovernorPolicy{
+      .hard_limit_bytes = 1250U,
+      .external_runtime_reserve_bytes = 100U,
+      .planned_overlap_reserve_bytes = 100U,
+      .safety_margin_fraction = 0.25,
+  });
+  // Raw 1000 -> ceil(1000*1.25) = 1250, exactly admissible.
+  governor.setBaselineOwnedBytes(800U);
+  const auto at_limit = governor.snapshot();
+  assert(at_limit.accounted_bytes == 1000U);
+  assert(at_limit.safety_adjusted_accounted_bytes == 1250U);
+  assert(at_limit.headroom_bytes == 0U);
+
+  bool rejected = false;
+  try {
+    (void)governor.reserve(MemoryClass::kScratchArena, 1U, "unit.margin_over");
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+}
+
+void testPressureBoundaries() {
+  MemoryGovernor governor(MemoryGovernorPolicy{.hard_limit_bytes = 1000U});
+  governor.setBaselineOwnedBytes(849U);
+  assert(governor.snapshot().pressure == MemoryPressure::kGreen);
+  governor.setBaselineOwnedBytes(850U);
+  assert(governor.snapshot().pressure == MemoryPressure::kAmber);
+  governor.setBaselineOwnedBytes(949U);
+  assert(governor.snapshot().pressure == MemoryPressure::kAmber);
+  governor.setBaselineOwnedBytes(950U);
+  assert(governor.snapshot().pressure == MemoryPressure::kRed);
+  governor.setBaselineOwnedBytes(1000U);
+  assert(governor.snapshot().pressure == MemoryPressure::kRed);
+  governor.setBaselineOwnedBytes(1001U);
+  assert(governor.snapshot().pressure == MemoryPressure::kTrip);
+  assert(governor.snapshot().headroom_bytes == 0U);
+}
+
+void testTinyFiniteBudgetPressureIsTotal() {
+  MemoryGovernor one_byte(MemoryGovernorPolicy{.hard_limit_bytes = 1U});
+  assert(one_byte.snapshot().pressure == MemoryPressure::kGreen);
+  one_byte.setBaselineOwnedBytes(1U);
+  assert(one_byte.snapshot().pressure == MemoryPressure::kRed);
+  one_byte.setBaselineOwnedBytes(2U);
+  assert(one_byte.snapshot().pressure == MemoryPressure::kTrip);
+
+  MemoryGovernor two_bytes(MemoryGovernorPolicy{.hard_limit_bytes = 2U});
+  assert(two_bytes.snapshot().pressure == MemoryPressure::kGreen);
+  two_bytes.setBaselineOwnedBytes(1U);
+  assert(two_bytes.snapshot().pressure == MemoryPressure::kAmber);
+  two_bytes.setBaselineOwnedBytes(2U);
+  assert(two_bytes.snapshot().pressure == MemoryPressure::kRed);
+
+  MemoryGovernor three_bytes(MemoryGovernorPolicy{.hard_limit_bytes = 3U});
+  assert(three_bytes.snapshot().pressure == MemoryPressure::kGreen);
+  three_bytes.setBaselineOwnedBytes(1U);
+  assert(three_bytes.snapshot().pressure == MemoryPressure::kAmber);
+  three_bytes.setBaselineOwnedBytes(2U);
+  assert(three_bytes.snapshot().pressure == MemoryPressure::kRed);
+}
+
+void testPendingDestructionAndCommitLifecycle() {
+  MemoryGovernor governor(MemoryGovernorPolicy{.hard_limit_bytes = 4096U});
+  {
+    auto pending = governor.reserve(MemoryClass::kScratchArena, 256U, "unit.pending_destroy");
+    assert(pending.pending());
+    assert(governor.snapshot().reserved_bytes == 256U);
+  }
+  assert(governor.snapshot().reserved_bytes == 0U);
+
+  {
+    auto committed = governor.reserve(MemoryClass::kPersistentCache, 512U, "unit.committed_destroy");
+    committed.commit();
+    assert(governor.snapshot().committed_bytes == 512U);
+  }
+  assert(governor.snapshot().committed_bytes == 0U);
+  const auto snapshot = governor.snapshot();
+  assert(snapshot.peak_reserved_bytes >= 512U);
+  assert(snapshot.peak_committed_bytes >= 512U);
+  assert(snapshot.peak_accounted_bytes >= 512U);
+}
+
+void testMoveConstructionMoveAssignmentAndDoubleCommit() {
+  MemoryGovernor governor(MemoryGovernorPolicy{.hard_limit_bytes = 4096U});
+  auto first = governor.reserve(MemoryClass::kScratchArena, 300U, "unit.move_first");
+  auto moved(std::move(first));
+  assert(!first.valid());
+  assert(moved.pending());
+  moved.commit();
+
+  bool double_commit_rejected = false;
+  try {
+    moved.commit();
+  } catch (const std::logic_error&) {
+    double_commit_rejected = true;
+  }
+  assert(double_commit_rejected);
+
+  auto second = governor.reserve(MemoryClass::kCommunication, 200U, "unit.move_second");
+  assert(governor.snapshot().reserved_bytes == 200U);
+  second = std::move(moved);
+  // Move assignment releases second's pending 200 bytes before taking the
+  // committed 300-byte reservation.
+  const auto after_move = governor.snapshot();
+  assert(after_move.reserved_bytes == 0U);
+  assert(after_move.committed_bytes == 300U);
+  assert(!moved.valid());
+  second.release();
+  second.release();
+  assert(governor.snapshot().committed_bytes == 0U);
+}
+
+void testMultipleReservationsClassesAndReleaseOrder() {
+  MemoryGovernor governor(MemoryGovernorPolicy{.hard_limit_bytes = 1000U});
+  auto scratch = governor.reserve(MemoryClass::kScratchArena, 300U, "unit.scratch");
+  auto comm = governor.reserve(MemoryClass::kCommunication, 200U, "unit.comm");
+  auto diag = governor.reserve(MemoryClass::kDiagnostic, 100U, "unit.diag");
+  auto pending = governor.snapshot();
+  assert(pending.reserved_bytes == 600U);
+  assert(pending.reserved_by_class[cosmosim::core::memoryClassIndex(MemoryClass::kScratchArena)] == 300U);
+  assert(pending.reserved_by_class[cosmosim::core::memoryClassIndex(MemoryClass::kCommunication)] == 200U);
+
+  comm.commit();
+  scratch.commit();
+  diag.release();
+  auto mixed = governor.snapshot();
+  assert(mixed.reserved_bytes == 0U);
+  assert(mixed.committed_bytes == 500U);
+  assert(mixed.committed_by_class[cosmosim::core::memoryClassIndex(MemoryClass::kScratchArena)] == 300U);
+  assert(mixed.committed_by_class[cosmosim::core::memoryClassIndex(MemoryClass::kCommunication)] == 200U);
+
+  scratch.release();
+  assert(governor.snapshot().committed_bytes == 200U);
+  comm.release();
+  assert(governor.snapshot().committed_bytes == 0U);
+}
+
+void testCheckedArithmeticAndOversizedRequest() {
+  bool checked_add_threw = false;
+  try {
+    (void)cosmosim::core::checkedMemoryBytesAdd(
+        std::numeric_limits<std::uint64_t>::max(), 1U, "unit.checked_add");
+  } catch (const std::overflow_error&) {
+    checked_add_threw = true;
+  }
+  assert(checked_add_threw);
+
+  MemoryGovernor governor;
+  governor.setBaselineOwnedBytes(1U);
+  bool oversized_rejected = false;
+  try {
+    (void)governor.reserve(
+        MemoryClass::kScratchArena,
+        std::numeric_limits<std::uint64_t>::max(),
+        "unit.oversized");
+  } catch (const std::overflow_error& error) {
+    oversized_rejected = true;
+    assert(std::string(error.what()).find("uint64_accounting_overflow") != std::string::npos);
+  }
+  assert(oversized_rejected);
+  assert(governor.snapshot().rejection_count == 1U);
+  assert(governor.snapshot().reserved_bytes == 0U);
+
+  MemoryGovernor baseline_governor(MemoryGovernorPolicy{
+      .external_runtime_reserve_bytes = 2U});
+  baseline_governor.setBaselineOwnedBytes(10U);
+  bool baseline_overflow_rejected = false;
+  try {
+    baseline_governor.setBaselineOwnedBytes(
+        std::numeric_limits<std::uint64_t>::max());
+  } catch (const std::overflow_error&) {
+    baseline_overflow_rejected = true;
+  }
+  assert(baseline_overflow_rejected);
+  assert(baseline_governor.snapshot().baseline_owned_bytes == 10U);
+}
+
+void testCommittedReservationTransfersIntoBaselineAtomically() {
+  MemoryGovernor governor(MemoryGovernorPolicy{
+      .hard_limit_bytes = 4096U,
+      .external_runtime_reserve_bytes = 128U,
+      .planned_overlap_reserve_bytes = 64U,
+  });
+  governor.setBaselineOwnedBytes(512U);
+  auto reservation = governor.reserve(
+      MemoryClass::kPhaseResident, 1024U, "unit.baseline_transfer");
+  reservation.commit();
+  const auto before = governor.snapshot();
+  assert(before.baseline_owned_bytes == 512U);
+  assert(before.committed_bytes == 1024U);
+
+  reservation.reconcileBaselineOwnedAndRelease(1400U);
+  const auto after = governor.snapshot();
+  assert(!reservation.valid());
+  assert(after.baseline_owned_bytes == 1400U);
+  assert(after.committed_bytes == 0U);
+  assert(after.reserved_bytes == 0U);
+  assert(after.accounted_bytes == 1592U);
+  assert(after.peak_accounted_bytes >= before.accounted_bytes);
+
+  bool second_transfer_rejected = false;
+  try {
+    reservation.reconcileBaselineOwnedAndRelease(1500U);
+  } catch (const std::logic_error&) {
+    second_transfer_rejected = true;
+  }
+  assert(second_transfer_rejected);
+}
+
+
+void testDeterministicHeadroomAwareBatchSizing() {
+  MemoryGovernor governor(MemoryGovernorPolicy{.hard_limit_bytes = 1000U});
+  governor.setBaselineOwnedBytes(400U);
+  const auto constrained = cosmosim::core::selectDeterministicBatchSize(
+      governor.snapshot(),
+      cosmosim::core::DeterministicBatchSizingPolicy{
+          .requested_max_items = 100U,
+          .bytes_per_item = 10U,
+          .fixed_reserve_bytes = 100U,
+          .minimum_items = 1U,
+          .alignment_items = 8U,
+          .headroom_use_basis_points = 5000U,
+      });
+  assert(constrained.usable_headroom_bytes == 250U);
+  assert(constrained.selected_items == 24U);
+  assert(constrained.selected_bytes == 240U);
+  assert(constrained.constrained_by_headroom);
+
+  MemoryGovernor unlimited;
+  const auto unconstrained = cosmosim::core::selectDeterministicBatchSize(
+      unlimited.snapshot(),
+      cosmosim::core::DeterministicBatchSizingPolicy{
+          .requested_max_items = 33U,
+          .bytes_per_item = 64U,
+          .minimum_items = 1U,
+          .alignment_items = 8U,
+      });
+  assert(unconstrained.selected_items == 33U);
+  assert(unconstrained.selected_bytes == 33U * 64U);
+  assert(!unconstrained.constrained_by_headroom);
+
+  MemoryGovernor starved(MemoryGovernorPolicy{.hard_limit_bytes = 128U});
+  starved.setBaselineOwnedBytes(120U);
+  const auto no_batch = cosmosim::core::selectDeterministicBatchSize(
+      starved.snapshot(),
+      cosmosim::core::DeterministicBatchSizingPolicy{
+          .requested_max_items = 16U,
+          .bytes_per_item = 16U,
+          .minimum_items = 1U,
+          .alignment_items = 1U,
+      });
+  assert(no_batch.selected_items == 0U);
+  assert(no_batch.selected_bytes == 0U);
+  assert(no_batch.constrained_by_headroom);
+}
+
+void testRetainedWorkspaceBatchSizing() {
+  using namespace cosmosim::core;
+  MemoryGovernor governor(MemoryGovernorPolicy{.hard_limit_bytes = 1000U});
+  governor.setBaselineOwnedBytes(800U);
+  const std::array<DeterministicBatchWorkspace, 3> workspaces{{
+      {8U, 0U}, {16U, 8U}, {4U, 8U},
+  }};
+  const DeterministicBatchSizingPolicy policy{
+      .requested_max_items = 16U, .bytes_per_item = 1U,
+      .fixed_reserve_bytes = 80U, .minimum_items = 1U,
+      .alignment_items = 1U, .headroom_use_basis_points = 10000U,
+  };
+  const auto first = selectDeterministicBatchSizeForWorkspaces(
+      governor.snapshot(), policy, workspaces);
+  // 8 retained event/row slots cost nothing; only the report is new.
+  assert(first.selected_items == 8U);
+  assert(first.selected_bytes == 64U);
+  auto fixed = governor.reserve(MemoryClass::kPhaseResident, 80U, "unit.index_rebuild");
+  fixed.commit();
+  auto report = governor.reserve(MemoryClass::kPhaseResident, first.selected_bytes, "unit.report");
+  report.commit();
+  assert(governor.snapshot().accounted_bytes == 944U);
+  report.release();
+  fixed.release();
+  assert(governor.snapshot().accounted_bytes == 800U);
+  // A larger headroom permits replacement, but the old capacity must coexist.
+  governor.setBaselineOwnedBytes(500U);
+  const auto grown = selectDeterministicBatchSizeForWorkspaces(
+      governor.snapshot(), policy, workspaces);
+  assert(grown.selected_items == 15U);
+  assert(grown.selected_bytes == 15U * 28U);
+  MemoryGovernor tight(MemoryGovernorPolicy{.hard_limit_bytes = 1000U});
+  tight.setBaselineOwnedBytes(920U);
+  const auto starved = selectDeterministicBatchSizeForWorkspaces(
+      tight.snapshot(), policy, workspaces);
+  assert(starved.selected_items == 0U);
+  assert(starved.constrained_by_headroom);
+  MemoryGovernor unlimited;
+  const auto all = selectDeterministicBatchSizeForWorkspaces(
+      unlimited.snapshot(), policy, workspaces);
+  assert(all.selected_items == 16U);
+  assert(all.selected_bytes == 16U * 28U);
+  bool overflow = false;
+  try {
+    (void)selectDeterministicBatchSizeForWorkspaces(
+        unlimited.snapshot(), DeterministicBatchSizingPolicy{
+            .requested_max_items = std::numeric_limits<std::uint64_t>::max(),
+            .bytes_per_item = 1U, .minimum_items = 1U, .alignment_items = 1U},
+        workspaces);
+  } catch (const std::overflow_error&) { overflow = true; }
+  assert(overflow);
+  // Two individually representable workspaces must not wrap their aggregate
+  // into a false fit, especially under the unlimited compatibility policy.
+  const std::array huge_workspaces{
+      cosmosim::core::DeterministicBatchWorkspace{.bytes_per_item =
+          std::numeric_limits<std::uint64_t>::max() / 2U, .retained_capacity_items = 0U},
+      cosmosim::core::DeterministicBatchWorkspace{.bytes_per_item =
+          std::numeric_limits<std::uint64_t>::max() / 2U, .retained_capacity_items = 0U},
+  };
+  bool aggregate_overflow_rejected = false;
+  try {
+    (void)cosmosim::core::selectDeterministicBatchSizeForWorkspaces(
+        unlimited.snapshot(), cosmosim::core::DeterministicBatchSizingPolicy{
+            .requested_max_items = 2U, .minimum_items = 1U}, huge_workspaces);
+  } catch (const std::overflow_error&) {
+    aggregate_overflow_rejected = true;
+  }
+  assert(aggregate_overflow_rejected);
+
+}
+
+void testGovernedScratchArena() {
+  MemoryGovernor governor(MemoryGovernorPolicy{.hard_limit_bytes = 1024U});
+  {
+    cosmosim::core::GovernedScratchArena arena(
+        &governor, MemoryClass::kScratchArena, 1024U, "unit.arena");
+    assert(arena.capacityBytes() == 1024U);
+    assert(governor.snapshot().committed_bytes == 1024U);
+    std::pmr::vector<std::uint64_t> values(arena.resource());
+    values.reserve(64U);
+    values.assign(64U, 7U);
+    assert(values.front() == 7U && values.back() == 7U);
+    bool exhausted = false;
+    try {
+      values.reserve(1024U);
+    } catch (const std::bad_alloc&) { exhausted = true; }
+    assert(exhausted);
+    assert(governor.snapshot().committed_bytes == 1024U);
+    bool rejected = false;
+    try {
+      cosmosim::core::GovernedScratchArena extra(
+          &governor, MemoryClass::kScratchArena, 1U, "unit.arena_over");
+    } catch (const cosmosim::core::MemoryAdmissionError&) { rejected = true; }
+    assert(rejected);
+  }
+  assert(governor.snapshot().committed_bytes == 0U);
+  assert(governor.snapshot().reserved_bytes == 0U);
+  {
+    cosmosim::core::GovernedScratchArena empty(
+        &governor, MemoryClass::kScratchArena, 0U, "unit.empty_arena");
+    assert(empty.capacityBytes() == 0U);
+  }
+  bool oversized = false;
+  try {
+    cosmosim::core::GovernedScratchArena too_large(
+        nullptr, MemoryClass::kScratchArena,
+        std::numeric_limits<std::uint64_t>::max(), "unit.oversized_arena");
+  } catch (const std::exception&) { oversized = true; }
+  assert(oversized);
+}
+
+void testConcurrentControlPlaneReservations() {
+  MemoryGovernor governor(MemoryGovernorPolicy{.hard_limit_bytes = 1U << 20U});
+  constexpr int k_threads = 8;
+  constexpr int k_iterations = 200;
+  std::atomic<int> completed{0};
+  std::vector<std::thread> workers;
+  workers.reserve(k_threads);
+  for (int thread_index = 0; thread_index < k_threads; ++thread_index) {
+    workers.emplace_back([&]() {
+      for (int i = 0; i < k_iterations; ++i) {
+        auto reservation = governor.reserve(
+            MemoryClass::kPhaseResident, 64U, "unit.concurrent");
+        reservation.commit();
+      }
+      completed.fetch_add(1, std::memory_order_relaxed);
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  assert(completed.load(std::memory_order_relaxed) == k_threads);
+  const auto snapshot = governor.snapshot();
+  assert(snapshot.reserved_bytes == 0U);
+  assert(snapshot.committed_bytes == 0U);
+  assert(snapshot.rejection_count == 0U);
+  assert(snapshot.peak_committed_bytes > 0U);
+}
+
+}  // namespace
+
+int main() {
+  testUnlimitedBudgetAccounting();
+  testAdmissionBoundariesAndZeroByteReservation();
+  testSafetyMarginMatchesPreflightStyleAdmission();
+  testPressureBoundaries();
+  testTinyFiniteBudgetPressureIsTotal();
+  testPendingDestructionAndCommitLifecycle();
+  testMoveConstructionMoveAssignmentAndDoubleCommit();
+  testMultipleReservationsClassesAndReleaseOrder();
+  testCheckedArithmeticAndOversizedRequest();
+  testCommittedReservationTransfersIntoBaselineAtomically();
+  testDeterministicHeadroomAwareBatchSizing();
+  testRetainedWorkspaceBatchSizing();
+  testGovernedScratchArena();
+  testConcurrentControlPlaneReservations();
+  return 0;
+}

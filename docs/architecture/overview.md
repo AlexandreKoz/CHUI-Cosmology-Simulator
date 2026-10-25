@@ -1,0 +1,103 @@
+# Architecture overview
+
+This file is the architecture index for contributors.
+
+## Module ownership map
+
+1. `core`: configuration, provenance, units, time integration, shared state layout.
+2. `gravity`: TreePM, PM, tree ordering/gravity, coupling contracts.
+3. `hydro`: Godunov finite-volume hydro kernels and interfaces.
+4. `amr`: patch-based AMR lifecycle and synchronization boundaries.
+5. `physics`: cooling, SF, feedback, stellar evolution, AGN, tracers.
+6. `io`: IC ingest, snapshot I/O, restart checkpointing.
+7. `analysis`: diagnostics and halo/merger workflow scaffolding.
+8. `parallel`: distributed-memory exchange and backend seams.
+9. `utils`: narrow cross-module support only.
+
+## Workflow runtime services
+
+The workflow composition root creates one `workflows::RuntimeServices` bundle
+per process. It borrows the process MPI context and profiler and carries the
+deterministic-execution policy. `workflows::GravityRuntime` owns TreePM/PM
+cadence, force-cache lifecycle, and gravity stage contribution behind narrow
+acceleration and restart-state provider interfaces. Drift and the remaining
+runtime tasks receive the shared bundle (or an explicit borrowed dependency
+from it); they do not construct replacement MPI contexts.
+`workflows::FailureCoordinator` provides
+the phase gate used to reduce rank-local failures before any rank enters the
+following collective phase. The first integrated gate covers restart-topology
+validation; additional collective protocols should use the same authority.
+
+`workflows::HydroAmrRuntime` owns the supported rung-zero hydro/AMR stage,
+conserved-state and geometry workspaces, ghost/patch exchange validation,
+reflux handoff, and CFL diagnostics. Its public surface exposes only aggregate
+diagnostics and depends on gravity through `GravityAccelerationProvider`.
+`workflows::SourceRuntime` and `workflows::AnalysisRuntime` own construction and
+deterministic ordering of the existing source and diagnostic contributions.
+
+`workflows::RungZeroTimeState` owns the particle and gas-cell schedulers,
+integrator truth, and ordered output cadence. `workflows::TimeCoordinator`
+owns the bounded rung-zero segment lifecycle: active-set creation, endpoint and
+output-event clipping, adaptive criteria, migration/rebalance handoff, and
+legal output boundaries. The core orchestrator remains dependency-safe and
+accepts the workflow's typed dispatcher; it does not depend upward on workflow
+owners.
+
+`workflows::RuntimeModuleRegistry` is the authoritative production stage
+composition. Its typed descriptors declare prerequisites, task stages,
+resource access, view kinds, and factories. Freezing the registry constructs
+the real gravity, hydro/AMR, source, analysis, output/restart, and drift owners
+and produces the only `RuntimeExecutionPlan` consumed by `TimeCoordinator`.
+The execution plan binds one descriptor resource grant per task invocation and
+clears it with RAII. Public stage views expose freshness and the read-only grant
+only; they contain no `StepContext` or state-recovery API. Built-in owners enter
+the existing rung-zero bodies through a source-private bridge that validates the
+grant first. Timestep criteria, restart schemas, and migration payload schemas
+remain owned by their dedicated services rather than by module descriptors.
+`core::moduleDescriptors()` is a compile-time structural layer catalog; it
+does not drive runtime stage dispatch.
+
+## External initial-condition boundary
+
+Typed configuration in `core` defines only foundational convention and species
+policy values; `core` does not depend upward on `io`. `InitialConditionRuntime`
+translates that typed contract at the workflow composition boundary and passes
+its borrowed MPI context to the distributed reader.
+
+The I/O subsystem owns strict manifest v3 parsing, deterministic multifile
+inspection, canonical conversion semantics, bounded source chunks, explicit wire
+records, and collective import validation. It never initializes MPI. A distributed
+read produces an already-partitioned rank-local `SimulationState`; subsequent
+runtime migration/rebalancing remains owned by the parallel/workflow layer and is
+not used to repair a replicated import.
+
+This boundary prevents a second configuration system, a hidden communicator, a
+root-global state, and per-rank `O(global_particle_count)` authoritative IC
+allocation. See [`distributed_ic_ingestion.md`](distributed_ic_ingestion.md).
+
+## Architectural invariants
+
+- SoA-first and hot/cold separated state organization.
+- Explicit ownership boundaries; avoid duplicate systems.
+- Typed, normalized, validated config before execution.
+- Stable output naming and explicit schema versioning.
+- Deterministic behavior by default unless controlled stochasticity is explicitly configured.
+
+## Cross-links
+
+- Decision log: [`decision_log.md`](decision_log.md)
+- Developer workflow contract: [`developer_workflow_contract.md`](developer_workflow_contract.md)
+- Config reference: [`../configuration.md`](../configuration.md)
+- Output schema guide: [`../output_schema.md`](../output_schema.md)
+- Validation ladder: [`../validation_plan.md`](../validation_plan.md)
+- Profiling workflow: [`../profiling.md`](../profiling.md)
+- Distributed IC ingestion: [`distributed_ic_ingestion.md`](distributed_ic_ingestion.md)
+
+
+## Runtime capability authority
+
+`workflows::RuntimeCapabilityReport` is the single typed authority for capability
+status. It distinguishes requested, compiled, dependency-available,
+runtime-available, active, and maturity status. The core module registry carries
+only structural layer/dependency ownership and must not duplicate runtime
+capability truth as handwritten strings.

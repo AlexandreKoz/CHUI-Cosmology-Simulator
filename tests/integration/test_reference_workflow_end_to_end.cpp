@@ -1,0 +1,976 @@
+#include <cassert>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <unordered_map>
+
+#include "cosmosim/io/restart_checkpoint.hpp"
+#include "cosmosim/workflows/runtime_module_registry.hpp"
+#include "cosmosim/workflows/runtime_services.hpp"
+
+#include "cosmosim/cosmosim.hpp"
+#include "cosmosim/core/build_config.hpp"
+#include "../support/test_temp_workspace.hpp"
+
+[[nodiscard]] std::string readFile(const std::filesystem::path& path) {
+  std::ifstream in(path);
+  assert(in.good());
+  return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+[[nodiscard]] std::uint64_t xorRangeOneToN(std::uint64_t n) {
+  switch (n & 3ULL) {
+    case 0ULL: return n;
+    case 1ULL: return 1ULL;
+    case 2ULL: return n + 1ULL;
+    default: return 0ULL;
+  }
+}
+
+int main() {
+  auto buildConfigText = [](int cadence_steps, const std::string& run_name, std::string_view assignment_scheme) {
+    std::stringstream stream;
+    stream << "schema_version = 1\n\n";
+    stream << "[mode]\n";
+    stream << "mode = zoom_in\n";
+    stream << "ic_file = generated\n";
+    stream << "zoom_high_res_region = false\n\n";
+    stream << "[numerics]\n";
+    stream << "time_begin_code = 0.01\n";
+    stream << "time_end_code = 0.0102\n";
+    stream << "max_global_steps = 2\n";
+    stream << "hierarchical_max_rung = 0\n\n";
+    stream << "treepm_pm_grid = 9\n";
+    stream << "treepm_asmth_cells = 1.75\n";
+    // Keep this low-cost workflow fixture inside the periodic one-image domain.
+    stream << "treepm_rcut_cells = 3.9\n";
+    stream << "treepm_allow_diagnostic_naive_dft = true\n";
+    stream << "treepm_assignment_scheme = " << assignment_scheme << '\n';
+    stream << "treepm_update_cadence_steps = " << cadence_steps << "\n\n";
+    stream << "[output]\n";
+    stream << "run_name = " << run_name << '\n';
+    stream << "output_directory = integration_outputs\n";
+    stream << "output_stem = snapshot\n";
+    stream << "restart_stem = restart\n";
+    return stream.str();
+  };
+
+  auto makeDecoupledGasCellState = [](const std::array<std::uint32_t, 3>& row_to_physical) {
+    cosmosim::core::SimulationState state;
+    state.resizeParticles(2);
+    state.resizeCells(3);
+    state.resizePatches(1);
+
+    state.particle_sidecar.particle_id = {5001U, 6001U};
+    state.particle_sidecar.sfc_key = {100U, 200U};
+    state.particle_sidecar.species_tag = {
+        static_cast<std::uint32_t>(cosmosim::core::ParticleSpecies::kGas),
+        static_cast<std::uint32_t>(cosmosim::core::ParticleSpecies::kDarkMatter)};
+    state.particle_sidecar.owning_rank = {0U, 0U};
+    state.particle_sidecar.particle_flags = {0U, 0U};
+    state.particles.position_x_comoving = {0.15, 0.45};
+    state.particles.position_y_comoving = {0.05, 0.05};
+    state.particles.position_z_comoving = {0.05, 0.05};
+    state.particles.velocity_x_peculiar = {0.0, 0.0};
+    state.particles.velocity_y_peculiar = {0.0, 0.0};
+    state.particles.velocity_z_peculiar = {0.0, 0.0};
+    state.particles.mass_code = {3.0, 10.0};
+    state.particles.time_bin = {0U, 0U};
+    state.species.count_by_species.fill(0U);
+    state.species.count_by_species[static_cast<std::size_t>(cosmosim::core::ParticleSpecies::kGas)] = 1U;
+    state.species.count_by_species[static_cast<std::size_t>(cosmosim::core::ParticleSpecies::kDarkMatter)] = 1U;
+    state.rebuildSpeciesIndex();
+
+    state.patches.patch_id[0] = 9001U;
+    state.patches.level[0] = 0U;
+    state.patches.first_cell[0] = 0U;
+    state.patches.cell_count[0] = 3U;
+    state.patches.owning_rank[0] = 0U;
+    state.patches.origin_x_comoving[0] = 0.0;
+    state.patches.origin_y_comoving[0] = 0.0;
+    state.patches.origin_z_comoving[0] = 0.0;
+    state.patches.extent_x_comoving[0] = 0.3;
+    state.patches.extent_y_comoving[0] = 0.1;
+    state.patches.extent_z_comoving[0] = 0.1;
+    state.patches.cell_dim_x[0] = 3U;
+    state.patches.cell_dim_y[0] = 1U;
+    state.patches.cell_dim_z[0] = 1U;
+
+    struct CellSeed {
+      std::uint64_t gas_cell_id;
+      std::optional<std::uint64_t> parent_particle_id;
+      double density;
+      double pressure;
+      double internal_energy;
+      double velocity_x;
+    };
+    const std::array<CellSeed, 3> physical_cells{{
+        {8001U, std::nullopt, 1.0, 1.2, 1.8, -0.1},
+        {8002U, 5001U, 1.1, 1.3, 1.9, 0.0},
+        {8003U, 5001U, 0.9, 1.4, 2.0, 0.1},
+    }};
+
+    std::vector<cosmosim::core::GasCellIdentityRecord> records;
+    records.reserve(physical_cells.size());
+    for (std::uint32_t row = 0; row < row_to_physical.size(); ++row) {
+      const std::uint32_t physical = row_to_physical[row];
+      assert(physical < physical_cells.size());
+      const CellSeed& seed = physical_cells[physical];
+      state.cells.center_x_comoving[row] = 0.05 + 0.1 * static_cast<double>(physical);
+      state.cells.center_y_comoving[row] = 0.05;
+      state.cells.center_z_comoving[row] = 0.05;
+      state.cells.mass_code[row] = 1.0;
+      state.cells.time_bin[row] = 0U;
+      state.cells.patch_index[row] = 0U;
+      state.gas_cells.density_code[row] = seed.density;
+      state.gas_cells.pressure_code[row] = seed.pressure;
+      state.gas_cells.internal_energy_code[row] = seed.internal_energy;
+      state.gas_cells.temperature_code[row] = 1.0;
+      state.gas_cells.sound_speed_code[row] = 1.0;
+      state.gas_cells.velocity_x_peculiar[row] = seed.velocity_x;
+      state.gas_cells.velocity_y_peculiar[row] = 0.0;
+      state.gas_cells.velocity_z_peculiar[row] = 0.0;
+      records.push_back(cosmosim::core::GasCellIdentityRecord{
+          .gas_cell_id = seed.gas_cell_id,
+          .parent_particle_id = seed.parent_particle_id,
+          .owning_patch_id = 9001U,
+          .local_cell_row = row,
+      });
+    }
+    state.replaceGasCellIdentityRecords(std::move(records));
+    assert(state.gasCellIdentityMapMatchesSidecarLanes());
+    assert(state.validateOwnershipInvariants());
+    return state;
+  };
+
+  auto gasStateByStableId = [](const cosmosim::core::SimulationState& state) {
+    std::unordered_map<std::uint64_t, std::array<double, 7>> values;
+    state.requireGasCellIdentityMapCoversDenseRows("reference workflow H2 stable-id comparison");
+    for (std::uint32_t row = 0; row < state.cells.size(); ++row) {
+      const auto* record = state.gas_cell_identity.findByLocalRow(row);
+      assert(record != nullptr);
+      values.emplace(record->gas_cell_id, std::array<double, 7>{
+          state.cells.mass_code[row],
+          state.cells.center_x_comoving[row],
+          state.gas_cells.density_code[row],
+          state.gas_cells.pressure_code[row],
+          state.gas_cells.internal_energy_code[row],
+          state.gas_cells.velocity_x_peculiar[row],
+          static_cast<double>(state.cells.time_bin[row])});
+    }
+    return values;
+  };
+
+  std::stringstream stream;
+  stream << buildConfigText(1, "reference_integration_test", "cic");
+  // Exercise the production governor with a finite authoritative process ceiling.
+  stream << "\n[parallel]\nprocess_memory_budget_bytes = 1073741824\n";
+
+  const cosmosim::core::FrozenConfig frozen =
+      cosmosim::core::loadFrozenConfigFromString(stream.str(), "test_reference_workflow_end_to_end");
+
+  cosmosim::workflows::ReferenceWorkflowRunner runner(frozen);
+  const std::filesystem::path output_dir =
+      cosmosim::test_support::TestTempWorkspace::uniqueProcessLocalPath("cosmosim_reference_workflow_test");
+  bool inspected_reference_drift = false;
+  cosmosim::workflows::ReferenceWorkflowOptions graph_options{.write_outputs = false};
+  graph_options.register_runtime_modules = [&](cosmosim::workflows::RuntimeModuleRegistry& registry) {
+    using namespace cosmosim::workflows;
+    for (const auto& module : registry.descriptors()) {
+      for (const auto& task : module.stage_tasks) {
+        if (task.task_id != "time.drift_particles") continue;
+        if (task.view_kind != RuntimeStageViewKind::kDriftParticles || task.resources.size() != 3U)
+          throw std::runtime_error("reference drift typed-view contract changed");
+        for (const auto& access : task.resources) {
+          const auto expected = access.resource == RuntimeResourceKey::kMigrationOwnership
+              ? RuntimeResourceAccessMode::kRead : RuntimeResourceAccessMode::kReadWrite;
+          if ((access.resource != RuntimeResourceKey::kParticlePosition &&
+               access.resource != RuntimeResourceKey::kParticleVelocity &&
+               access.resource != RuntimeResourceKey::kMigrationOwnership) || access.mode != expected)
+            throw std::runtime_error("reference drift resource grant changed");
+        }
+        inspected_reference_drift = true;
+      }
+    }
+    if (!inspected_reference_drift) throw std::runtime_error("reference drift task missing");
+  };
+  const cosmosim::workflows::ReferenceWorkflowReport report =
+      runner.run(output_dir, graph_options);
+  // run() freezes/admit-checks the actual built-ins, then executes two complete
+  // KDK steps. This regression is registered even without HDF5/FFTW.
+  if (!inspected_reference_drift || report.completed_steps != 2U ||
+      report.treepm_long_range_refresh_count < 3U)
+    throw std::runtime_error("reference graph did not reach multi-step gravity execution");
+
+  const std::filesystem::path expected_run_dir = output_dir / "reference_integration_test";
+
+  assert(report.config_compatible);
+  assert(report.schema_compatible);
+  assert(report.canonical_stage_order);
+  assert(report.stage_sequence.size() == cosmosim::core::StageScheduler::kickDriftKickOrder().size() * 2U);
+  assert(report.stage_sequence.front() == "gravity_kick_pre");
+  assert(report.stage_sequence.back() == "output_check");
+  assert(report.completed_steps == 2);
+  assert(report.world_size == 1);
+  assert(report.world_rank == 0);
+  assert(report.local_particle_count == 42);
+  assert(report.global_particle_count == 42);
+  assert(report.local_cell_count == 6);
+  assert(report.global_cell_count == 6);
+  assert(report.local_particle_id_sum == (42ULL * 43ULL) / 2ULL);
+  assert(report.global_particle_id_sum == (42ULL * 43ULL) / 2ULL);
+  assert(report.local_particle_id_xor == xorRangeOneToN(42));
+  assert(report.global_particle_id_xor == xorRangeOneToN(42));
+  assert(report.treepm_pm_grid == 9);
+  assert(report.treepm_pm_grid_nx == 9);
+  assert(report.treepm_pm_grid_ny == 9);
+  assert(report.treepm_pm_grid_nz == 9);
+  assert(report.treepm_pm_grid_shape == "9x9x9");
+  assert(report.treepm_update_cadence_steps == 1);
+  // Two KDK steps with gas intentionally mutate authoritative gravity sources in
+  // HydroUpdate after each scheduled post-drift PM refresh. The integrator must
+  // therefore repair the long-range field before each post-kick rather than reuse
+  // a stale source epoch. This is a physical validity contract, not a magic count.
+  assert(report.treepm_long_range_refresh_count == 5);
+  assert(report.treepm_long_range_reuse_count == 0);
+  assert(report.treepm_cadence_records.size() == 5);
+  const std::array<std::string_view, 5> expected_refresh_reasons{
+      "initial_force_bootstrap",
+      "scheduled_force_refresh_stage",
+      "source_mutation_force_refresh",
+      "scheduled_force_refresh_stage",
+      "source_mutation_force_refresh"};
+  const std::array<std::string_view, 5> expected_refresh_stages{
+      "gravity_kick_pre", "force_refresh", "gravity_kick_post",
+      "force_refresh", "gravity_kick_post"};
+  for (std::size_t i = 0; i < report.treepm_cadence_records.size(); ++i) {
+    const auto& record = report.treepm_cadence_records[i];
+    assert(record.refreshed_long_range_field);
+    assert(record.field_built_step_index == record.step_index);
+    assert(record.field_age_in_kick_opportunities == 0);
+    assert(record.pm_refresh_reason == expected_refresh_reasons[i]);
+    assert(record.stage_name == expected_refresh_stages[i]);
+  }
+  assert(report.run_directory == expected_run_dir);
+  assert(report.normalized_config_snapshot_written);
+  assert(std::filesystem::exists(report.normalized_config_snapshot_path));
+  assert(std::filesystem::exists(report.profiler_json_path));
+  assert(std::filesystem::exists(report.profiler_csv_path));
+  assert(std::filesystem::exists(report.operational_report_json_path));
+
+  std::ifstream op_in(report.operational_report_json_path);
+  const std::string op_text((std::istreambuf_iterator<char>(op_in)), std::istreambuf_iterator<char>());
+  op_in.close();
+  assert(op_text.find("\"event_kind\": \"config.freeze\"") != std::string::npos);
+  assert(op_text.find("\"provenance_config_hash_hex\"") != std::string::npos);
+  assert(op_text.find("\"status\": \"ok\"") != std::string::npos);
+  assert(op_text.find("\"event_kind\": \"gravity.treepm_setup\"") != std::string::npos);
+  const std::size_t first_pm_event_begin =
+      op_text.find("\"event_kind\": \"gravity.pm_long_range_field\"");
+  assert(first_pm_event_begin != std::string::npos);
+  const std::size_t first_pm_event_end =
+      op_text.find("\"event_kind\":", first_pm_event_begin + 1U);
+  const std::string first_pm_event = op_text.substr(
+      first_pm_event_begin,
+      first_pm_event_end == std::string::npos
+          ? std::string::npos
+          : first_pm_event_end - first_pm_event_begin);
+  assert(first_pm_event.find("\"gravity_kick_opportunity\": \"1\"") != std::string::npos);
+  assert(first_pm_event.find("\"field_version\": \"1\"") != std::string::npos);
+  assert(op_text.find("\"pm_grid\": \"9x9x9\"") != std::string::npos);
+  assert(op_text.find("\"pm_assignment_scheme\": \"cic\"") != std::string::npos);
+  assert(op_text.find("\"softening_kernel\": \"plummer\"") != std::string::npos);
+  assert(op_text.find("\"pm_fft_backend\"") != std::string::npos);
+  assert(op_text.find("\"pm_update_cadence_steps\": \"1\"") != std::string::npos);
+  assert(op_text.find("\"gravitational_constant_code\": \"0.000000\"") == std::string::npos);
+  assert(op_text.find("\"tree_relative_force_acceleration_floor\": \"0.000000\"") ==
+      std::string::npos);
+  assert(op_text.find("\"event_kind\": \"gravity.health_summary\"") != std::string::npos);
+  assert(op_text.find("\"heavy_reference_checks_opt_in\": \"false\"") != std::string::npos);
+  const std::string profile_text = readFile(report.profiler_json_path);
+  assert(profile_text.find("\"governor\"") != std::string::npos);
+  assert(profile_text.find("\"hard_limit_bytes\": 1073741824") != std::string::npos);
+  assert(profile_text.find("\"pressure\": \"green\"") != std::string::npos);
+  assert(profile_text.find("\"process_memory\"") != std::string::npos);
+  assert(profile_text.find("\"known_accounted_bytes\"") != std::string::npos);
+  assert(profile_text.find("\"observed_rss_bytes\"") != std::string::npos);
+  assert(profile_text.find("\"unexplained_resident_bytes\"") != std::string::npos);
+  assert(profile_text.find("\"distributed_process_memory\"") != std::string::npos);
+  assert(profile_text.find("\"rank_count\": 1") != std::string::npos);
+  const std::size_t governor_begin = profile_text.find("\"governor\": {");
+  assert(governor_begin != std::string::npos);
+  const std::string governor_text = profile_text.substr(governor_begin, 768U);
+  assert(governor_text.find("\"committed_bytes\": 0") == std::string::npos);
+  assert(governor_text.find("\"peak_committed_bytes\": 0") == std::string::npos);
+  assert(governor_text.find("\"peak_reserved_bytes\": 0") == std::string::npos);
+  assert(profile_text.find("\"workflow_workspace_reuses\": 2") != std::string::npos);
+  assert(profile_text.find("\"scheduler_active_index_copy_bytes\": 0") !=
+         std::string::npos);
+  assert(profile_text.find("\"timestep_particle_criteria_evaluations\": 84") !=
+         std::string::npos);
+  assert(profile_text.find("\"timestep_gas_cell_criteria_evaluations\": 12") !=
+         std::string::npos);
+
+  std::stringstream tsc_stream;
+  tsc_stream << buildConfigText(1, "reference_integration_test_tsc", "tsc");
+
+  const cosmosim::core::FrozenConfig tsc_frozen =
+      cosmosim::core::loadFrozenConfigFromString(tsc_stream.str(), "test_reference_workflow_tsc");
+  cosmosim::workflows::ReferenceWorkflowRunner tsc_runner(tsc_frozen);
+  const cosmosim::workflows::ReferenceWorkflowReport tsc_report =
+      tsc_runner.run(output_dir, cosmosim::workflows::ReferenceWorkflowOptions{.write_outputs = false});
+  assert(tsc_report.completed_steps == 2);
+  assert(tsc_report.treepm_pm_grid == 9);
+  assert(tsc_report.treepm_pm_grid_shape == "9x9x9");
+  assert(tsc_report.treepm_long_range_refresh_count == 5);
+  assert(tsc_report.treepm_long_range_reuse_count == 0);
+
+  // The composed process-memory model is a real production gate, not a test-only
+  // utility. A deliberately impossible process budget must fail before gravity
+  // materializes its large staging/tree/PM workspaces.
+  {
+    std::string budget_config =
+        buildConfigText(1, "reference_integration_process_budget_reject", "cic");
+    budget_config += "\n[parallel]\nprocess_memory_budget_bytes = 1\n";
+    const auto budget_frozen = cosmosim::core::loadFrozenConfigFromString(
+        budget_config, "test_reference_workflow_process_memory_budget");
+    cosmosim::workflows::ReferenceWorkflowRunner budget_runner(budget_frozen);
+    bool rejected = false;
+    try {
+      (void)budget_runner.run(
+          output_dir, cosmosim::workflows::ReferenceWorkflowOptions{.write_outputs = false});
+    } catch (const std::runtime_error& ex) {
+      const std::string_view message(ex.what());
+      // The first governed admission to execute may reject first. Since the
+      // P4 startup decomposition closure the startup seed/top-domain
+      // reservation fires before any gravity-stage reservation, so the
+      // rejection owner is not necessarily gravity-owned. Either the DMO
+      // process preflight or a MemoryGovernor reservation rejection pinned to
+      // the 1-byte hard limit proves the run failed closed before
+      // materializing large staging/tree/PM workspaces.
+      rejected =
+          message.find("DMO process memory preflight requires") != std::string_view::npos ||
+          (message.find("memory reservation rejected") != std::string_view::npos &&
+           message.find("hard_limit_bytes=1") != std::string_view::npos &&
+           (message.find("owner=parallel.") != std::string_view::npos ||
+            message.find("owner=gravity.") != std::string_view::npos));
+    }
+    assert(rejected);
+  }
+
+  // Red pressure may postpone optional science diagnostics, but it must not
+  // alter the gravity/hydro step or suppress required run-health diagnostics.
+  {
+    std::string pressure_config =
+        buildConfigText(1, "reference_integration_red_pressure", "cic");
+    const std::string max_steps = "max_global_steps = 2";
+    const std::size_t max_steps_pos = pressure_config.find(max_steps);
+    assert(max_steps_pos != std::string::npos);
+    pressure_config.replace(
+        max_steps_pos, max_steps.size(), "max_global_steps = 1");
+    pressure_config +=
+        "\n[analysis]\n"
+        "enable_diagnostics = true\n"
+        "diagnostics_execution_policy = run_health_and_light_science\n"
+        "run_health_interval_steps = 1\n"
+        "science_light_interval_steps = 1\n"
+        "science_heavy_interval_steps = 8\n"
+        "\n[parallel]\n"
+        // Budget/overlap arithmetic is pinned to measured production memory
+        // behavior: the in-step accounted peak is baseline + committed =
+        // 67,235,394 bytes (dominated by the hydro active-batch scratch arena),
+        // while at the analysis stage almost everything is released
+        // (baseline 94,166 + committed 2,392). Red pressure therefore requires
+        // the overlap reserve itself to sit above the 95% red threshold
+        // (0.95 * budget), while the budget must still admit the mid-step peak.
+        // budget = 1,400,000,000 leaves 1,764,606 bytes over the measured peak,
+        // and overlap = 1,331,000,000 keeps analysis accounted demand 1,096,558
+        // bytes above the red threshold with ~68.9 MB of headroom for the
+        // required run-health bundle. The previous pair (1,073,741,824 /
+        // 1,021,000,000) left ~15 KB of headroom mid-step, so the required AMR
+        // sweep was rejected and the fixture failed its own completed_steps
+        // assertion.
+        "process_memory_budget_bytes = 1400000000\n"
+        "process_output_restart_overlap_bytes = 1331000000\n"
+        "process_memory_safety_margin_fraction = 0.0\n";
+    const auto pressure_frozen = cosmosim::core::loadFrozenConfigFromString(
+        pressure_config, "test_reference_workflow_red_pressure");
+    cosmosim::workflows::ReferenceWorkflowRunner pressure_runner(pressure_frozen);
+    const auto pressure_report = pressure_runner.run(
+        output_dir, cosmosim::workflows::ReferenceWorkflowOptions{.write_outputs = false});
+    assert(pressure_report.completed_steps == 1U);
+    const std::string pressure_events = readFile(pressure_report.operational_report_json_path);
+    assert(pressure_events.find("\"event_kind\": \"analysis.memory_pressure_deferral\"") !=
+           std::string::npos);
+    assert(pressure_events.find("\"pressure\": \"red\"") != std::string::npos);
+  }
+
+  // A transient red-pressure episode must not permanently starve a due
+  // optional science diagnostic. The test starts at step 3 so light-science
+  // cadence 4 is due at completed step 4, forces red pressure only for that
+  // analysis stage, restores the production baseline before OutputCheck, and
+  // verifies catch-up on completed step 5 even though cadence 4 is no longer
+  // due. Safety still wins: the catch-up occurs only after pressure is eased.
+  {
+    std::string catchup_config =
+        buildConfigText(1, "reference_integration_analysis_catchup", "cic");
+    const std::string catchup_time_end = "time_end_code = 0.0102";
+    const std::size_t catchup_time_end_pos = catchup_config.find(catchup_time_end);
+    assert(catchup_time_end_pos != std::string::npos);
+    catchup_config.replace(
+        catchup_time_end_pos, catchup_time_end.size(), "time_end_code = 0.0108");
+    const std::string catchup_max_steps = "max_global_steps = 2";
+    const std::size_t catchup_max_steps_pos = catchup_config.find(catchup_max_steps);
+    assert(catchup_max_steps_pos != std::string::npos);
+    catchup_config.replace(
+        catchup_max_steps_pos, catchup_max_steps.size(), "max_global_steps = 8");
+    catchup_config +=
+        "\n[analysis]\n"
+        "enable_diagnostics = true\n"
+        "diagnostics_execution_policy = run_health_and_light_science\n"
+        "run_health_interval_steps = 1\n"
+        "science_light_interval_steps = 4\n"
+        "science_heavy_interval_steps = 8\n"
+        "\n[parallel]\n"
+        "process_memory_budget_bytes = 1073741824\n"
+        "process_memory_safety_margin_fraction = 0.0\n";
+    const auto catchup_frozen = cosmosim::core::loadFrozenConfigFromString(
+        catchup_config, "test_reference_workflow_analysis_catchup");
+    cosmosim::workflows::ReferenceWorkflowRunner catchup_runner(catchup_frozen);
+
+    struct PressureToggleState {
+      cosmosim::core::MemoryGovernor* governor = nullptr;
+      std::uint64_t production_baseline_bytes = 0U;
+      std::uint64_t analysis_invocations = 0U;
+      std::uint64_t red_invocations = 1U;
+      bool baseline_restored = false;
+    };
+    auto pressure_toggle = std::make_shared<PressureToggleState>();
+
+    cosmosim::workflows::ReferenceWorkflowOptions catchup_options;
+    catchup_options.step_index = 3U;
+    catchup_options.max_steps_override = 8U;
+    // Pin dt so the 8-step segment fits the time_end_code window
+    // (0.0108 - 0.01 = 0.0008 = 8 * 1e-4). Adaptive CFL currently proposes
+    // ~1.49e-4 for this fixture, which reached time_end after only 6 steps and
+    // failed the completed_steps == 8 assertions. A pinned dt keeps the
+    // cadence bookkeeping under test independent of physics-driven dt drift.
+    catchup_options.dt_time_code = 1.0e-4;
+    catchup_options.write_outputs = false;
+    catchup_options.register_runtime_modules =
+        [pressure_toggle](cosmosim::workflows::RuntimeModuleRegistry& registry) {
+          using namespace cosmosim::workflows;
+          registry.registerModule(RuntimeModuleDescriptor{
+              .module_id = "test_analysis_pressure_toggle",
+              .schema_version = 1,
+              .construction_ordinal = 1000,
+              .prerequisites = {"analysis"},
+              .incompatibilities = {},
+              .stage_tasks = {
+                  RuntimeTaskDeclaration{
+                      .task_id = "force_transient_red_pressure",
+                      .stage = cosmosim::core::IntegrationStage::kAnalysisHooks,
+                      .ordinal = 50,
+                      .view_kind = RuntimeStageViewKind::kAnalysis,
+                      .resources = {RuntimeResourceAccess{
+                          .resource = RuntimeResourceKey::kDiagnostics,
+                          .mode = RuntimeResourceAccessMode::kWrite,
+                      }},
+                      .dependencies = {"gravity::gravity.gravity_kick_post"},
+                  },
+                  RuntimeTaskDeclaration{
+                      .task_id = "restore_memory_baseline",
+                      .stage = cosmosim::core::IntegrationStage::kOutputCheck,
+                      .ordinal = -50,
+                      .view_kind = RuntimeStageViewKind::kOutputRestart,
+                      .resources = {RuntimeResourceAccess{
+                          .resource = RuntimeResourceKey::kOutputRestartState,
+                          .mode = RuntimeResourceAccessMode::kReadWrite,
+                      }},
+                      .dependencies = {"analysis::analysis.diagnostics"},
+                  },
+              },
+              .factory = [pressure_toggle](const RuntimeModuleFactoryContext& context) {
+                assert(context.services.memory_governor != nullptr);
+                pressure_toggle->governor = context.services.memory_governor;
+                RuntimeModuleInstance instance;
+                instance.owner_lifetime = pressure_toggle;
+                instance.stage_tasks.push_back(RuntimeStageTaskContribution{
+                    .task_id = "force_transient_red_pressure",
+                    .task = AnalysisStageTask(
+                        [pressure_toggle](AnalysisStageView& view) {
+                          view.requireFresh();
+                          ++pressure_toggle->analysis_invocations;
+                          if (pressure_toggle->analysis_invocations > pressure_toggle->red_invocations) {
+                            return;
+                          }
+                          const auto snapshot = pressure_toggle->governor->snapshot();
+                          assert(snapshot.hard_limit_bytes != 0U);
+                          pressure_toggle->production_baseline_bytes =
+                              snapshot.baseline_owned_bytes;
+                          assert(snapshot.accounted_bytes >= snapshot.baseline_owned_bytes);
+                          const std::uint64_t non_baseline_bytes =
+                              snapshot.accounted_bytes - snapshot.baseline_owned_bytes;
+                          const std::uint64_t red_target_bytes =
+                              snapshot.hard_limit_bytes * 96U / 100U;
+                          assert(red_target_bytes > non_baseline_bytes);
+                          pressure_toggle->governor->setBaselineOwnedBytes(
+                              red_target_bytes - non_baseline_bytes);
+                          assert(pressure_toggle->governor->snapshot().pressure ==
+                                 cosmosim::core::MemoryPressure::kRed);
+                        }),
+                });
+                instance.stage_tasks.push_back(RuntimeStageTaskContribution{
+                    .task_id = "restore_memory_baseline",
+                    .task = OutputRestartStageTask(
+                        [pressure_toggle](OutputRestartStageView& view) {
+                          view.requireFresh();
+                          if (pressure_toggle->analysis_invocations == pressure_toggle->red_invocations &&
+                              !pressure_toggle->baseline_restored) {
+                            pressure_toggle->governor->setBaselineOwnedBytes(
+                                pressure_toggle->production_baseline_bytes);
+                            pressure_toggle->baseline_restored = true;
+                            const auto restored = pressure_toggle->governor->snapshot();
+                            assert(restored.pressure != cosmosim::core::MemoryPressure::kRed);
+                            assert(restored.pressure != cosmosim::core::MemoryPressure::kTrip);
+                          }
+                        }),
+                });
+                return instance;
+              },
+          });
+        };
+
+    const auto catchup_report = catchup_runner.run(output_dir, catchup_options);
+    assert(catchup_report.completed_steps == 8U);
+    assert(pressure_toggle->analysis_invocations == 8U);
+    assert(pressure_toggle->baseline_restored);
+    const std::string catchup_events =
+        readFile(catchup_report.operational_report_json_path);
+    assert(catchup_events.find("\"event_kind\": \"analysis.memory_pressure_deferral\"") !=
+           std::string::npos);
+    assert(catchup_events.find("\"event_kind\": \"analysis.memory_pressure_catchup\"") !=
+           std::string::npos);
+    assert(catchup_events.find("\"science_light_catchup\": \"true\"") !=
+           std::string::npos);
+
+    // Two missed cadence epochs coalesce into one current-state product.
+    // No historical physical state is relabeled or silently reconstructed.
+    std::string repeated_config = catchup_config;
+    const auto cadence_pos = repeated_config.find("science_light_interval_steps = 4");
+    assert(cadence_pos != std::string::npos);
+    repeated_config.replace(cadence_pos, std::string("science_light_interval_steps = 4").size(),
+                            "science_light_interval_steps = 2");
+    const auto run_name_pos = repeated_config.find("reference_integration_analysis_catchup");
+    assert(run_name_pos != std::string::npos);
+    repeated_config.replace(run_name_pos, std::string("reference_integration_analysis_catchup").size(),
+                            "reference_integration_analysis_coalesced");
+    pressure_toggle->analysis_invocations = 0U;
+    pressure_toggle->red_invocations = 3U;
+    pressure_toggle->baseline_restored = false;
+    auto repeated_options = catchup_options;
+    const auto repeated_frozen = cosmosim::core::loadFrozenConfigFromString(
+        repeated_config, "test_reference_workflow_analysis_coalesced");
+    const auto repeated_report = cosmosim::workflows::ReferenceWorkflowRunner(repeated_frozen).run(
+        output_dir, repeated_options);
+    assert(repeated_report.completed_steps == 8U);
+    const std::string repeated_events = readFile(repeated_report.operational_report_json_path);
+    assert(repeated_events.find("\"missed_count\": \"2\"") != std::string::npos);
+    assert(repeated_events.find("\"coalesced_count\": \"1\"") != std::string::npos);
+    assert(repeated_events.find("\"actual_execution_step\": \"7\"") != std::string::npos);
+    assert(repeated_events.find("\"historical_state_replayed\": \"false\"") != std::string::npos);
+
+    // Persistent pressure through run termination must generate a dropped
+    // product event, never force an optional allocation through the ceiling.
+    pressure_toggle->analysis_invocations = 0U;
+    pressure_toggle->red_invocations = 1U;
+    pressure_toggle->baseline_restored = false;
+    repeated_options.max_steps_override = 1U;
+    std::string terminal_config = catchup_config;
+    const auto terminal_name_pos = terminal_config.find("reference_integration_analysis_catchup");
+    assert(terminal_name_pos != std::string::npos);
+    terminal_config.replace(terminal_name_pos, std::string("reference_integration_analysis_catchup").size(),
+                            "reference_integration_analysis_terminal_pressure");
+    const auto terminal_frozen = cosmosim::core::loadFrozenConfigFromString(
+        terminal_config, "test_reference_workflow_analysis_terminal_pressure");
+    const auto terminal_report = cosmosim::workflows::ReferenceWorkflowRunner(terminal_frozen).run(
+        output_dir, repeated_options);
+    assert(terminal_report.completed_steps == 1U);
+    const std::string terminal_events = readFile(terminal_report.operational_report_json_path);
+    assert(terminal_events.find("\"event_kind\": \"analysis.optional_cadence_dropped\"") !=
+           std::string::npos);
+    assert(terminal_events.find("\"dropped_count\": \"1\"") != std::string::npos);
+  }
+
+  // P1 residual observability identity plus P3 OpenMP worker telemetry: the
+  // exact pair-evaluation identity holds event by event, configured worker
+  // telemetry tracks the requested team size, and residual counters are
+  // deterministic across OpenMP team sizes.
+  {
+    auto extractPayloadValues = [](const std::string& text, std::string_view key) {
+      std::vector<std::string> values;
+      const std::string needle = "\"" + std::string(key) + "\": \"";
+      std::size_t pos = 0U;
+      while ((pos = text.find(needle, pos)) != std::string::npos) {
+        const std::size_t begin = pos + needle.size();
+        const std::size_t end = text.find('"', begin);
+        if (end == std::string::npos) {
+          break;
+        }
+        values.push_back(text.substr(begin, end - begin));
+        pos = end + 1U;
+      }
+      return values;
+    };
+    std::vector<std::vector<std::string>> totals_by_threads;
+    std::vector<std::vector<std::string>> locals_by_threads;
+    std::vector<std::vector<std::string>> remotes_by_threads;
+#ifdef _OPENMP
+    const std::vector<int> omp_thread_sizes{1, 2, 4};
+#else
+    // A non-OpenMP build fail-closes parallel.omp_threads > 1 in core config,
+    // so only the serial worker telemetry can be qualified here.
+    const std::vector<int> omp_thread_sizes{1};
+#endif
+    for (const int omp_threads : omp_thread_sizes) {
+      const std::string label = std::to_string(omp_threads);
+      std::string omp_config =
+          buildConfigText(1, "reference_integration_omp_workers_" + label, "cic");
+      omp_config += "\n[parallel]\nomp_threads = " + label + "\n";
+      const auto omp_frozen = cosmosim::core::loadFrozenConfigFromString(
+          omp_config, "test_reference_workflow_omp_workers");
+      cosmosim::workflows::ReferenceWorkflowRunner omp_runner(omp_frozen);
+      const cosmosim::workflows::ReferenceWorkflowReport omp_report =
+          omp_runner.run(
+              output_dir,
+              cosmosim::workflows::ReferenceWorkflowOptions{.write_outputs = false});
+      assert(omp_report.completed_steps == 2U);
+      const std::string omp_events = readFile(omp_report.operational_report_json_path);
+      const auto totals = extractPayloadValues(omp_events, "total_pair_evaluations");
+      const auto locals = extractPayloadValues(omp_events, "local_pair_evaluations");
+      const auto remotes = extractPayloadValues(omp_events, "remote_pair_evaluations");
+      const auto configured = extractPayloadValues(omp_events, "openmp_configured_workers");
+      const auto observed = extractPayloadValues(omp_events, "openmp_observed_workers");
+      assert(totals.size() == 5U);
+      assert(locals.size() == totals.size());
+      assert(remotes.size() == totals.size());
+      for (std::size_t i = 0U; i < totals.size(); ++i) {
+        assert(std::stoull(totals[i]) == std::stoull(locals[i]) + std::stoull(remotes[i]));
+      }
+      assert(configured.size() == totals.size());
+      assert(observed.size() == totals.size());
+      for (std::size_t i = 0U; i < configured.size(); ++i) {
+        assert(std::stoul(configured[i]) == static_cast<unsigned long>(omp_threads));
+        // Observed worker telemetry reflects the configured team size.
+        assert(std::stoul(observed[i]) == std::stoul(configured[i]));
+      }
+      totals_by_threads.push_back(totals);
+      locals_by_threads.push_back(locals);
+      remotes_by_threads.push_back(remotes);
+    }
+    assert(totals_by_threads.size() == omp_thread_sizes.size());
+    for (std::size_t run = 1U; run < totals_by_threads.size(); ++run) {
+      assert(totals_by_threads[run] == totals_by_threads[0]);
+      assert(locals_by_threads[run] == locals_by_threads[0]);
+      assert(remotes_by_threads[run] == remotes_by_threads[0]);
+    }
+  }
+
+  std::string endpoint_config =
+      buildConfigText(1, "reference_integration_endpoint_clip", "cic");
+  const std::string original_endpoint = "time_end_code = 0.0102";
+  const std::size_t endpoint_pos = endpoint_config.find(original_endpoint);
+  assert(endpoint_pos != std::string::npos);
+  endpoint_config.replace(
+      endpoint_pos, original_endpoint.size(), "time_end_code = 0.01025");
+  const cosmosim::core::FrozenConfig endpoint_frozen =
+      cosmosim::core::loadFrozenConfigFromString(
+          endpoint_config, "test_reference_workflow_endpoint_clip");
+  cosmosim::workflows::ReferenceWorkflowRunner endpoint_runner(endpoint_frozen);
+  const cosmosim::workflows::ReferenceWorkflowReport endpoint_report =
+      endpoint_runner.run(
+          output_dir,
+          cosmosim::workflows::ReferenceWorkflowOptions{
+              .dt_time_code = 0.0002,
+              .write_outputs = false});
+  assert(endpoint_report.completed_steps == 2U);
+  assert(std::abs(endpoint_report.final_time_code - 0.01025) < 1.0e-15);
+  assert(endpoint_report.final_time_code <= 0.01025);
+  const std::string endpoint_events_text =
+      readFile(endpoint_report.operational_report_json_path);
+  assert(endpoint_events_text.find("\"event_kind\": \"time.endpoint_clip\"") !=
+         std::string::npos);
+
+  const std::string cadence_two_config =
+      buildConfigText(2, "reference_integration_test_cadence_two", "cic");
+  bool unsafe_cadence_rejected = false;
+  try {
+    (void)cosmosim::core::loadFrozenConfigFromString(
+        cadence_two_config, "test_reference_workflow_cadence_two");
+  } catch (const cosmosim::core::ConfigError&) {
+    unsafe_cadence_rejected = true;
+  }
+  assert(unsafe_cadence_rejected);
+
+  const std::string restart_diagnostics_config =
+      buildConfigText(1, "reference_integration_test_restart_diagnostics", "cic") +
+      "snapshot_interval_steps = 1\n"
+      "write_restarts = true\n";
+  const cosmosim::core::FrozenConfig restart_diagnostics_frozen =
+      cosmosim::core::loadFrozenConfigFromString(
+          restart_diagnostics_config,
+          "test_reference_workflow_restart_diagnostics");
+  cosmosim::workflows::ReferenceWorkflowRunner restart_diagnostics_runner(restart_diagnostics_frozen);
+#if COSMOSIM_ENABLE_HDF5
+  const cosmosim::workflows::ReferenceWorkflowReport restart_diagnostics_report =
+      restart_diagnostics_runner.run(output_dir, cosmosim::workflows::ReferenceWorkflowOptions{.write_outputs = true});
+  assert(restart_diagnostics_report.restart_roundtrip_executed);
+  assert(restart_diagnostics_report.restart_roundtrip_ok);
+  assert(std::filesystem::exists(restart_diagnostics_report.restart_path));
+  const std::string restart_diag_events_text = readFile(restart_diagnostics_report.operational_report_json_path);
+  assert(restart_diag_events_text.find("\"event_kind\": \"restart.write.complete\"") != std::string::npos);
+  // Streaming verification replaced the full readback (restart.read.complete
+  // was renamed restart.verify.complete in the streaming-verification change).
+  assert(restart_diag_events_text.find("\"event_kind\": \"restart.verify.complete\"") != std::string::npos);
+  assert(restart_diag_events_text.find("\"payload_hash_hex\"") != std::string::npos);
+  assert(restart_diag_events_text.find("\"scheduler_pending_transition_count\"") != std::string::npos);
+
+  std::string time_cadence_config =
+      buildConfigText(1, "reference_integration_time_cadence", "cic") +
+      "snapshot_interval_steps = 0\n"
+      "snapshot_interval_time_code = 0.00015\n"
+      "write_restarts = true\n";
+  const std::size_t time_cadence_end = time_cadence_config.find("time_end_code = 0.0102");
+  assert(time_cadence_end != std::string::npos);
+  time_cadence_config.replace(
+      time_cadence_end,
+      std::string("time_end_code = 0.0102").size(),
+      "time_end_code = 0.0104");
+  const std::size_t time_cadence_steps = time_cadence_config.find("max_global_steps = 2");
+  assert(time_cadence_steps != std::string::npos);
+  // The fixture's adaptive gravity CFL dt (~1.49e-4) sits below the option cap
+  // (2.0e-4), so the timeline phases below a cap-bound design: output-event
+  // clips land at steps 2 and 4, and the 0.0104 endpoint is reached by an
+  // endpoint clip on step 5. The step budget must cover that fifth step.
+  time_cadence_config.replace(
+      time_cadence_steps,
+      std::string("max_global_steps = 2").size(),
+      "max_global_steps = 5");
+  const auto time_cadence_frozen = cosmosim::core::loadFrozenConfigFromString(
+      time_cadence_config, "test_reference_workflow_time_cadence");
+  cosmosim::workflows::ReferenceWorkflowRunner time_cadence_runner(time_cadence_frozen);
+  const auto time_cadence_report = time_cadence_runner.run(
+      output_dir,
+      cosmosim::workflows::ReferenceWorkflowOptions{
+          .dt_time_code = 0.0002,
+          .write_outputs = true});
+  assert(std::abs(time_cadence_report.final_time_code - 0.0104) < 1.0e-15);
+  assert(time_cadence_report.restart_roundtrip_executed);
+  assert(time_cadence_report.restart_roundtrip_ok);
+  const auto time_event_restart =
+      cosmosim::io::readRestartCheckpointHdf5(time_cadence_report.restart_path);
+  assert(std::abs(time_event_restart.integrator_state.current_time_code - 0.0103) < 1.0e-15);
+  const std::string time_cadence_events = readFile(time_cadence_report.operational_report_json_path);
+  {
+    // The final checkpoint's integrator dt is the unclipped resume dt latched
+    // at the last clipping output boundary (the time coordinator restores it
+    // into the integrator before the checkpoint is written). With the adaptive
+    // CFL below the option cap that latched value is the CFL dt, not the cap.
+    // Anchor on the last time.output_event_clip event: endpoint clips share the
+    // same payload key but a later one belongs to the post-checkpoint step.
+    const std::string clip_kind_key = "\"event_kind\": \"time.output_event_clip\"";
+    const std::string::size_type last_clip_pos = time_cadence_events.rfind(clip_kind_key);
+    assert(last_clip_pos != std::string::npos);
+    const std::string unclipped_key = "\"unclipped_dt_time_code\": \"";
+    const std::string::size_type unclipped_pos =
+        time_cadence_events.find(unclipped_key, last_clip_pos);
+    assert(unclipped_pos != std::string::npos);
+    const std::string::size_type last_unclipped_pos = unclipped_pos + unclipped_key.size();
+    const std::string::size_type value_end =
+        time_cadence_events.find('"', last_unclipped_pos);
+    assert(value_end != std::string::npos);
+    std::istringstream unclipped_stream(
+        time_cadence_events.substr(last_unclipped_pos, value_end - last_unclipped_pos));
+    double resume_dt_expected = 0.0;
+    unclipped_stream >> resume_dt_expected;
+    assert(resume_dt_expected > 0.0);
+    assert(std::abs(time_event_restart.integrator_state.dt_time_code - resume_dt_expected) <=
+           1.0e-15);
+  }
+  assert(std::abs(
+      time_event_restart.output_cadence_state.snapshot_interval_time_code - 0.00015) < 1.0e-15);
+  assert(std::abs(
+      time_event_restart.output_cadence_state.next_snapshot_time_code - 0.01045) < 1.0e-15);
+  assert(time_cadence_events.find("\"event_kind\": \"time.output_event_clip\"") !=
+         std::string::npos);
+  const auto time_cadence_resume_report = time_cadence_runner.run(
+      output_dir,
+      cosmosim::workflows::ReferenceWorkflowOptions{
+          .write_outputs = false,
+          .restart_state_override = &time_event_restart});
+  assert(std::abs(time_cadence_resume_report.final_time_code - 0.0104) < 1.0e-15);
+#else
+  bool trapped_hdf5_disabled = false;
+  try {
+    (void)restart_diagnostics_runner.run(
+        output_dir,
+        cosmosim::workflows::ReferenceWorkflowOptions{.write_outputs = true});
+  } catch (const std::runtime_error& error) {
+    trapped_hdf5_disabled =
+        std::string(error.what()).find("lacks HDF5 support") != std::string::npos;
+  }
+  assert(trapped_hdf5_disabled);
+#endif
+
+#if COSMOSIM_ENABLE_HDF5
+  // This drives the real ReferenceWorkflow pipeline with a parentless cell,
+  // two cells sharing one optional parent particle, and deliberately shuffled
+  // dense rows.  The only comparison key is stable gas_cell_id.
+  const std::string h2_identity_config =
+      buildConfigText(1, "reference_h2_decoupled_gas_cells", "cic") +
+      "snapshot_interval_steps = 1\n"
+      "write_restarts = true\n";
+  const cosmosim::core::FrozenConfig h2_identity_frozen =
+      cosmosim::core::loadFrozenConfigFromString(
+          h2_identity_config, "test_reference_workflow_h2_decoupled_gas_cells");
+
+  const cosmosim::core::SimulationState canonical_h2_state =
+      makeDecoupledGasCellState({0U, 1U, 2U});
+  const cosmosim::core::SimulationState shuffled_h2_state =
+      makeDecoupledGasCellState({2U, 0U, 1U});
+
+  cosmosim::workflows::ReferenceWorkflowRunner h2_identity_runner(h2_identity_frozen);
+  const auto canonical_h2_report = h2_identity_runner.run(
+      output_dir,
+      cosmosim::workflows::ReferenceWorkflowOptions{
+          .write_outputs = true,
+          .initial_state_override = &canonical_h2_state});
+
+  std::string shuffled_h2_config = h2_identity_config;
+  const std::string canonical_run_name = "reference_h2_decoupled_gas_cells";
+  const std::string shuffled_run_name = "reference_h2_decoupled_gas_cells_shuffled";
+  const std::size_t run_name_position = shuffled_h2_config.find(canonical_run_name);
+  assert(run_name_position != std::string::npos);
+  shuffled_h2_config.replace(run_name_position, canonical_run_name.size(), shuffled_run_name);
+  const cosmosim::core::FrozenConfig shuffled_h2_frozen =
+      cosmosim::core::loadFrozenConfigFromString(
+          shuffled_h2_config, "test_reference_workflow_h2_decoupled_gas_cells_shuffled");
+  cosmosim::workflows::ReferenceWorkflowRunner shuffled_h2_runner(shuffled_h2_frozen);
+  const auto shuffled_h2_report = shuffled_h2_runner.run(
+      output_dir,
+      cosmosim::workflows::ReferenceWorkflowOptions{
+          .write_outputs = true,
+          .initial_state_override = &shuffled_h2_state});
+
+  assert(canonical_h2_report.completed_steps == 2U);
+  assert(shuffled_h2_report.completed_steps == 2U);
+  assert(canonical_h2_report.restart_roundtrip_executed && canonical_h2_report.restart_roundtrip_ok);
+  assert(shuffled_h2_report.restart_roundtrip_executed && shuffled_h2_report.restart_roundtrip_ok);
+
+  const auto canonical_h2_restart = cosmosim::io::readRestartCheckpointHdf5(canonical_h2_report.restart_path);
+  const auto shuffled_h2_restart = cosmosim::io::readRestartCheckpointHdf5(shuffled_h2_report.restart_path);
+  const auto canonical_by_id = gasStateByStableId(canonical_h2_restart.state);
+  const auto shuffled_by_id = gasStateByStableId(shuffled_h2_restart.state);
+  assert(canonical_by_id.size() == 3U);
+  assert(canonical_by_id == shuffled_by_id);
+  const auto* parentless = canonical_h2_restart.state.gas_cell_identity.findByGasCellId(8001U);
+  assert(parentless != nullptr && !parentless->parent_particle_id.has_value());
+  assert(canonical_h2_restart.state.gas_cell_identity.rowsForParentParticleId(5001U).size() == 2U);
+  assert(canonical_h2_restart.gas_cell_scheduler_ids.size() == 3U);
+#endif
+
+  auto invalidGravityConfig = []() {
+    std::stringstream cfg;
+    cfg << "schema_version = 1\n\n";
+    cfg << "[mode]\n";
+    cfg << "mode = zoom_in\n";
+    cfg << "ic_file = generated\n";
+    cfg << "zoom_high_res_region = false\n\n";
+    cfg << "[numerics]\n";
+    cfg << "time_begin_code = 0.01\n";
+    cfg << "time_end_code = 0.0101\n";
+    cfg << "max_global_steps = 1\n";
+    cfg << "treepm_pm_grid = 9\n";
+    cfg << "treepm_asmth_cells = nan\n";
+    cfg << "treepm_rcut_cells = 3.9\n";
+    cfg << "treepm_update_cadence_steps = 1\n\n";
+    cfg << "[output]\n";
+    cfg << "run_name = reference_integration_test_invalid_gravity\n";
+    cfg << "output_directory = integration_outputs\n";
+    cfg << "output_stem = snapshot\n";
+    cfg << "restart_stem = restart\n";
+    return cfg.str();
+  };
+
+  bool trapped_invalid_gravity_state = false;
+  try {
+    const cosmosim::core::FrozenConfig bad_frozen =
+        cosmosim::core::loadFrozenConfigFromString(invalidGravityConfig(), "test_reference_workflow_invalid_gravity");
+    cosmosim::workflows::ReferenceWorkflowRunner bad_runner(bad_frozen);
+    (void)bad_runner.run(output_dir, cosmosim::workflows::ReferenceWorkflowOptions{.write_outputs = false});
+  } catch (const cosmosim::core::ConfigError&) {
+    trapped_invalid_gravity_state = true;
+  } catch (const std::runtime_error& error) {
+    const std::string message = error.what();
+    trapped_invalid_gravity_state =
+        message.find("fatal gravity-state check failed") != std::string::npos ||
+        message.find("runtime workflow schema compatibility validation failed") != std::string::npos;
+  }
+  assert(trapped_invalid_gravity_state);
+
+
+  const std::filesystem::path zoom_id_path = output_dir / "zoom_ids.txt";
+  {
+    std::ofstream zoom_out(zoom_id_path);
+    zoom_out << "1\n2\n3\n";
+  }
+  std::stringstream zoom_stream;
+  zoom_stream << "schema_version = 1\n\n";
+  zoom_stream << "[mode]\n";
+  zoom_stream << "mode = zoom_in\n";
+  zoom_stream << "ic_file = generated\n";
+  zoom_stream << "zoom_high_res_region = true\n";
+  zoom_stream << "zoom_region_file = " << zoom_id_path.string() << "\n";
+  zoom_stream << "zoom_region_radius = 0.05\n";
+  zoom_stream << "zoom_long_range_strategy = global_coarse_plus_focused_highres_correction\n";
+  zoom_stream << "zoom_focused_pm_grid_nx = 9\n";
+  zoom_stream << "zoom_focused_pm_grid_ny = 9\n";
+  zoom_stream << "zoom_focused_pm_grid_nz = 9\n\n";
+  zoom_stream << "[numerics]\n";
+  zoom_stream << "time_begin_code = 0.01\n";
+  zoom_stream << "time_end_code = 0.0101\n";
+  zoom_stream << "max_global_steps = 1\n";
+  zoom_stream << "hierarchical_max_rung = 0\n";
+  zoom_stream << "treepm_pm_grid = 9\n";
+  zoom_stream << "treepm_asmth_cells = 1.25\n";
+  zoom_stream << "treepm_rcut_cells = 3.9\n";
+  zoom_stream << "treepm_allow_diagnostic_naive_dft = true\n";
+  zoom_stream << "treepm_assignment_scheme = cic\n";
+  zoom_stream << "treepm_update_cadence_steps = 1\n\n";
+  zoom_stream << "[output]\n";
+  zoom_stream << "run_name = reference_integration_test_zoom_file\n";
+  zoom_stream << "output_directory = integration_outputs\n";
+  zoom_stream << "output_stem = snapshot\n";
+  zoom_stream << "restart_stem = restart\n";
+
+  const cosmosim::core::FrozenConfig zoom_frozen =
+      cosmosim::core::loadFrozenConfigFromString(zoom_stream.str(), "test_reference_workflow_zoom_file");
+  cosmosim::workflows::ReferenceWorkflowRunner zoom_runner(zoom_frozen);
+  const cosmosim::workflows::ReferenceWorkflowReport zoom_report =
+      zoom_runner.run(output_dir, cosmosim::workflows::ReferenceWorkflowOptions{.write_outputs = false});
+  std::ifstream zoom_op_in(zoom_report.operational_report_json_path);
+  const std::string zoom_op_text((std::istreambuf_iterator<char>(zoom_op_in)), std::istreambuf_iterator<char>());
+  zoom_op_in.close();
+  assert(zoom_op_text.find("\"zoom_membership_source\": \"particle_id_file_text\"") != std::string::npos);
+
+  std::error_code cleanup_error;
+  std::filesystem::remove_all(output_dir, cleanup_error);
+  return 0;
+}

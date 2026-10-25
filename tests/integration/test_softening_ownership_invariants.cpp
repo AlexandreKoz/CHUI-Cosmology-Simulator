@@ -1,0 +1,454 @@
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <stdexcept>
+#include <unordered_map>
+#include <vector>
+
+#include "cosmosim/analysis/diagnostics.hpp"
+#include "cosmosim/core/build_config.hpp"
+#include "cosmosim/core/simulation_state.hpp"
+#include "cosmosim/core/time_integration.hpp"
+#include "cosmosim/gravity/tree_softening.hpp"
+#include "cosmosim/io/restart_checkpoint.hpp"
+#include "../support/test_temp_workspace.hpp"
+
+namespace {
+
+cosmosim::core::HierarchicalTimeBinScheduler makeMigrationScheduler(
+    const cosmosim::core::SimulationState& state) {
+  std::uint8_t max_bin = 0;
+  for (const std::uint8_t bin : state.particles.time_bin) {
+    if (bin > max_bin) {
+      max_bin = bin;
+    }
+  }
+  cosmosim::core::HierarchicalTimeBinScheduler scheduler(max_bin);
+  scheduler.reset(static_cast<std::uint32_t>(state.particles.size()), 0U, 0U);
+  for (std::uint32_t i = 0; i < state.particles.size(); ++i) {
+    scheduler.setElementBin(i, state.particles.time_bin[i], scheduler.currentTick());
+  }
+  return scheduler;
+}
+
+
+using cosmosim::core::ParticleMigrationCommit;
+using cosmosim::core::ParticleSpecies;
+using cosmosim::core::SimulationState;
+
+constexpr std::uint32_t speciesTag(ParticleSpecies species) {
+  return static_cast<std::uint32_t>(species);
+}
+
+void rebuildSpeciesLedger(SimulationState& state) {
+  state.species.count_by_species.fill(0);
+  for (const auto tag : state.particle_sidecar.species_tag) {
+    ++state.species.count_by_species[tag];
+  }
+  state.rebuildSpeciesIndex();
+}
+
+std::uint32_t findParticleIndexById(const SimulationState& state, std::uint64_t id) {
+  for (std::size_t i = 0; i < state.particles.size(); ++i) {
+    if (state.particle_sidecar.particle_id[i] == id) {
+      return static_cast<std::uint32_t>(i);
+    }
+  }
+  assert(false && "particle id not found");
+  return 0;
+}
+
+cosmosim::gravity::TreeSofteningSpeciesPolicy makeSpeciesPolicy() {
+  cosmosim::gravity::TreeSofteningSpeciesPolicy policy;
+  policy.enabled = true;
+  policy.epsilon_comoving_by_species = {0.020, 0.030, 0.040, 0.050, 0.060};
+  return policy;
+}
+
+SimulationState seedStateWithSelectiveOverrides() {
+  SimulationState state;
+  state.resizeParticles(6);
+
+  const std::array<std::uint64_t, 6> ids{501, 502, 503, 504, 505, 506};
+  const std::array<std::uint32_t, 6> species{
+      speciesTag(ParticleSpecies::kDarkMatter),
+      speciesTag(ParticleSpecies::kGas),
+      speciesTag(ParticleSpecies::kStar),
+      speciesTag(ParticleSpecies::kGas),
+      speciesTag(ParticleSpecies::kBlackHole),
+      speciesTag(ParticleSpecies::kTracer)};
+
+  for (std::size_t i = 0; i < state.particles.size(); ++i) {
+    state.particle_sidecar.particle_id[i] = ids[i];
+    state.particle_sidecar.species_tag[i] = species[i];
+    state.particle_sidecar.owning_rank[i] = 0;
+    state.particle_sidecar.sfc_key[i] = 1000U - static_cast<std::uint64_t>(i * 100U);
+  }
+
+  state.particle_sidecar.gravity_softening_comoving.resize(state.particles.size(), 0.0);
+  const auto species_policy = makeSpeciesPolicy();
+  for (std::size_t i = 0; i < state.particles.size(); ++i) {
+    const std::size_t sp = static_cast<std::size_t>(state.particle_sidecar.species_tag[i]);
+    state.particle_sidecar.gravity_softening_comoving[i] = species_policy.epsilon_comoving_by_species[sp];
+  }
+  // Selective per-particle overrides over species defaults.
+  state.particle_sidecar.setGravitySofteningOverride(1, 0.03125);  // gas override
+  state.particle_sidecar.setGravitySofteningOverride(4, 0.07250);  // BH override
+
+  state.star_particles.resize(1);
+  state.star_particles.particle_index[0] = 2;
+  state.black_holes.resize(1);
+  state.black_holes.particle_index[0] = 4;
+  state.tracers.resize(1);
+  state.tracers.particle_index[0] = 5;
+
+  rebuildSpeciesLedger(state);
+  assert(state.validateOwnershipInvariants());
+  return state;
+}
+
+void assertSofteningById(const SimulationState& state, std::uint64_t id, double expected) {
+  const auto index = findParticleIndexById(state, id);
+  assert(std::abs(state.particle_sidecar.gravity_softening_comoving[index] - expected) < 1.0e-15);
+}
+
+void test_softening_priority_invariants() {
+  const auto species_policy = makeSpeciesPolicy();
+  cosmosim::gravity::TreeSofteningPolicy global_policy;
+  global_policy.epsilon_comoving = 0.125;
+
+  const std::array<std::uint32_t, 3> source_species{
+      speciesTag(ParticleSpecies::kGas),
+      speciesTag(ParticleSpecies::kStar),
+      speciesTag(ParticleSpecies::kDarkMatter)};
+
+  // Global-only fallback.
+  {
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = source_species,
+        .source_particle_epsilon_comoving = {},
+        .target_particle_epsilon_comoving = {},
+        .species_policy = {.enabled = false},
+    };
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(0, global_policy, view) - 0.125) < 1.0e-15);
+  }
+
+  // Species-default fallback.
+  {
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = source_species,
+        .source_particle_epsilon_comoving = {},
+        .target_particle_epsilon_comoving = {},
+        .species_policy = species_policy,
+    };
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(0, global_policy, view) - 0.030) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(1, global_policy, view) - 0.040) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(2, global_policy, view) - 0.020) < 1.0e-15);
+  }
+
+  // Materialized per-particle values without an override mask are diagnostic/default mirrors,
+  // not per-particle override authority.
+  {
+    const std::array<double, 3> materialized_eps{0.333, 0.222, 0.111};
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = source_species,
+        .source_particle_epsilon_comoving = materialized_eps,
+        .target_particle_epsilon_comoving = {},
+        .species_policy = species_policy,
+    };
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(0, global_policy, view) - 0.030) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(1, global_policy, view) - 0.040) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(2, global_policy, view) - 0.020) < 1.0e-15);
+  }
+
+  // Per-particle override precedence.
+  {
+    const std::array<double, 3> per_particle_eps{0.333, 0.222, 0.111};
+    const std::array<std::uint8_t, 3> override_mask{1U, 1U, 1U};
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = source_species,
+        .source_particle_epsilon_comoving = per_particle_eps,
+        .source_particle_epsilon_override_mask = override_mask,
+        .target_particle_epsilon_comoving = {},
+        .species_policy = species_policy,
+    };
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(0, global_policy, view) - 0.333) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(1, global_policy, view) - 0.222) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(2, global_policy, view) - 0.111) < 1.0e-15);
+  }
+
+  // Materialized per-particle values are not authoritative overrides when an override mask is present.
+  {
+    const std::array<double, 3> materialized_eps{0.333, 0.222, 0.111};
+    const std::array<std::uint8_t, 3> override_mask{1U, 0U, 0U};
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = source_species,
+        .source_particle_epsilon_comoving = materialized_eps,
+        .source_particle_epsilon_override_mask = override_mask,
+        .target_particle_epsilon_comoving = {},
+        .species_policy = species_policy,
+    };
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(0, global_policy, view) - 0.333) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(1, global_policy, view) - 0.040) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(2, global_policy, view) - 0.020) < 1.0e-15);
+  }
+
+  // Target softening must obey the same override -> species -> global priority as sources.
+  {
+    const std::array<std::uint32_t, 3> target_species{
+        speciesTag(ParticleSpecies::kDarkMatter),
+        speciesTag(ParticleSpecies::kBlackHole),
+        speciesTag(ParticleSpecies::kTracer)};
+    const std::array<double, 3> target_eps{0.777, 0.888, 0.999};
+    const std::array<std::uint8_t, 3> target_mask{0U, 1U, 0U};
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = source_species,
+        .source_particle_epsilon_comoving = {},
+        .source_particle_epsilon_override_mask = {},
+        .target_species_tag = target_species,
+        .target_particle_epsilon_comoving = target_eps,
+        .target_particle_epsilon_override_mask = target_mask,
+        .species_policy = species_policy,
+    };
+    assert(std::abs(cosmosim::gravity::resolveTargetSofteningEpsilon(0, global_policy, view) - 0.020) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveTargetSofteningEpsilon(1, global_policy, view) - 0.888) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveTargetSofteningEpsilon(2, global_policy, view) - 0.060) < 1.0e-15);
+  }
+
+  // Compact active-set targets may resolve through source-indexed sidecar lanes when explicit
+  // active-slot target lanes are absent. This is the TreePM workflow path for owned compact views.
+  {
+    const std::array<std::uint32_t, 4> compact_source_species{
+        speciesTag(ParticleSpecies::kDarkMatter),
+        speciesTag(ParticleSpecies::kGas),
+        speciesTag(ParticleSpecies::kBlackHole),
+        speciesTag(ParticleSpecies::kTracer)};
+    const std::array<double, 4> compact_source_eps{0.011, 0.022, 0.333, 0.044};
+    const std::array<std::uint8_t, 4> compact_source_mask{0U, 0U, 1U, 0U};
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = compact_source_species,
+        .source_particle_epsilon_comoving = compact_source_eps,
+        .source_particle_epsilon_override_mask = compact_source_mask,
+        .target_species_tag = {},
+        .target_particle_epsilon_comoving = {},
+        .target_particle_epsilon_override_mask = {},
+        .species_policy = species_policy,
+    };
+    assert(std::abs(cosmosim::gravity::resolveTargetSofteningEpsilon(0, 1, global_policy, view) - 0.030) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveTargetSofteningEpsilon(1, 2, global_policy, view) - 0.333) < 1.0e-15);
+    assert(std::abs(cosmosim::gravity::resolveTargetSofteningEpsilon(2, 3, global_policy, view) - 0.060) < 1.0e-15);
+  }
+
+  // Invalid species tags are never a fallback signal. Canonical particle metadata is authoritative
+  // and malformed tags fail closed before force evaluation.
+  {
+    const std::array<std::uint32_t, 1> invalid_species{99U};
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = invalid_species,
+        .species_policy = species_policy,
+    };
+    bool threw = false;
+    try {
+      (void)cosmosim::gravity::resolveSourceSofteningEpsilon(0, global_policy, view);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+  {
+    const std::array<std::uint32_t, 1> invalid_species{99U};
+    const cosmosim::gravity::TreeSofteningView view{
+        .target_species_tag = invalid_species,
+        .species_policy = species_policy,
+    };
+    bool threw = false;
+    try {
+      (void)cosmosim::gravity::resolveTargetSofteningEpsilon(0, 0, global_policy, view);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+
+  // Source/target override masks must not silently truncate relative to value lanes.
+  {
+    const std::array<double, 3> source_eps{0.333, 0.222, 0.111};
+    const std::array<std::uint8_t, 2> short_source_mask{1U, 1U};
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = source_species,
+        .source_particle_epsilon_comoving = source_eps,
+        .source_particle_epsilon_override_mask = short_source_mask,
+        .target_particle_epsilon_comoving = {},
+        .species_policy = species_policy,
+    };
+    bool source_mismatch_threw = false;
+    try {
+      (void)cosmosim::gravity::resolveSourceSofteningEpsilon(2, global_policy, view);
+    } catch (const std::invalid_argument&) {
+      source_mismatch_threw = true;
+    }
+    assert(source_mismatch_threw);
+  }
+  {
+    const std::array<double, 3> target_eps{0.444, 0.555, 0.666};
+    const std::array<std::uint8_t, 2> short_target_mask{1U, 1U};
+    const cosmosim::gravity::TreeSofteningView view{
+        .source_species_tag = source_species,
+        .source_particle_epsilon_comoving = {},
+        .target_particle_epsilon_comoving = target_eps,
+        .target_particle_epsilon_override_mask = short_target_mask,
+        .species_policy = species_policy,
+    };
+    bool target_mismatch_threw = false;
+    try {
+      (void)cosmosim::gravity::resolveTargetSofteningEpsilon(2, global_policy, view);
+    } catch (const std::invalid_argument&) {
+      target_mismatch_threw = true;
+    }
+    assert(target_mismatch_threw);
+  }
+
+  // Diagnostics are observers only.
+  SimulationState state = seedStateWithSelectiveOverrides();
+  const auto before = state.particle_sidecar.gravity_softening_comoving;
+
+  auto cfg = cosmosim::core::makeUnvalidatedSimulationConfigForTests();
+  cfg.analysis.enable_diagnostics = true;
+  cosmosim::analysis::DiagnosticsEngine engine(cfg);
+  const auto health = engine.computeRunHealth(state);
+  assert(health.gravity_softening_sidecar_size_ok);
+  assert(state.particle_sidecar.gravity_softening_comoving == before);
+}
+
+void test_softening_override_resize_reorder_preservation() {
+  SimulationState state = seedStateWithSelectiveOverrides();
+
+  const double id502_eps = state.particle_sidecar.gravity_softening_comoving[findParticleIndexById(state, 502)];
+  const double id505_eps = state.particle_sidecar.gravity_softening_comoving[findParticleIndexById(state, 505)];
+
+  // Grow and confirm pre-existing rows preserved.
+  const std::size_t original_count = state.particles.size();
+  state.resizeParticles(original_count + 2);
+  for (std::size_t i = original_count; i < state.particles.size(); ++i) {
+    state.particle_sidecar.particle_id[i] = 800 + static_cast<std::uint64_t>(i);
+    state.particle_sidecar.species_tag[i] = speciesTag(ParticleSpecies::kGas);
+    state.particle_sidecar.owning_rank[i] = 0;
+    state.particle_sidecar.sfc_key[i] = 5000U + static_cast<std::uint64_t>(i);
+    state.particle_sidecar.gravity_softening_comoving[i] = 0.030;
+  }
+  rebuildSpeciesLedger(state);
+
+  assertSofteningById(state, 502, id502_eps);
+  assertSofteningById(state, 505, id505_eps);
+
+  // Reorder and ensure override follows particle identity.
+  const auto reorder = cosmosim::core::buildParticleReorderMap(state, cosmosim::core::ParticleReorderMode::kBySfcKey);
+  cosmosim::core::reorderParticles(state, reorder);
+  assertSofteningById(state, 502, id502_eps);
+  assertSofteningById(state, 505, id505_eps);
+
+  // Species migration preserves explicit overrides.
+  const std::uint32_t outbound = findParticleIndexById(state, 505);
+  auto packet = state.packParticleMigrationRecords(std::array<std::uint32_t, 1>{outbound}, makeMigrationScheduler(state));
+  assert(packet.size() == 1);
+  packet[0].species_tag = speciesTag(ParticleSpecies::kGas);
+  packet[0].has_black_hole_fields = false;
+  packet[0].has_gravity_softening_value = true;
+  packet[0].has_gravity_softening_override = true;
+  packet[0].gravity_softening_comoving = id505_eps;
+
+  ParticleMigrationCommit commit;
+  commit.world_rank = 0;
+  commit.outbound_local_indices = {outbound};
+  commit.inbound_records = packet;
+  state.commitParticleMigration(commit);
+  assertSofteningById(state, 505, id505_eps);
+
+  // Active-set extraction lane mirrors authoritative sidecar data and follows reorder identity.
+  const std::vector<std::uint32_t> active_indices{
+      findParticleIndexById(state, 502),
+      findParticleIndexById(state, 505)};
+  std::vector<double> active_softening(active_indices.size(), 0.0);
+  for (std::size_t i = 0; i < active_indices.size(); ++i) {
+    active_softening[i] = state.particle_sidecar.gravity_softening_comoving[active_indices[i]];
+  }
+  assert(std::abs(active_softening[0] - id502_eps) < 1.0e-15);
+  assert(std::abs(active_softening[1] - id505_eps) < 1.0e-15);
+
+  // Shrink after reorder and ensure retained rows keep overrides.
+  state.resizeParticles(6);
+  assert(state.particle_sidecar.gravity_softening_comoving.size() == 6);
+  assert(findParticleIndexById(state, 502) < state.particles.size());
+  assertSofteningById(state, 502, id502_eps);
+}
+
+void test_softening_override_restart_roundtrip() {
+#if COSMOSIM_ENABLE_HDF5
+  SimulationState state = seedStateWithSelectiveOverrides();
+  cosmosim::core::IntegratorState integrator_state;
+  cosmosim::core::HierarchicalTimeBinScheduler scheduler(2);
+  scheduler.reset(static_cast<std::uint32_t>(state.particles.size()), 0, 0);
+
+  cosmosim::io::RestartWritePayload payload;
+  payload.persistent_state.simulation_state = &state;
+  payload.integrator_state = &integrator_state;
+  payload.scheduler = &scheduler;
+  payload.normalized_config_text = "schema_version = 1\n[mode]\nmode = zoom_in\n";
+  payload.normalized_config_hash_hex = cosmosim::core::stableConfigHashHex(payload.normalized_config_text);
+  state.metadata.run_name = "softening_ownership_roundtrip";
+  state.metadata.normalized_config_hash_hex = payload.normalized_config_hash_hex;
+  payload.provenance = cosmosim::core::makeProvenanceRecord(payload.normalized_config_hash_hex, "deadbeef", 0, payload.normalized_config_text);
+  payload.distributed_gravity_state.schema_version = 2;
+  payload.distributed_gravity_state.world_size = 1;
+  payload.distributed_gravity_state.pm_grid_nx = 4;
+  payload.distributed_gravity_state.pm_grid_ny = 4;
+  payload.distributed_gravity_state.pm_grid_nz = 4;
+  payload.distributed_gravity_state.owning_rank_by_item.assign(state.particles.size(), 0);
+  payload.distributed_gravity_state.pm_slab_begin_x_by_rank = {0};
+  payload.distributed_gravity_state.pm_slab_end_x_by_rank = {4};
+
+  const std::filesystem::path restart_path =
+      cosmosim::test_support::TestTempWorkspace::uniqueProcessLocalPath("cosmosim_softening_ownership_roundtrip.hdf5");
+
+  cosmosim::io::writeRestartCheckpointHdf5(restart_path, payload);
+  const auto restored = cosmosim::io::readRestartCheckpointHdf5(restart_path);
+
+  assert(restored.state.validateOwnershipInvariants());
+  assert(restored.state.particle_sidecar.gravity_softening_comoving == state.particle_sidecar.gravity_softening_comoving);
+  assert(restored.state.particle_sidecar.has_gravity_softening_override == state.particle_sidecar.has_gravity_softening_override);
+
+  const auto species_policy = makeSpeciesPolicy();
+  cosmosim::gravity::TreeSofteningPolicy global_policy;
+  global_policy.epsilon_comoving = 0.125;
+  const cosmosim::gravity::TreeSofteningView view{
+      .source_species_tag = std::span<const std::uint32_t>(
+          restored.state.particle_sidecar.species_tag.data(),
+          restored.state.particle_sidecar.species_tag.size()),
+      .source_particle_epsilon_comoving = std::span<const double>(
+          restored.state.particle_sidecar.gravity_softening_comoving.data(),
+          restored.state.particle_sidecar.gravity_softening_comoving.size()),
+      .source_particle_epsilon_override_mask = std::span<const std::uint8_t>(
+          restored.state.particle_sidecar.has_gravity_softening_override.data(),
+          restored.state.particle_sidecar.has_gravity_softening_override.size()),
+      .target_particle_epsilon_comoving = {},
+      .species_policy = species_policy,
+  };
+
+  const auto id505 = findParticleIndexById(restored.state, 505);
+  assert(std::abs(cosmosim::gravity::resolveSourceSofteningEpsilon(id505, global_policy, view) - 0.07250) < 1.0e-15);
+#else
+  // No-op in non-HDF5 builds; restart roundtrip is covered by HDF5-enabled test presets.
+#endif
+}
+
+}  // namespace
+
+int main() {
+  test_softening_priority_invariants();
+  test_softening_override_resize_reorder_preservation();
+  test_softening_override_restart_roundtrip();
+  return 0;
+}

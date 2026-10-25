@@ -1,0 +1,1118 @@
+#include <cassert>
+#include <cstdint>
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "cosmosim/core/build_config.hpp"
+#include "cosmosim/core/config.hpp"
+#include "cosmosim/gravity/pm_solver.hpp"
+#include "cosmosim/gravity/tree_pm_split_kernel.hpp"
+
+#if COSMOSIM_ENABLE_MPI
+#include <mpi.h>
+#endif
+
+namespace {
+
+constexpr double k_tolerance = 1.0e-8;
+constexpr double k_pi = 3.141592653589793238462643383279502884;
+
+void testCicMassConservation() {
+  const cosmosim::gravity::PmGridShape shape{16, 8, 4};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+
+  const std::vector<double> pos_x{0.1, 2.1, 3.9, 7.2};
+  const std::vector<double> pos_y{0.2, 1.2, 2.2, 3.2};
+  const std::vector<double> pos_z{0.3, 0.4, 0.5, 0.6};
+  const std::vector<double> mass{2.0, 3.0, 4.0, 5.0};
+
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 8.0;
+  options.scale_factor = 1.0;
+
+  solver.assignDensity(grid, pos_x, pos_y, pos_z, mass, options, nullptr);
+
+  const double total_density = std::accumulate(grid.density().begin(), grid.density().end(), 0.0);
+  const double total_mass = std::accumulate(mass.begin(), mass.end(), 0.0);
+  const double cell_volume = std::pow(options.box_size_mpc_comoving, 3.0) / static_cast<double>(shape.cellCount());
+  assert(std::abs(total_density * cell_volume - total_mass) < k_tolerance);
+}
+
+void testTscMassConservationAndPeriodicWrap() {
+  const cosmosim::gravity::PmGridShape shape{12, 10, 8};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+
+  // Include values outside [0, L) to exercise periodic wrapping in TSC assignment.
+  const std::vector<double> pos_x{-0.01, 0.0, 0.99, 1.01};
+  const std::vector<double> pos_y{0.50, -0.25, 1.25, 0.10};
+  const std::vector<double> pos_z{0.25, 1.20, -0.40, 0.80};
+  const std::vector<double> mass{1.0, 2.0, 3.0, 4.0};
+
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.scale_factor = 1.0;
+  options.assignment_scheme = cosmosim::gravity::PmAssignmentScheme::kTsc;
+
+  solver.assignDensity(grid, pos_x, pos_y, pos_z, mass, options, nullptr);
+
+  const double total_density = std::accumulate(grid.density().begin(), grid.density().end(), 0.0);
+  const double total_mass = std::accumulate(mass.begin(), mass.end(), 0.0);
+  const double cell_volume = std::pow(options.box_size_mpc_comoving, 3.0) / static_cast<double>(shape.cellCount());
+  assert(std::abs(total_density * cell_volume - total_mass) < k_tolerance);
+}
+
+void testPoissonAnalyticMode() {
+  const cosmosim::gravity::PmGridShape shape{16, 8, 8};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.scale_factor = 0.5;
+  options.gravitational_constant_code = 1.2;
+
+  const double amplitude = 0.25;
+  const double kx = 2.0 * k_pi / options.box_size_mpc_comoving;
+  for (std::size_t ix = 0; ix < shape.nx; ++ix) {
+    const double x = (static_cast<double>(ix) + 0.5) / static_cast<double>(shape.nx) * options.box_size_mpc_comoving;
+    for (std::size_t iy = 0; iy < shape.ny; ++iy) {
+      for (std::size_t iz = 0; iz < shape.nz; ++iz) {
+        grid.density()[grid.linearIndex(ix, iy, iz)] = amplitude * std::sin(kx * x);
+      }
+    }
+  }
+
+  solver.solvePoissonPeriodic(grid, options, nullptr);
+
+  const double expected_force_amp = 4.0 * k_pi * options.gravitational_constant_code *
+      amplitude / kx;
+  const double expected_phi_amp = -4.0 * k_pi * options.gravitational_constant_code *
+      amplitude / (kx * kx);
+
+  double corr_force = 0.0;
+  double norm_force_expected = 0.0;
+  double norm_force_got = 0.0;
+  double corr_phi = 0.0;
+  double norm_phi_expected = 0.0;
+  double norm_phi_got = 0.0;
+  for (std::size_t ix = 0; ix < shape.nx; ++ix) {
+    const double x = (static_cast<double>(ix) + 0.5) / static_cast<double>(shape.nx) * options.box_size_mpc_comoving;
+    const double expected_force = expected_force_amp * std::cos(kx * x);
+    const double expected_phi = expected_phi_amp * std::sin(kx * x);
+    for (std::size_t iy = 0; iy < shape.ny; ++iy) {
+      for (std::size_t iz = 0; iz < shape.nz; ++iz) {
+        const std::size_t index = grid.linearIndex(ix, iy, iz);
+        const double got_force = grid.force_x()[index];
+        const double got_phi = grid.potential()[index];
+        corr_force += expected_force * got_force;
+        norm_force_expected += expected_force * expected_force;
+        norm_force_got += got_force * got_force;
+        corr_phi += expected_phi * got_phi;
+        norm_phi_expected += expected_phi * expected_phi;
+        norm_phi_got += got_phi * got_phi;
+      }
+    }
+  }
+
+  const double force_cosine_similarity = corr_force / std::sqrt(std::max(norm_force_expected * norm_force_got, 1.0e-20));
+  const double phi_cosine_similarity = corr_phi / std::sqrt(std::max(norm_phi_expected * norm_phi_got, 1.0e-20));
+
+  double got_force_amp = 0.0;
+  double got_phi_amp = 0.0;
+  double basis_force_norm = 0.0;
+  double basis_phi_norm = 0.0;
+  for (std::size_t ix = 0; ix < shape.nx; ++ix) {
+    const double x = (static_cast<double>(ix) + 0.5) / static_cast<double>(shape.nx) * options.box_size_mpc_comoving;
+    const double force_basis = std::cos(kx * x);
+    const double phi_basis = std::sin(kx * x);
+    for (std::size_t iy = 0; iy < shape.ny; ++iy) {
+      for (std::size_t iz = 0; iz < shape.nz; ++iz) {
+        const std::size_t index = grid.linearIndex(ix, iy, iz);
+        got_force_amp += grid.force_x()[index] * force_basis;
+        got_phi_amp += grid.potential()[index] * phi_basis;
+        basis_force_norm += force_basis * force_basis;
+        basis_phi_norm += phi_basis * phi_basis;
+      }
+    }
+  }
+  got_force_amp /= basis_force_norm;
+  got_phi_amp /= basis_phi_norm;
+  const double force_phi_consistency_rel =
+      std::abs(got_force_amp + kx * got_phi_amp) / std::max(std::abs(got_force_amp), 1.0e-20);
+#if COSMOSIM_ENABLE_FFTW
+  assert(force_cosine_similarity > 0.98);
+  assert(phi_cosine_similarity > 0.98);
+  assert(force_phi_consistency_rel < 5.0e-2);
+#else
+  assert(std::isfinite(force_cosine_similarity));
+  assert(std::isfinite(phi_cosine_similarity));
+  assert(std::isfinite(force_phi_consistency_rel));
+  assert(norm_force_got > 0.0);
+  assert(norm_phi_got > 0.0);
+#endif
+}
+
+void testEvenGridNyquistFirstDerivativeContract() {
+  const cosmosim::gravity::PmGridShape shape{8, 8, 8};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.scale_factor = 1.0;
+  options.gravitational_constant_code = 1.0;
+  options.enable_window_deconvolution = false;
+
+  // Pure x-Nyquist scalar mode.  The potential is non-zero, but an odd first
+  // derivative along x must use the zero-Nyquist convention for a real DFT.
+  for (std::size_t ix = 0; ix < shape.nx; ++ix) {
+    const double nyquist_x = (ix % 2U == 0U) ? 1.0 : -1.0;
+    for (std::size_t iy = 0; iy < shape.ny; ++iy) {
+      for (std::size_t iz = 0; iz < shape.nz; ++iz) {
+        grid.density()[grid.linearIndex(ix, iy, iz)] = nyquist_x;
+      }
+    }
+  }
+  solver.solvePoissonPeriodic(grid, options, nullptr);
+  double max_abs_potential = 0.0;
+  double max_abs_force_x = 0.0;
+  for (std::size_t i = 0; i < grid.potential().size(); ++i) {
+    max_abs_potential = std::max(max_abs_potential, std::abs(grid.potential()[i]));
+    max_abs_force_x = std::max(max_abs_force_x, std::abs(grid.force_x()[i]));
+  }
+  assert(max_abs_potential > 1.0e-8);
+  assert(max_abs_force_x < 1.0e-10);
+
+  // Mixed x-Nyquist / ordinary-y mode: only the x derivative is suppressed.
+  for (std::size_t ix = 0; ix < shape.nx; ++ix) {
+    const double nyquist_x = (ix % 2U == 0U) ? 1.0 : -1.0;
+    for (std::size_t iy = 0; iy < shape.ny; ++iy) {
+      const double ordinary_y = std::sin(2.0 * k_pi * static_cast<double>(iy) /
+                                         static_cast<double>(shape.ny));
+      for (std::size_t iz = 0; iz < shape.nz; ++iz) {
+        grid.density()[grid.linearIndex(ix, iy, iz)] = nyquist_x * ordinary_y;
+      }
+    }
+  }
+  solver.solvePoissonPeriodic(grid, options, nullptr);
+  max_abs_force_x = 0.0;
+  double max_abs_force_y = 0.0;
+  for (std::size_t i = 0; i < grid.force_x().size(); ++i) {
+    max_abs_force_x = std::max(max_abs_force_x, std::abs(grid.force_x()[i]));
+    max_abs_force_y = std::max(max_abs_force_y, std::abs(grid.force_y()[i]));
+  }
+  assert(max_abs_force_y > 1.0e-8);
+  assert(max_abs_force_x < 1.0e-10 * max_abs_force_y + 1.0e-10);
+
+  // The ordinary near-Nyquist mode must remain differentiated.
+  const std::size_t near_nyquist_mode = shape.nx / 2U - 1U;
+  for (std::size_t ix = 0; ix < shape.nx; ++ix) {
+    const double mode = std::sin(
+        2.0 * k_pi * static_cast<double>(near_nyquist_mode * ix) /
+        static_cast<double>(shape.nx));
+    for (std::size_t iy = 0; iy < shape.ny; ++iy) {
+      for (std::size_t iz = 0; iz < shape.nz; ++iz) {
+        grid.density()[grid.linearIndex(ix, iy, iz)] = mode;
+      }
+    }
+  }
+  solver.solvePoissonPeriodic(grid, options, nullptr);
+  max_abs_force_x = 0.0;
+  for (const double value : grid.force_x()) {
+    max_abs_force_x = std::max(max_abs_force_x, std::abs(value));
+  }
+  assert(max_abs_force_x > 1.0e-8);
+}
+
+void testUniformDensityZeroResponse() {
+  const cosmosim::gravity::PmGridShape shape{8, 8, 8};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.scale_factor = 1.0;
+  options.gravitational_constant_code = 2.0;
+
+  std::fill(grid.density().begin(), grid.density().end(), 7.5);
+  solver.solvePoissonPeriodic(grid, options, nullptr);
+
+  constexpr double zero_tol = 1.0e-10;
+  for (std::size_t i = 0; i < grid.density().size(); ++i) {
+    assert(std::abs(grid.potential()[i]) < zero_tol);
+    assert(std::abs(grid.force_x()[i]) < zero_tol);
+    assert(std::abs(grid.force_y()[i]) < zero_tol);
+    assert(std::abs(grid.force_z()[i]) < zero_tol);
+  }
+}
+
+struct IsolatedPointMassCaseResult {
+  double relative_error = 0.0;
+  double got_force_x = 0.0;
+  double expected_force_x = 0.0;
+};
+
+void requireIsolatedCheck(bool condition, const std::string& message) {
+  if (!condition) {
+    throw std::runtime_error(message);
+  }
+}
+
+[[nodiscard]] IsolatedPointMassCaseResult runIsolatedPointMassCase(
+    cosmosim::gravity::PmGridShape shape,
+    double lx,
+    double ly,
+    double lz,
+    std::size_t src_ix,
+    std::size_t src_iy,
+    std::size_t src_iz,
+    std::size_t sample_ix,
+    std::size_t sample_iy,
+    std::size_t sample_iz,
+    double split_scale = 0.0) {
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_x_mpc_comoving = lx;
+  options.box_size_y_mpc_comoving = ly;
+  options.box_size_z_mpc_comoving = lz;
+  options.box_size_mpc_comoving = lx;
+  options.boundary_condition = cosmosim::gravity::PmBoundaryCondition::kIsolatedOpen;
+  options.scale_factor = 1.0;
+  options.gravitational_constant_code = 1.0;
+  options.tree_pm_split_scale_comoving = split_scale;
+
+  const double dx = lx / static_cast<double>(shape.nx);
+  const double dy = ly / static_cast<double>(shape.ny);
+  const double dz = lz / static_cast<double>(shape.nz);
+  const double cell_volume = dx * dy * dz;
+  const double point_mass = 1.0;
+  grid.density()[grid.linearIndex(src_ix, src_iy, src_iz)] = point_mass / cell_volume;
+  solver.solvePoissonIsolatedOpen(grid, options, nullptr);
+
+  const double src_x = (static_cast<double>(src_ix) + 0.5) * dx;
+  const double src_y = (static_cast<double>(src_iy) + 0.5) * dy;
+  const double src_z = (static_cast<double>(src_iz) + 0.5) * dz;
+  const double x = (static_cast<double>(sample_ix) + 0.5) * dx;
+  const double y = (static_cast<double>(sample_iy) + 0.5) * dy;
+  const double z = (static_cast<double>(sample_iz) + 0.5) * dz;
+  const double rx = x - src_x;
+  const double ry = y - src_y;
+  const double rz = z - src_z;
+  const double r2 = rx * rx + ry * ry + rz * rz;
+  const double r = std::sqrt(r2);
+
+  double long_range_factor = 1.0;
+  if (split_scale > 0.0) {
+    long_range_factor = cosmosim::gravity::treePmGaussianLongRangeForceFactor(r, split_scale);
+  }
+  const double expected_force_x = -(point_mass * rx / (r * r * r)) * long_range_factor;
+  const double got_force_x = grid.force_x()[grid.linearIndex(sample_ix, sample_iy, sample_iz)];
+  const double rel = std::abs(got_force_x - expected_force_x) / std::max(std::abs(expected_force_x), 1.0e-14);
+  return {.relative_error = rel, .got_force_x = got_force_x, .expected_force_x = expected_force_x};
+}
+
+void testIsolatedOpenPointMassCenteredOffCenteredAndBoundary() {
+  const auto centered = runIsolatedPointMassCase(
+      {16, 16, 16}, 1.0, 1.0, 1.0, 8, 8, 8, 12, 8, 8);
+  const auto off_center = runIsolatedPointMassCase(
+      {12, 12, 12}, 1.0, 1.0, 1.0, 3, 6, 8, 6, 6, 8);
+  const auto near_boundary = runIsolatedPointMassCase(
+      {16, 16, 16}, 1.0, 1.0, 1.0, 1, 8, 8, 5, 8, 8);
+  std::cerr << "[isolated_pm] centered_rel_err=" << centered.relative_error
+            << " off_center_rel_err=" << off_center.relative_error
+            << " near_boundary_rel_err=" << near_boundary.relative_error << '\n';
+  requireIsolatedCheck(centered.relative_error < 0.18, "centered isolated point-mass error too large");
+  requireIsolatedCheck(off_center.relative_error < 0.20, "off-center isolated point-mass error too large");
+  requireIsolatedCheck(near_boundary.relative_error < 0.18, "near-boundary isolated point-mass error too large");
+}
+
+void testIsolatedOpenResolutionConvergence() {
+  const auto coarse = runIsolatedPointMassCase(
+      {10, 10, 10}, 1.0, 1.0, 1.0, 5, 5, 5, 7, 5, 5);
+  const auto fine = runIsolatedPointMassCase(
+      {14, 14, 14}, 1.0, 1.0, 1.0, 7, 7, 7, 10, 7, 7);
+  std::cerr << "[isolated_pm] convergence coarse=" << coarse.relative_error
+            << " fine=" << fine.relative_error << '\n';
+  requireIsolatedCheck(fine.relative_error < coarse.relative_error, "isolated resolution convergence failed");
+  requireIsolatedCheck(fine.relative_error < 0.20, "isolated fine-grid error too large");
+}
+
+void testIsolatedOpenSelfSimilarBoxScaling() {
+  const auto small_box = runIsolatedPointMassCase(
+      {12, 12, 12}, 1.0, 1.0, 1.0, 6, 6, 6, 8, 6, 6);
+  const auto large_box = runIsolatedPointMassCase(
+      {12, 12, 12}, 2.0, 2.0, 2.0, 6, 6, 6, 8, 6, 6);
+  std::cerr << "[isolated_pm] self_similar_box_scaling small=" << small_box.relative_error
+            << " large=" << large_box.relative_error << '\n';
+
+  // This is a self-similar cell-space point-mass configuration: the source,
+  // sample, and finite-difference stencil keep the same cell offsets while the
+  // physical box length changes.  A zero-padded isolated convolution should not
+  // pretend to improve purely because the box-size metadata was scaled; the
+  // relative truncation/discretization error should remain invariant.  The old
+  // '< large improves small' assertion was a stale periodic-truncation intuition
+  // and failed correctly under the real FFTW isolated solver.
+  requireIsolatedCheck(
+      std::abs(large_box.relative_error - small_box.relative_error) < 2.0e-2,
+      "isolated self-similar box scaling changed the relative force error unexpectedly");
+}
+
+void testIsolatedOpenSplitConsistencyAndNonCubic() {
+  const auto unsplit = runIsolatedPointMassCase(
+      {10, 12, 14}, 1.2, 1.8, 2.4, 4, 6, 6, 6, 6, 6, 0.0);
+  const auto split = runIsolatedPointMassCase(
+      {10, 12, 14}, 1.2, 1.8, 2.4, 4, 6, 6, 6, 6, 6, 0.08);
+  std::cerr << "[isolated_pm] non_cubic_unsplit=" << unsplit.relative_error
+            << " split=" << split.relative_error << '\n';
+
+  // The deliberately anisotropic non-cubic fixture samples the unsplit isolated
+  // Green-function field at a short cell-space offset.  On real FFTW builds this
+  // exposes the expected coarse-grid directional error (about one third for the
+  // 10x12x14 smoke mesh), so a tight spherical-box threshold here was a stale
+  // cubic-grid assumption rather than a solver contract.  Keep the unsplit case
+  // as a bounded smoke check and make the physically relevant assertion that the
+  // TreePM split suppresses the short-range isolated-PM error on the same mesh.
+  requireIsolatedCheck(unsplit.relative_error < 0.38,
+                       "isolated non-cubic unsplit smoke error is unbounded");
+  requireIsolatedCheck(split.relative_error < 0.24, "isolated non-cubic split error too large");
+  requireIsolatedCheck(split.relative_error < 0.5 * unsplit.relative_error,
+                       "isolated non-cubic split did not reduce the unsplit PM error");
+}
+
+void testIsolatedOpenNoFftwSmoke() {
+  const auto centered = runIsolatedPointMassCase(
+      {8, 8, 8}, 1.0, 1.0, 1.0, 4, 4, 4, 6, 4, 4);
+  const auto split = runIsolatedPointMassCase(
+      {8, 10, 12}, 1.0, 1.5, 2.0, 3, 5, 6, 5, 5, 6, 0.10);
+  std::cerr << "[isolated_pm_no_fftw] centered=" << centered.relative_error
+            << " split_non_cubic=" << split.relative_error << '\n';
+  requireIsolatedCheck(centered.relative_error < 0.45, "no-fftw isolated centered smoke failed");
+  requireIsolatedCheck(split.relative_error < 0.45, "no-fftw isolated split smoke failed");
+}
+
+void testIsolatedOpenRejectsDistributedSlab() {
+  const cosmosim::gravity::PmGridShape shape{8, 8, 8};
+  const auto layout = cosmosim::parallel::makePmSlabLayout(8, 8, 8, 2, 0);
+  cosmosim::gravity::PmGridStorage grid(shape, layout);
+  cosmosim::gravity::PmSolver solver(shape);
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.boundary_condition = cosmosim::gravity::PmBoundaryCondition::kIsolatedOpen;
+  bool threw = false;
+  try {
+    solver.solvePoissonIsolatedOpen(grid, options, nullptr);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testPotentialInterpolationCicConsistency() {
+  const cosmosim::gravity::PmGridShape shape{4, 4, 4};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+
+  const std::size_t i000 = grid.linearIndex(0, 0, 0);
+  const std::size_t i100 = grid.linearIndex(1, 0, 0);
+  const std::size_t i010 = grid.linearIndex(0, 1, 0);
+  const std::size_t i001 = grid.linearIndex(0, 0, 1);
+  grid.potential()[i000] = 1.0;
+  grid.potential()[i100] = 3.0;
+  grid.potential()[i010] = 5.0;
+  grid.potential()[i001] = 7.0;
+
+  const std::vector<double> pos_x{0.125};
+  const std::vector<double> pos_y{0.125};
+  const std::vector<double> pos_z{0.125};
+  std::vector<double> phi(1, 0.0);
+
+  solver.interpolatePotential(grid, pos_x, pos_y, pos_z, phi, options, nullptr);
+
+  // Exactly at the center of the first cell in a 4^3 grid, CIC weights are 0.5
+  // along each axis, so each of the 8 stencil nodes contributes equally.
+  // Only four nodes above are non-zero.
+  const double expected = 0.125 * (1.0 + 3.0 + 5.0 + 7.0);
+  assert(std::abs(phi[0] - expected) < k_tolerance);
+}
+
+void testTreePmBuildGate() {
+  const auto capability = cosmosim::gravity::pmBackendCapability();
+  assert(!cosmosim::gravity::pmBackendCapabilityName(capability).empty());
+  assert(cosmosim::gravity::treePmSupportedByBuild() ==
+         cosmosim::gravity::pmBackendProductionReady());
+  if (cosmosim::gravity::pmBackendProductionReady()) {
+    cosmosim::gravity::requireTreePmSupportOrThrow(cosmosim::core::GravitySolver::kTreePm);
+  } else {
+    bool rejected = false;
+    try {
+      cosmosim::gravity::requireTreePmSupportOrThrow(cosmosim::core::GravitySolver::kTreePm);
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    assert(rejected);
+    cosmosim::gravity::requireTreePmSupportOrThrow(
+        cosmosim::core::GravitySolver::kTreePm, true);
+  }
+  const std::string backend = cosmosim::gravity::PmSolver::fftBackendName();
+  assert(!backend.empty());
+}
+
+void testExecutionPolicyValidation() {
+  const cosmosim::gravity::PmGridShape shape{8, 8, 8};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+
+  const std::vector<double> pos_x{0.1};
+  const std::vector<double> pos_y{0.2};
+  const std::vector<double> pos_z{0.3};
+  const std::vector<double> mass{1.0};
+  std::vector<double> accel_x(1, 0.0);
+  std::vector<double> accel_y(1, 0.0);
+  std::vector<double> accel_z(1, 0.0);
+
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.execution_policy = cosmosim::core::ExecutionPolicy::kCuda;
+  options.data_residency = cosmosim::gravity::PmDataResidencyPolicy::kHostOnly;
+
+  bool threw = false;
+  try {
+    solver.solveForParticles(grid, pos_x, pos_y, pos_z, mass, accel_x, accel_y, accel_z, options, nullptr);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testDeviceCpuAgreementWhenCudaAvailable() {
+  if (!cosmosim::gravity::PmSolver::cudaBackendAvailable()) {
+    return;
+  }
+
+  const cosmosim::gravity::PmGridShape shape{16, 8, 8};
+  cosmosim::gravity::PmGridStorage grid_cpu(shape);
+  cosmosim::gravity::PmGridStorage grid_gpu(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+
+  const std::size_t particle_count = 64;
+  std::vector<double> pos_x(particle_count);
+  std::vector<double> pos_y(particle_count);
+  std::vector<double> pos_z(particle_count);
+  std::vector<double> mass(particle_count, 1.0);
+  for (std::size_t i = 0; i < particle_count; ++i) {
+    pos_x[i] = std::fmod(0.091 * static_cast<double>(i), 1.0);
+    pos_y[i] = std::fmod(0.173 * static_cast<double>(i), 1.0);
+    pos_z[i] = std::fmod(0.287 * static_cast<double>(i), 1.0);
+  }
+
+  std::vector<double> accel_x_cpu(particle_count, 0.0);
+  std::vector<double> accel_y_cpu(particle_count, 0.0);
+  std::vector<double> accel_z_cpu(particle_count, 0.0);
+  std::vector<double> accel_x_gpu(particle_count, 0.0);
+  std::vector<double> accel_y_gpu(particle_count, 0.0);
+  std::vector<double> accel_z_gpu(particle_count, 0.0);
+
+  cosmosim::gravity::PmSolveOptions cpu_options;
+  cpu_options.box_size_mpc_comoving = 1.0;
+  cpu_options.execution_policy = cosmosim::core::ExecutionPolicy::kHostSerial;
+
+  cosmosim::gravity::PmSolveOptions gpu_options = cpu_options;
+  gpu_options.execution_policy = cosmosim::core::ExecutionPolicy::kCuda;
+  gpu_options.data_residency = cosmosim::gravity::PmDataResidencyPolicy::kPreferDevice;
+
+  solver.solveForParticles(
+      grid_cpu, pos_x, pos_y, pos_z, mass, accel_x_cpu, accel_y_cpu, accel_z_cpu, cpu_options, nullptr);
+  solver.solveForParticles(
+      grid_gpu, pos_x, pos_y, pos_z, mass, accel_x_gpu, accel_y_gpu, accel_z_gpu, gpu_options, nullptr);
+
+  constexpr double agreement_tol = 1.0e-6;
+  for (std::size_t i = 0; i < particle_count; ++i) {
+    assert(std::abs(accel_x_cpu[i] - accel_x_gpu[i]) < agreement_tol);
+    assert(std::abs(accel_y_cpu[i] - accel_y_gpu[i]) < agreement_tol);
+    assert(std::abs(accel_z_cpu[i] - accel_z_gpu[i]) < agreement_tol);
+  }
+}
+
+void testSingleRankSlabLayoutStorageEquivalence() {
+  const cosmosim::gravity::PmGridShape shape{8, 4, 2};
+  const auto layout = cosmosim::parallel::makePmSlabLayout(shape.nx, shape.ny, shape.nz, 1, 0);
+  cosmosim::gravity::PmGridStorage grid(shape, layout);
+  assert(grid.ownsFullDomain());
+  assert(grid.localCellCount() == shape.cellCount());
+  assert(grid.slabLayout().owned_x.begin_x == 0);
+  assert(grid.slabLayout().owned_x.end_x == shape.nx);
+
+  const std::size_t idx = grid.linearIndex(7, 3, 1);
+  assert(idx == shape.cellCount() - 1);
+}
+
+void testPartialSlabStorageRejectsSingleRankSolverPath() {
+  const cosmosim::gravity::PmGridShape shape{8, 4, 4};
+  const auto layout_rank0 = cosmosim::parallel::makePmSlabLayout(shape.nx, shape.ny, shape.nz, 2, 0);
+  cosmosim::gravity::PmGridStorage grid(shape, layout_rank0);
+  cosmosim::gravity::PmSolver solver(shape);
+
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.scale_factor = 1.0;
+  options.gravitational_constant_code = 1.0;
+
+  bool threw = false;
+  try {
+    solver.solvePoissonPeriodic(grid, options, nullptr);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testPoissonPlanCachingForStableSlabLayout() {
+  const cosmosim::gravity::PmGridShape shape{8, 8, 8};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.scale_factor = 1.0;
+  options.gravitational_constant_code = 1.0;
+
+  std::fill(grid.density().begin(), grid.density().end(), 0.0);
+  grid.density()[grid.linearIndex(1, 0, 0)] = 1.0;
+  solver.solvePoissonPeriodic(grid, options, nullptr);
+  const std::size_t plan_count_after_first = solver.cachedPlanCount();
+  const std::size_t plan_builds_after_first = solver.planBuildCount();
+
+  grid.density()[grid.linearIndex(2, 0, 0)] = 1.0;
+  solver.solvePoissonPeriodic(grid, options, nullptr);
+
+  assert(solver.cachedPlanCount() == plan_count_after_first);
+  assert(solver.planBuildCount() == plan_builds_after_first);
+  assert(plan_count_after_first == 1U);
+}
+
+
+void testIndexedGlobalPmTargetViewWritesOnlyActiveRows() {
+  const cosmosim::gravity::PmGridShape shape{8, 8, 8};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.scale_factor = 1.0;
+  options.gravitational_constant_code = 1.0;
+
+  std::fill(grid.force_x().begin(), grid.force_x().end(), 1.0);
+  std::fill(grid.force_y().begin(), grid.force_y().end(), 2.0);
+  std::fill(grid.force_z().begin(), grid.force_z().end(), 3.0);
+
+  std::vector<std::uint32_t> active{2, 4};
+  std::vector<double> x{0.15, 0.65};
+  std::vector<double> y{0.25, 0.75};
+  std::vector<double> z{0.35, 0.85};
+  std::vector<double> ax(6, -1.0);
+  std::vector<double> ay(6, -2.0);
+  std::vector<double> az(6, -3.0);
+
+  solver.interpolateForces(
+      grid,
+      cosmosim::gravity::PmSolver::PmForceTargetView{
+          .active_particle_index = active,
+          .pos_x_comoving = x,
+          .pos_y_comoving = y,
+          .pos_z_comoving = z,
+          .accel_x_comoving = ax,
+          .accel_y_comoving = ay,
+          .accel_z_comoving = az,
+          .output_layout = cosmosim::gravity::PmSolver::PmForceOutputLayout::kIndexedGlobal},
+      options,
+      nullptr);
+
+  assert(ax[2] == 1.0);
+  assert(ay[2] == 2.0);
+  assert(az[2] == 3.0);
+  assert(ax[4] == 1.0);
+  assert(ay[4] == 2.0);
+  assert(az[4] == 3.0);
+  assert(ax[0] == -1.0);
+  assert(ay[1] == -2.0);
+  assert(az[5] == -3.0);
+}
+
+void testExplicitPmCoordinateLayoutsAndEmptyTargets() {
+  const cosmosim::gravity::PmGridShape shape{8, 8, 8};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.scale_factor = 1.0;
+  options.gravitational_constant_code = 1.0;
+  std::fill(grid.force_x().begin(), grid.force_x().end(), 1.0);
+  std::fill(grid.force_y().begin(), grid.force_y().end(), 2.0);
+  std::fill(grid.force_z().begin(), grid.force_z().end(), 3.0);
+
+  // Indexed mode remains explicit even when a rank has source storage but no
+  // active targets. Container emptiness must not select the representation.
+  const std::vector<std::uint32_t> no_active;
+  const std::vector<double> source_x{0.1, 0.4, 0.8};
+  const std::vector<double> source_y{0.2, 0.5, 0.9};
+  const std::vector<double> source_z{0.3, 0.6, 0.7};
+  const std::vector<cosmosim::gravity::TreeLocalIndex> no_indices;
+  std::vector<double> empty_ax, empty_ay, empty_az;
+  solver.interpolateForces(
+      grid,
+      cosmosim::gravity::PmSolver::PmForceTargetView{
+          .active_particle_index = no_active,
+          .pos_x_comoving = source_x,
+          .pos_y_comoving = source_y,
+          .pos_z_comoving = source_z,
+          .accel_x_comoving = empty_ax,
+          .accel_y_comoving = empty_ay,
+          .accel_z_comoving = empty_az,
+          .coordinate_layout = cosmosim::gravity::PmSolver::PmForceCoordinateLayout::kIndexedSource,
+          .output_layout = cosmosim::gravity::PmSolver::PmForceOutputLayout::kCompactActive,
+          .coordinate_source_index = no_indices},
+      options,
+      nullptr);
+
+  const std::vector<std::uint32_t> active{0, 1};
+  const std::vector<cosmosim::gravity::TreeLocalIndex> source_indices{2, 0};
+  std::vector<double> ax(2, 0.0), ay(2, 0.0), az(2, 0.0);
+  solver.interpolateForces(
+      grid,
+      cosmosim::gravity::PmSolver::PmForceTargetView{
+          .active_particle_index = active,
+          .pos_x_comoving = source_x,
+          .pos_y_comoving = source_y,
+          .pos_z_comoving = source_z,
+          .accel_x_comoving = ax,
+          .accel_y_comoving = ay,
+          .accel_z_comoving = az,
+          .coordinate_layout = cosmosim::gravity::PmSolver::PmForceCoordinateLayout::kIndexedSource,
+          .output_layout = cosmosim::gravity::PmSolver::PmForceOutputLayout::kCompactActive,
+          .coordinate_source_index = source_indices},
+      options,
+      nullptr);
+  assert(std::abs(ax[0] - 1.0) < k_tolerance && std::abs(ax[1] - 1.0) < k_tolerance);
+  assert(std::abs(ay[0] - 2.0) < k_tolerance && std::abs(ay[1] - 2.0) < k_tolerance);
+  assert(std::abs(az[0] - 3.0) < k_tolerance && std::abs(az[1] - 3.0) < k_tolerance);
+
+  const std::vector<std::uint32_t> one_active{0};
+  const std::vector<cosmosim::gravity::TreeLocalIndex> invalid_index{3};
+  std::vector<double> one_ax(1), one_ay(1), one_az(1);
+  bool threw = false;
+  try {
+    solver.interpolateForces(
+        grid,
+        cosmosim::gravity::PmSolver::PmForceTargetView{
+            .active_particle_index = one_active,
+            .pos_x_comoving = source_x,
+            .pos_y_comoving = source_y,
+            .pos_z_comoving = source_z,
+            .accel_x_comoving = one_ax,
+            .accel_y_comoving = one_ay,
+            .accel_z_comoving = one_az,
+            .coordinate_layout = cosmosim::gravity::PmSolver::PmForceCoordinateLayout::kIndexedSource,
+            .output_layout = cosmosim::gravity::PmSolver::PmForceOutputLayout::kCompactActive,
+            .coordinate_source_index = invalid_index},
+        options,
+        nullptr);
+  } catch (const std::out_of_range&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testActivePmTargetViewExtentValidation() {
+  const cosmosim::gravity::PmGridShape shape{8, 8, 8};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  options.scale_factor = 1.0;
+  options.gravitational_constant_code = 1.0;
+  std::vector<std::uint32_t> active{0, 1};
+  std::vector<double> x{0.1, 0.2};
+  std::vector<double> y{0.1, 0.2};
+  std::vector<double> z{0.1, 0.2};
+  std::vector<double> ax(1, 0.0);
+  std::vector<double> ay(2, 0.0);
+  std::vector<double> az(2, 0.0);
+  bool threw = false;
+  try {
+    solver.interpolateForces(
+        grid,
+        cosmosim::gravity::PmSolver::PmForceTargetView{active, x, y, z, ax, ay, az},
+        options,
+        nullptr);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testNonFiniteSolveOptionsRejected() {
+  const cosmosim::gravity::PmGridShape shape{4, 4, 4};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+
+  cosmosim::gravity::PmSolveOptions baseline;
+  baseline.box_size_mpc_comoving = 1.0;
+  baseline.scale_factor = 1.0;
+  baseline.gravitational_constant_code = 1.0;
+
+  const auto require_rejected = [&](const cosmosim::gravity::PmSolveOptions& options) {
+    bool threw = false;
+    try {
+      solver.solvePoissonPeriodic(grid, options, nullptr);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  };
+
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  auto options = baseline;
+  options.box_size_x_mpc_comoving = nan;
+  require_rejected(options);
+
+  options = baseline;
+  options.scale_factor = nan;
+  require_rejected(options);
+
+  options = baseline;
+  options.gravitational_constant_code = nan;
+  require_rejected(options);
+
+  options = baseline;
+  options.tree_pm_split_scale_comoving = nan;
+  require_rejected(options);
+}
+
+void testIsolatedOpenRectangularAssignmentAndInterpolationClipStencils() {
+  const cosmosim::gravity::PmGridShape shape{4, 3, 2};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_x_mpc_comoving = 2.0;
+  options.box_size_y_mpc_comoving = 3.0;
+  options.box_size_z_mpc_comoving = 4.0;
+  options.boundary_condition = cosmosim::gravity::PmBoundaryCondition::kIsolatedOpen;
+
+  const std::vector<double> x{1.95};
+  const std::vector<double> y{0.0};
+  const std::vector<double> z{0.0};
+  const std::vector<double> mass{1.0};
+  solver.assignDensity(grid, x, y, z, mass, options, nullptr);
+  assert(std::abs(grid.density()[grid.linearIndex(3, 0, 0)] - 0.1) < 1.0e-12);
+  assert(std::abs(grid.density()[grid.linearIndex(0, 0, 0)]) < 1.0e-12);
+
+  grid.force_x()[grid.linearIndex(3, 0, 0)] = 2.0;
+  grid.force_x()[grid.linearIndex(0, 0, 0)] = 100.0;
+  grid.potential()[grid.linearIndex(3, 0, 0)] = 5.0;
+  grid.potential()[grid.linearIndex(0, 0, 0)] = 200.0;
+  std::vector<double> ax(1, 0.0);
+  std::vector<double> ay(1, 0.0);
+  std::vector<double> az(1, 0.0);
+  std::vector<double> potential(1, 0.0);
+  solver.interpolateForces(grid, x, y, z, ax, ay, az, options, nullptr);
+  solver.interpolatePotential(grid, x, y, z, potential, options, nullptr);
+  assert(std::abs(ax[0] - 0.2) < 1.0e-12);
+  assert(std::abs(potential[0] - 0.5) < 1.0e-12);
+
+  const std::vector<double> outside_x{2.1};
+  solver.interpolateForces(grid, outside_x, y, z, ax, ay, az, options, nullptr);
+  solver.interpolatePotential(grid, outside_x, y, z, potential, options, nullptr);
+  assert(ax[0] == 0.0 && ay[0] == 0.0 && az[0] == 0.0);
+  assert(potential[0] == 0.0);
+}
+
+
+void testPmBackendArchitectureAndTopologyContract() {
+  const auto architecture = cosmosim::gravity::pmBackendArchitecture();
+  assert(architecture.capability == cosmosim::gravity::pmBackendCapability());
+  assert(!architecture.device_fft);
+  assert(!architecture.device_green_function);
+  assert(!architecture.device_gradient);
+  assert(!architecture.persistent_residency);
+  assert(!architecture.distributed_device_fft);
+#if !COSMOSIM_ENABLE_CUDA
+  assert(!architecture.persistent_device_buffers);
+#endif
+
+  const cosmosim::gravity::PmGridShape shape{16U, 12U, 8U};
+  const cosmosim::parallel::PmSlabLayout serial_layout{
+      .global_nx = shape.nx,
+      .global_ny = shape.ny,
+      .global_nz = shape.nz,
+      .world_size = 1,
+      .world_rank = 0,
+      .owned_x = {.begin_x = 0U, .end_x = shape.nx},
+  };
+  const auto serial = cosmosim::gravity::describePmDecomposition(
+      shape, serial_layout, cosmosim::core::PmDecompositionMode::kSlab);
+  assert(serial.topology == cosmosim::gravity::PmDecompositionTopology::kSerial);
+  assert(serial.real_extent.x_count == shape.nx);
+  assert(serial.real_extent.y_count == shape.ny);
+  assert(serial.real_extent.z_count == shape.nz);
+
+  const cosmosim::parallel::PmSlabLayout distributed_layout{
+      .global_nx = shape.nx,
+      .global_ny = shape.ny,
+      .global_nz = shape.nz,
+      .world_size = 4,
+      .world_rank = 1,
+      .owned_x = {.begin_x = 4U, .end_x = 8U},
+  };
+  const auto transposed = cosmosim::gravity::describePmDecomposition(
+      shape, distributed_layout, cosmosim::core::PmDecompositionMode::kPencil);
+  assert(transposed.topology ==
+         cosmosim::gravity::PmDecompositionTopology::kXSlabTransposedSpectral);
+  assert(transposed.real_extent.x_begin == 4U);
+  assert(transposed.real_extent.x_count == 4U);
+
+  const cosmosim::gravity::PmDecompositionView serial_view(
+      shape, serial_layout, cosmosim::core::PmDecompositionMode::kSlab);
+  assert(serial_view.realOwnerRank({15U, 0U, 0U}) == 0);
+  assert(serial_view.ownsRealCell(3U, 2U, 1U));
+  assert(serial_view.globalToLocalRealIndex(3U, 2U, 1U) == (3U * shape.ny + 2U) * shape.nz + 1U);
+
+  const cosmosim::gravity::PmDecompositionView distributed_view(
+      shape, distributed_layout, cosmosim::core::PmDecompositionMode::kPencil);
+  assert(distributed_view.realOwnerRank({0U, 2U, 1U}) == 0);
+  assert(distributed_view.realOwnerRank({5U, 2U, 1U}) == 1);
+  assert(distributed_view.realOwnerRank({15U, 2U, 1U}) == 3);
+  assert(distributed_view.ownsRealCell(5U, 2U, 1U));
+  assert(!distributed_view.ownsRealCell(2U, 2U, 1U));
+
+  // A true 2-D ownership query must be able to distinguish cells with the
+  // same global x but different y process-grid coordinates. This is a value-
+  // type contract only; no distributed FFT backend is implied by the test.
+  cosmosim::gravity::PmDecompositionDescriptor pencil_descriptor;
+  pencil_descriptor.topology = cosmosim::gravity::PmDecompositionTopology::kPencil2D;
+  pencil_descriptor.process_grid_x = 2U;
+  pencil_descriptor.process_grid_y = 2U;
+  const cosmosim::gravity::PmDecompositionView pencil_rank0(
+      shape, pencil_descriptor, 0, 4);
+  assert(pencil_rank0.realOwnerRank({1U, 1U, 0U}) == 0);
+  assert(pencil_rank0.realOwnerRank({1U, 6U, 0U}) == 2);
+  assert(pencil_rank0.realOwnerRank({10U, 1U, 0U}) == 1);
+  assert(pencil_rank0.realOwnerRank({10U, 6U, 0U}) == 3);
+  const auto pencil_rank3_extent = pencil_rank0.realExtentForRank(3);
+  assert(pencil_rank3_extent.x_begin == 8U);
+  assert(pencil_rank3_extent.x_count == 8U);
+  assert(pencil_rank3_extent.y_begin == 6U);
+  assert(pencil_rank3_extent.y_count == 6U);
+}
+
+
+void testPmRoutingCapacityModelM1A() {
+  constexpr std::uint64_t mib = 1024ULL * 1024ULL;
+  constexpr std::uint64_t configured_peer_max = 16ULL * mib;
+  constexpr std::uint64_t density_rank_metadata_bytes =
+      8ULL * 8ULL * static_cast<std::uint64_t>(sizeof(int)) +
+      8ULL * static_cast<std::uint64_t>(sizeof(std::size_t));
+  constexpr std::uint64_t interpolation_rank_metadata_bytes =
+      12ULL * 8ULL * static_cast<std::uint64_t>(sizeof(int)) +
+      8ULL * static_cast<std::uint64_t>(sizeof(std::size_t));
+  constexpr std::size_t plane_record_bytes = 96U;
+  constexpr std::uint64_t certified_global_particles = 512ULL * 512ULL * 512ULL;
+  constexpr std::uint64_t certified_local_particles = certified_global_particles / 8ULL;
+  static_assert(certified_local_particles == 16'777'216ULL);
+
+  const auto certified = cosmosim::gravity::modelPmRoutingCapacity(
+      8,
+      configured_peer_max,
+      cosmosim::gravity::k_pm_routing_modeled_workspace_limit_bytes,
+      density_rank_metadata_bytes,
+      plane_record_bytes);
+  assert(certified.configured_per_peer_max_bytes == configured_peer_max);
+  assert(certified.effective_per_peer_payload_bytes == 9'582'240ULL);
+  assert(certified.effective_per_peer_payload_bytes <= configured_peer_max);
+  assert(certified.effective_per_peer_payload_bytes % plane_record_bytes == 0U);
+  assert(certified.max_send_payload_bytes == 67'075'680ULL);
+  assert(certified.max_receive_payload_bytes == 67'075'680ULL);
+  assert(certified.max_simultaneous_workspace_bytes == 134'151'680ULL);
+  assert(certified.max_simultaneous_workspace_bytes <=
+         cosmosim::gravity::k_pm_routing_modeled_workspace_limit_bytes);
+  assert(cosmosim::gravity::k_pm_routing_workspace_target_bytes -
+             certified.max_simultaneous_workspace_bytes >=
+         cosmosim::gravity::k_pm_routing_workspace_headroom_bytes);
+
+  const auto interpolation = cosmosim::gravity::modelPmRoutingCapacity(
+      8,
+      configured_peer_max,
+      cosmosim::gravity::k_pm_routing_modeled_workspace_limit_bytes,
+      interpolation_rank_metadata_bytes,
+      plane_record_bytes);
+  assert(interpolation.fixed_workspace_bytes == interpolation_rank_metadata_bytes);
+  assert(interpolation.fixed_workspace_bytes == 448ULL);
+  assert(interpolation.effective_per_peer_payload_bytes == 9'582'240ULL);
+  assert(interpolation.max_send_payload_bytes == 67'075'680ULL);
+  assert(interpolation.max_receive_payload_bytes == 67'075'680ULL);
+  assert(interpolation.max_simultaneous_workspace_bytes ==
+         interpolation.fixed_workspace_bytes +
+             interpolation.max_send_payload_bytes +
+             interpolation.max_receive_payload_bytes);
+  assert(interpolation.max_simultaneous_workspace_bytes == 134'151'808ULL);
+  assert(interpolation.max_simultaneous_workspace_bytes <=
+         cosmosim::gravity::k_pm_routing_modeled_workspace_limit_bytes);
+  const std::uint64_t certified_margin_bytes =
+      cosmosim::gravity::k_pm_routing_workspace_target_bytes -
+      interpolation.max_simultaneous_workspace_bytes;
+  assert(certified_margin_bytes == 65'920ULL);
+  assert(certified_margin_bytes >=
+         cosmosim::gravity::k_pm_routing_workspace_headroom_bytes);
+
+  // The certified 512^3 / 8-rank TSC local population is deliberately not an
+  // input to the capacity model: bounded routing depends on peer count, wire
+  // width, rank metadata capacity, and policy bytes, not N_local. Keep the
+  // target count visible here so later refactors cannot accidentally turn the
+  // acceptance proof into a tiny-fixture-only statement.
+  assert(certified_local_particles >
+         interpolation.effective_per_peer_payload_bytes / plane_record_bytes);
+
+  const auto serial = cosmosim::gravity::modelPmRoutingCapacity(
+      1, configured_peer_max, 128ULL * mib, 4096U, plane_record_bytes);
+  assert(serial.effective_per_peer_payload_bytes == 0U);
+  assert(serial.max_send_payload_bytes == 0U);
+  assert(serial.max_receive_payload_bytes == 0U);
+  assert(serial.max_simultaneous_workspace_bytes == 4096U);
+
+  const std::uint64_t small_peer_max = 4ULL * plane_record_bytes;
+  const auto configured_limited = cosmosim::gravity::modelPmRoutingCapacity(
+      8, small_peer_max, 128ULL * mib, 0U, plane_record_bytes);
+  assert(configured_limited.effective_per_peer_payload_bytes == small_peer_max);
+  assert(configured_limited.effective_per_peer_payload_bytes <= small_peer_max);
+
+  // N_local is deliberately absent from the capacity model. Even extreme
+  // legal rank/byte inputs remain bounded by the aggregate budget before any
+  // multiplication, which is the checked-arithmetic contract used by routing.
+  const auto extreme = cosmosim::gravity::modelPmRoutingCapacity(
+      std::numeric_limits<int>::max(),
+      std::numeric_limits<std::uint64_t>::max(),
+      std::numeric_limits<std::uint64_t>::max(),
+      0U,
+      1U);
+  assert(extreme.max_simultaneous_workspace_bytes <=
+         std::numeric_limits<std::uint64_t>::max());
+
+  bool threw = false;
+  try {
+    (void)cosmosim::gravity::modelPmRoutingCapacity(
+        0, configured_peer_max, 128ULL * mib, 0U, plane_record_bytes);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  threw = false;
+  try {
+    (void)cosmosim::gravity::modelPmRoutingCapacity(
+        8, configured_peer_max, 1024U, 2048U, plane_record_bytes);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  threw = false;
+  try {
+    (void)cosmosim::gravity::modelPmRoutingCapacity(
+        8, plane_record_bytes - 1U, 128ULL * mib, 0U, plane_record_bytes);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testPmRejectsInvalidEnumsNegativeMassAndOverflow() {
+  const cosmosim::gravity::PmGridShape shape{4, 4, 4};
+  cosmosim::gravity::PmGridStorage grid(shape);
+  cosmosim::gravity::PmSolver solver(shape);
+  const std::vector<double> x{0.25};
+  const std::vector<double> y{0.25};
+  const std::vector<double> z{0.25};
+  const std::vector<double> negative_mass{-1.0};
+  cosmosim::gravity::PmSolveOptions options;
+  options.box_size_mpc_comoving = 1.0;
+  bool threw = false;
+  try {
+    solver.assignDensity(grid, x, y, z, negative_mass, options, nullptr);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  options.assignment_scheme = static_cast<cosmosim::gravity::PmAssignmentScheme>(99);
+  threw = false;
+  try {
+    const std::vector<double> mass{1.0};
+    solver.assignDensity(grid, x, y, z, mass, options, nullptr);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  const cosmosim::gravity::PmGridShape overflow_shape{
+      (std::numeric_limits<std::size_t>::max() / 2U) + 1U, 2U, 2U};
+  threw = false;
+  try {
+    (void)overflow_shape.cellCount();
+  } catch (const std::overflow_error&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+}  // namespace
+
+int main() {
+#if COSMOSIM_ENABLE_MPI
+  MPI_Init(nullptr, nullptr);
+#endif
+
+  testCicMassConservation();
+  testTscMassConservationAndPeriodicWrap();
+  testPoissonAnalyticMode();
+  testEvenGridNyquistFirstDerivativeContract();
+  testUniformDensityZeroResponse();
+  testPotentialInterpolationCicConsistency();
+  if (cosmosim::gravity::PmSolver::fftBackendAvailable()) {
+    testIsolatedOpenPointMassCenteredOffCenteredAndBoundary();
+    testIsolatedOpenResolutionConvergence();
+    testIsolatedOpenSelfSimilarBoxScaling();
+    testIsolatedOpenSplitConsistencyAndNonCubic();
+  } else {
+    testIsolatedOpenNoFftwSmoke();
+  }
+  testIsolatedOpenRejectsDistributedSlab();
+  testSingleRankSlabLayoutStorageEquivalence();
+  testPartialSlabStorageRejectsSingleRankSolverPath();
+  testPoissonPlanCachingForStableSlabLayout();
+  testIndexedGlobalPmTargetViewWritesOnlyActiveRows();
+  testExplicitPmCoordinateLayoutsAndEmptyTargets();
+  testActivePmTargetViewExtentValidation();
+  testNonFiniteSolveOptionsRejected();
+  testIsolatedOpenRectangularAssignmentAndInterpolationClipStencils();
+  testTreePmBuildGate();
+  testExecutionPolicyValidation();
+  testDeviceCpuAgreementWhenCudaAvailable();
+  testPmRoutingCapacityModelM1A();
+  testPmRejectsInvalidEnumsNegativeMassAndOverflow();
+  testPmBackendArchitectureAndTopologyContract();
+
+#if COSMOSIM_ENABLE_MPI
+  MPI_Finalize();
+#endif
+
+  return 0;
+}

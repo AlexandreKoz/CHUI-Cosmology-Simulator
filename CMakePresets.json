@@ -1,0 +1,485 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "displayName": "Base",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "COSMOSIM_PRESET_NAME": "${presetName}",
+        "COSMOSIM_ENABLE_TESTS": "ON",
+        "COSMOSIM_ENABLE_BENCHMARKS": "ON",
+        "COSMOSIM_ENABLE_MPI": "OFF",
+        "COSMOSIM_ENABLE_HDF5": "OFF",
+        "COSMOSIM_ENABLE_FFTW": "OFF",
+        "COSMOSIM_ENABLE_CUDA": "OFF",
+        "COSMOSIM_ENABLE_PYTHON": "OFF",
+        "COSMOSIM_ENABLE_LTO": "OFF",
+        "COSMOSIM_ENABLE_NATIVE_CPU": "OFF"
+      }
+    },
+    {
+      "name": "cpu-only-debug",
+      "inherits": [
+        "base"
+      ],
+      "displayName": "CPU Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "cpu-debug",
+      "inherits": [
+        "cpu-only-debug"
+      ],
+      "displayName": "CPU Debug (compat alias)",
+      "description": "Compatibility alias for the canonical cpu-only-debug configure preset used by build-cpu-debug/test-cpu-debug.",
+      "binaryDir": "${sourceDir}/build/cpu-only-debug",
+      "cacheVariables": {
+        "COSMOSIM_PRESET_NAME": "cpu-only-debug"
+      }
+    },
+    {
+      "name": "hdf5-debug",
+      "inherits": [
+        "cpu-only-debug"
+      ],
+      "displayName": "HDF5 Debug",
+      "description": "Developer workflow for snapshot/restart schema and provenance work.",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_HDF5": "ON"
+      }
+    },
+    {
+      "name": "pm-hdf5-fftw-debug",
+      "inherits": [
+        "hdf5-debug"
+      ],
+      "displayName": "PM + HDF5 + FFTW Debug",
+      "description": "PM/TreePM validation workflow with HDF5 I/O and FFTW enabled.",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_FFTW": "ON"
+      }
+    },
+    {
+      "name": "mpi-hdf5-fftw-debug",
+      "inherits": [
+        "pm-hdf5-fftw-debug"
+      ],
+      "displayName": "MPI + HDF5 + FFTW Debug",
+      "description": "Distributed gravity development preset (Phase 2 contract path).",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_MPI": "ON",
+        "COSMOSIM_REQUIRE_PARALLEL_HDF5": "ON"
+      }
+    },
+    {
+      "name": "mpi-serial-hdf5-fftw-debug",
+      "displayName": "MPI + serial HDF5 + FFTW Debug (legacy sharded compatibility)",
+      "inherits": [
+        "pm-hdf5-fftw-debug"
+      ],
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_MPI": "ON",
+        "COSMOSIM_REQUIRE_PARALLEL_HDF5": "OFF"
+      }
+    },
+    {
+      "name": "python-debug",
+      "inherits": [
+        "cpu-only-debug"
+      ],
+      "displayName": "Python Debug",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_PYTHON": "ON"
+      }
+    },
+    {
+      "name": "cuda-debug",
+      "inherits": [
+        "cpu-only-debug"
+      ],
+      "displayName": "CUDA Debug",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_CUDA": "ON"
+      }
+    },
+    {
+      "name": "mpi-cuda-hdf5-fftw-debug",
+      "inherits": [
+        "mpi-hdf5-fftw-debug"
+      ],
+      "displayName": "MPI + CUDA + HDF5 + FFTW Debug",
+      "description": "Distributed gravity + GPU development preset.",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_CUDA": "ON"
+      }
+    },
+    {
+      "name": "cpu-only-release",
+      "inherits": [
+        "base"
+      ],
+      "displayName": "CPU Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "asan-debug",
+      "inherits": [
+        "base"
+      ],
+      "displayName": "ASan Debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
+    },
+    {
+      "name": "mpi-hdf5-fftw-release",
+      "inherits": [
+        "cpu-only-release"
+      ],
+      "displayName": "MPI + HDF5 + FFTW Release",
+      "description": "Production-like CPU feature combination for distributed DMO qualification.",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_MPI": "ON",
+        "COSMOSIM_ENABLE_HDF5": "ON",
+        "COSMOSIM_ENABLE_FFTW": "ON",
+        "COSMOSIM_ENABLE_CUDA": "OFF",
+        "COSMOSIM_REQUIRE_PARALLEL_HDF5": "ON"
+      }
+    },
+    {
+      "name": "mpi-release",
+      "inherits": [
+        "cpu-only-release"
+      ],
+      "displayName": "MPI Release",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_MPI": "ON"
+      }
+    },
+    {
+      "name": "cuda-release",
+      "inherits": [
+        "cpu-only-release"
+      ],
+      "displayName": "CUDA Release",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_CUDA": "ON"
+      }
+    },
+    {
+      "name": "cpu-only-release-native",
+      "inherits": [
+        "cpu-only-release"
+      ],
+      "displayName": "cpu-only-release-native",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_NATIVE_CPU": "ON",
+        "COSMOSIM_ENABLE_LTO": "OFF"
+      }
+    },
+    {
+      "name": "cpu-only-release-lto",
+      "inherits": [
+        "cpu-only-release"
+      ],
+      "displayName": "cpu-only-release-lto",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_NATIVE_CPU": "OFF",
+        "COSMOSIM_ENABLE_LTO": "ON"
+      }
+    },
+    {
+      "name": "cpu-only-release-native-lto",
+      "inherits": [
+        "cpu-only-release"
+      ],
+      "displayName": "cpu-only-release-native-lto",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_NATIVE_CPU": "ON",
+        "COSMOSIM_ENABLE_LTO": "ON"
+      }
+    },
+    {
+      "name": "mpi-hdf5-fftw-release-native",
+      "inherits": [
+        "mpi-hdf5-fftw-release"
+      ],
+      "displayName": "mpi-hdf5-fftw-release-native",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_NATIVE_CPU": "ON",
+        "COSMOSIM_ENABLE_LTO": "OFF"
+      }
+    },
+    {
+      "name": "mpi-hdf5-fftw-release-lto",
+      "inherits": [
+        "mpi-hdf5-fftw-release"
+      ],
+      "displayName": "mpi-hdf5-fftw-release-lto",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_NATIVE_CPU": "OFF",
+        "COSMOSIM_ENABLE_LTO": "ON"
+      }
+    },
+    {
+      "name": "mpi-hdf5-fftw-release-native-lto",
+      "inherits": [
+        "mpi-hdf5-fftw-release"
+      ],
+      "displayName": "mpi-hdf5-fftw-release-native-lto",
+      "cacheVariables": {
+        "COSMOSIM_ENABLE_NATIVE_CPU": "ON",
+        "COSMOSIM_ENABLE_LTO": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-cpu-debug",
+      "configurePreset": "cpu-only-debug"
+    },
+    {
+      "name": "build-cuda-debug",
+      "configurePreset": "cuda-debug"
+    },
+    {
+      "name": "build-mpi-cuda-hdf5-fftw-debug",
+      "configurePreset": "mpi-cuda-hdf5-fftw-debug"
+    },
+    {
+      "name": "build-cpu-release",
+      "configurePreset": "cpu-only-release"
+    },
+    {
+      "name": "build-hdf5-debug",
+      "configurePreset": "hdf5-debug"
+    },
+    {
+      "name": "build-pm-hdf5-fftw-debug",
+      "configurePreset": "pm-hdf5-fftw-debug"
+    },
+    {
+      "name": "build-mpi-serial-hdf5-fftw-debug",
+      "configurePreset": "mpi-serial-hdf5-fftw-debug"
+    },
+    {
+      "name": "build-mpi-hdf5-fftw-debug",
+      "configurePreset": "mpi-hdf5-fftw-debug"
+    },
+    {
+      "name": "build-mpi-hdf5-fftw-release",
+      "configurePreset": "mpi-hdf5-fftw-release"
+    },
+    {
+      "name": "build-mpi-release",
+      "configurePreset": "mpi-release"
+    },
+    {
+      "name": "build-cuda-release",
+      "configurePreset": "cuda-release"
+    },
+    {
+      "name": "build-python-debug",
+      "configurePreset": "python-debug"
+    },
+    {
+      "name": "build-cpu-only-release-native",
+      "configurePreset": "cpu-only-release-native"
+    },
+    {
+      "name": "build-cpu-only-release-lto",
+      "configurePreset": "cpu-only-release-lto"
+    },
+    {
+      "name": "build-cpu-only-release-native-lto",
+      "configurePreset": "cpu-only-release-native-lto"
+    },
+    {
+      "name": "build-mpi-hdf5-fftw-release-native",
+      "configurePreset": "mpi-hdf5-fftw-release-native"
+    },
+    {
+      "name": "build-mpi-hdf5-fftw-release-lto",
+      "configurePreset": "mpi-hdf5-fftw-release-lto"
+    },
+    {
+      "name": "build-mpi-hdf5-fftw-release-native-lto",
+      "configurePreset": "mpi-hdf5-fftw-release-native-lto"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "test-cpu-debug",
+      "configurePreset": "cpu-only-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-cuda-debug",
+      "configurePreset": "cuda-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-mpi-cuda-hdf5-fftw-debug",
+      "configurePreset": "mpi-cuda-hdf5-fftw-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-hdf5-debug",
+      "configurePreset": "hdf5-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-pm-hdf5-fftw-debug",
+      "configurePreset": "pm-hdf5-fftw-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-mpi-serial-hdf5-fftw-debug",
+      "configurePreset": "mpi-serial-hdf5-fftw-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-mpi-hdf5-fftw-debug",
+      "configurePreset": "mpi-hdf5-fftw-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-mpi-hdf5-fftw-release",
+      "configurePreset": "mpi-hdf5-fftw-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-mpi-release",
+      "configurePreset": "mpi-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-cuda-release",
+      "configurePreset": "cuda-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-python-debug",
+      "configurePreset": "python-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-stage0-runtime-truth-cpu-debug",
+      "configurePreset": "cpu-only-debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "name": "^(unit_simulation_state|unit_time_integration|unit_gas_cell_identity_invariants|unit_hot_cold_sidecar_layout|integration_reorder_compaction_sidecars|integration_species_migration_invariants|integration_transform_fuzz_invariants|integration_softening_ownership_invariants|integration_hierarchical_time_bins|integration_hierarchical_timestep_regression|integration_parallel_two_rank_restart|unit_snapshot_hdf5_schema|unit_restart_checkpoint_schema|integration_snapshot_hdf5_roundtrip|integration_restart_checkpoint_roundtrip|integration_provenance_roundtrip|integration_runtime_truth_ctest_labels)$"
+        }
+      },
+      "description": "Compatibility alias for the CPU-only Stage-1 P0 runtime-truth gate."
+    },
+    {
+      "name": "test-stage2-runtime-truth-cpu-debug",
+      "configurePreset": "cpu-only-debug",
+      "displayName": "Stage 2 scheduler-authority CPU gate",
+      "description": "Runs the dependency-free Stage 2 scheduler authority, split-brain removal, PM sync legality, restart equivalence, and CTest label audit gate.",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "name": "^(unit_time_integration|integration_hierarchical_time_bins|integration_hierarchical_timestep_regression|integration_parallel_two_rank_restart|integration_restart_checkpoint_roundtrip|integration_runtime_truth_ctest_labels)$"
+        }
+      }
+    },
+    {
+      "name": "test-stage1-runtime-truth-cpu-debug",
+      "configurePreset": "cpu-only-debug",
+      "displayName": "Stage 1 runtime-truth CPU P0 gate",
+      "description": "Runs the dependency-free P0 runtime-truth repair suite: softening, sidecar, gas, migration, restart, provenance, scheduler, active views, and CTest label audit.",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "name": "^(unit_simulation_state|unit_time_integration|unit_gas_cell_identity_invariants|unit_hot_cold_sidecar_layout|integration_reorder_compaction_sidecars|integration_species_migration_invariants|integration_transform_fuzz_invariants|integration_softening_ownership_invariants|integration_hierarchical_time_bins|integration_hierarchical_timestep_regression|integration_parallel_two_rank_restart|unit_snapshot_hdf5_schema|unit_restart_checkpoint_schema|integration_snapshot_hdf5_roundtrip|integration_restart_checkpoint_roundtrip|integration_provenance_roundtrip|integration_runtime_truth_ctest_labels)$"
+        }
+      }
+    },
+    {
+      "name": "test-cpu-only-release-native",
+      "configurePreset": "cpu-only-release-native",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-cpu-only-release-lto",
+      "configurePreset": "cpu-only-release-lto",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-cpu-only-release-native-lto",
+      "configurePreset": "cpu-only-release-native-lto",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-mpi-hdf5-fftw-release-native",
+      "configurePreset": "mpi-hdf5-fftw-release-native",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-mpi-hdf5-fftw-release-lto",
+      "configurePreset": "mpi-hdf5-fftw-release-lto",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "test-mpi-hdf5-fftw-release-native-lto",
+      "configurePreset": "mpi-hdf5-fftw-release-native-lto",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

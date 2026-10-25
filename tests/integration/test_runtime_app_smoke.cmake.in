@@ -1,0 +1,198 @@
+set(runtime_smoke_root "@CMAKE_BINARY_DIR@/runtime_app_smoke")
+set(runtime_smoke_run_root "${runtime_smoke_root}/outputs")
+set(runtime_smoke_config "${runtime_smoke_root}/runtime_smoke.param.txt")
+set(runtime_smoke_stdout "${runtime_smoke_root}/runtime_stdout.txt")
+set(runtime_smoke_stderr "${runtime_smoke_root}/runtime_stderr.txt")
+set(runtime_smoke_run_dir "${runtime_smoke_run_root}/runtime_app_smoke")
+set(runtime_smoke_snapshot_dir "${runtime_smoke_run_dir}/snapshots")
+set(runtime_smoke_snapshot_member "${runtime_smoke_snapshot_dir}/snap_001.hdf5")
+
+file(REMOVE_RECURSE "${runtime_smoke_root}")
+file(MAKE_DIRECTORY "${runtime_smoke_root}")
+
+file(WRITE "${runtime_smoke_config}" "schema_version = 1\n\n[mode]\nmode = zoom_in\nic_file = generated\nzoom_high_res_region = false\n\n[numerics]\ntime_begin_code = 0.01\ntime_end_code = 0.0101\nmax_global_steps = 1\nhierarchical_max_rung = 0\ngravity_solver = treepm\nhydro_solver = godunov_fv\ntreepm_pm_grid_nx = 8\ntreepm_pm_grid_ny = 8\ntreepm_pm_grid_nz = 8\ntreepm_asmth_cells = 1.5\ntreepm_rcut_cells = 3.5\ntreepm_assignment_scheme = cic\ntreepm_enable_window_deconvolution = true\ntreepm_update_cadence_steps = 1\n\n[analysis]\nenable_diagnostics = true\nenable_halo_workflow = false\nrun_health_interval_steps = 1\nscience_light_interval_steps = 1\nscience_heavy_interval_steps = 4\n\n[output]\nrun_name = runtime_app_smoke\noutput_directory = ${runtime_smoke_run_root}\noutput_stem = snap\nrestart_stem = restart\nsnapshot_interval_steps = 1\nwrite_restarts = true\n\n[units]\ncoordinate_frame = comoving\n")
+
+execute_process(
+  COMMAND "@CMAKE_COMMAND@" -E env
+          "COSMOSIM_RUNTIME_PHASE_DIAGNOSTICS=1"
+          "@CMAKE_BINARY_DIR@/cosmosim_harness" "${runtime_smoke_config}"
+  RESULT_VARIABLE runtime_result
+  OUTPUT_FILE "${runtime_smoke_stdout}"
+  ERROR_FILE "${runtime_smoke_stderr}"
+  TIMEOUT 30)
+
+if(NOT runtime_result EQUAL 0)
+  file(READ "${runtime_smoke_stdout}" runtime_out)
+  file(READ "${runtime_smoke_stderr}" runtime_err)
+  message(FATAL_ERROR
+    "cosmosim_harness runtime smoke failed with result ${runtime_result}:\n"
+    "stdout:\n${runtime_out}\n"
+    "stderr/phase diagnostics:\n${runtime_err}")
+endif()
+
+foreach(required_path IN ITEMS
+    "${runtime_smoke_run_dir}"
+    "${runtime_smoke_run_dir}/normalized_config.param.txt"
+    "${runtime_smoke_run_dir}/operational_events.json"
+    "${runtime_smoke_run_dir}/profile.json"
+    "${runtime_smoke_run_dir}/profile.csv"
+    "${runtime_smoke_snapshot_dir}"
+    "${runtime_smoke_snapshot_member}"
+    "${runtime_smoke_run_dir}/restart_001.hdf5")
+  if(NOT EXISTS "${required_path}")
+    message(FATAL_ERROR "runtime smoke missing expected artifact: ${required_path}")
+  endif()
+endforeach()
+
+file(GLOB runtime_smoke_completion_markers
+     "${runtime_smoke_snapshot_dir}/snap_001.complete")
+list(LENGTH runtime_smoke_completion_markers runtime_smoke_completion_marker_count)
+if(NOT runtime_smoke_completion_marker_count EQUAL 1)
+  message(FATAL_ERROR
+    "runtime smoke expected exactly one snapshot-set completion manifest in "
+    "${runtime_smoke_snapshot_dir}, found ${runtime_smoke_completion_marker_count}")
+endif()
+list(GET runtime_smoke_completion_markers 0 runtime_smoke_completion_marker)
+file(READ "${runtime_smoke_completion_marker}" runtime_smoke_completion_text)
+foreach(required_manifest_contract IN ITEMS
+    "schema=chui_snapshot_set_v2"
+    "schema_name=chui_science_snapshot_v6"
+    "file_kind=science_snapshot"
+    "num_files_per_snapshot=1"
+    "member_count=1"
+    "member.0.filename=snap_001.hdf5")
+  if(NOT runtime_smoke_completion_text MATCHES "${required_manifest_contract}")
+    message(FATAL_ERROR
+      "runtime smoke snapshot-set completion manifest is missing contract: "
+      "${required_manifest_contract}")
+  endif()
+endforeach()
+
+file(READ "${runtime_smoke_stdout}" runtime_stdout_text)
+foreach(required_console_record IN ITEMS
+    "[CHUI][START]"
+    "[CHUI][STEP]"
+    "[CHUI][SNAPSHOT]"
+    "[CHUI][RESTART]"
+    "[CHUI][DONE]")
+  string(FIND "${runtime_stdout_text}" "${required_console_record}" required_console_record_index)
+  if(required_console_record_index EQUAL -1)
+    message(FATAL_ERROR "runtime smoke stdout missing native console record ${required_console_record}")
+  endif()
+endforeach()
+if(NOT runtime_stdout_text MATCHES "${runtime_smoke_run_dir}")
+  message(FATAL_ERROR "runtime smoke stdout must report the concrete run directory")
+endif()
+if(NOT runtime_stdout_text MATCHES "completed_steps=1")
+  message(FATAL_ERROR "runtime smoke stdout must report completed_steps=1")
+endif()
+if(NOT runtime_stdout_text MATCHES "\\[CHUI\\]\\[SNAPSHOT\\].*state=committed.*members=1.*manifest=.*snap_001.complete")
+  message(FATAL_ERROR "runtime smoke snapshot console record must describe the committed logical set")
+endif()
+file(READ "${runtime_smoke_stderr}" runtime_stderr_text)
+if(NOT runtime_stderr_text MATCHES "runtime_phase=time_coordinator_begin")
+  message(FATAL_ERROR "runtime phase diagnostic compatibility marker is missing")
+endif()
+
+file(READ "${runtime_smoke_run_dir}/operational_events.json" runtime_ops)
+if(NOT runtime_ops MATCHES "run.complete")
+  message(FATAL_ERROR "runtime smoke operational report must record run.complete")
+endif()
+if(NOT runtime_ops MATCHES "config.freeze")
+  message(FATAL_ERROR "runtime smoke operational report must record config.freeze")
+endif()
+if(NOT runtime_ops MATCHES "snapshot.write.complete")
+  message(FATAL_ERROR "runtime smoke operational report must record snapshot.write.complete")
+endif()
+if(NOT runtime_ops MATCHES "scientifically read back, and transactionally published")
+  message(FATAL_ERROR "runtime smoke must record successful scientific snapshot publication")
+endif()
+
+file(READ "${runtime_smoke_run_dir}/normalized_config.param.txt" runtime_normalized)
+if(NOT runtime_normalized MATCHES "treepm_pm_grid_nx = 8")
+  message(FATAL_ERROR "runtime smoke normalized config must preserve canonical numerics.treepm_pm_grid_nx")
+endif()
+if(NOT runtime_normalized MATCHES "treepm_pm_grid_ny = 8")
+  message(FATAL_ERROR "runtime smoke normalized config must preserve canonical numerics.treepm_pm_grid_ny")
+endif()
+if(NOT runtime_normalized MATCHES "treepm_pm_grid_nz = 8")
+  message(FATAL_ERROR "runtime smoke normalized config must preserve canonical numerics.treepm_pm_grid_nz")
+endif()
+if(NOT runtime_normalized MATCHES "treepm_asmth_cells = 1.5")
+  message(FATAL_ERROR "runtime smoke normalized config must preserve numerics.treepm_asmth_cells")
+endif()
+
+# Re-run the same one-step runtime after clearing only its output tree to prove
+# quiet mode suppresses routine native console output without changing success.
+file(REMOVE_RECURSE "${runtime_smoke_run_root}")
+set(runtime_smoke_quiet_stdout "${runtime_smoke_root}/runtime_quiet_stdout.txt")
+set(runtime_smoke_quiet_stderr "${runtime_smoke_root}/runtime_quiet_stderr.txt")
+execute_process(
+  COMMAND "@CMAKE_BINARY_DIR@/cosmosim_harness" "${runtime_smoke_config}" --quiet
+  RESULT_VARIABLE runtime_quiet_result
+  OUTPUT_FILE "${runtime_smoke_quiet_stdout}"
+  ERROR_FILE "${runtime_smoke_quiet_stderr}"
+  TIMEOUT 30)
+if(NOT runtime_quiet_result EQUAL 0)
+  file(READ "${runtime_smoke_quiet_stderr}" runtime_quiet_err)
+  message(FATAL_ERROR "cosmosim_harness quiet runtime smoke failed: ${runtime_quiet_err}")
+endif()
+file(READ "${runtime_smoke_quiet_stdout}" runtime_quiet_out)
+foreach(quiet_record IN ITEMS
+    "[CHUI][START]" "[CHUI][STEP]" "[CHUI][SNAPSHOT]" "[CHUI][RESTART]"
+    "[CHUI][DONE]" "[CHUI][RUNTIME]" "[CHUI][PM]" "[CHUI][MEMORY]" "[CHUI][IC]")
+  string(FIND "${runtime_quiet_out}" "${quiet_record}" quiet_record_index)
+  if(NOT quiet_record_index EQUAL -1)
+    message(FATAL_ERROR "--quiet must suppress routine native CHUI console record ${quiet_record}")
+  endif()
+endforeach()
+
+# Off-cadence endpoint: cadence cannot fire on step 1, so normal completion must
+# force exactly one science snapshot at the authoritative final endpoint.
+file(REMOVE_RECURSE "${runtime_smoke_run_root}")
+set(runtime_smoke_off_cadence_config "${runtime_smoke_root}/runtime_smoke_off_cadence.param.txt")
+file(READ "${runtime_smoke_config}" runtime_smoke_off_cadence_text)
+string(REPLACE "snapshot_interval_steps = 1" "snapshot_interval_steps = 8"
+       runtime_smoke_off_cadence_text "${runtime_smoke_off_cadence_text}")
+file(WRITE "${runtime_smoke_off_cadence_config}" "${runtime_smoke_off_cadence_text}")
+execute_process(
+  COMMAND "@CMAKE_BINARY_DIR@/cosmosim_harness" "${runtime_smoke_off_cadence_config}" --quiet
+  RESULT_VARIABLE runtime_off_cadence_result
+  OUTPUT_FILE "${runtime_smoke_root}/runtime_off_cadence_stdout.txt"
+  ERROR_FILE "${runtime_smoke_root}/runtime_off_cadence_stderr.txt"
+  TIMEOUT 30)
+if(NOT runtime_off_cadence_result EQUAL 0)
+  file(READ "${runtime_smoke_root}/runtime_off_cadence_stderr.txt" runtime_off_cadence_err)
+  message(FATAL_ERROR "off-cadence endpoint runtime smoke failed: ${runtime_off_cadence_err}")
+endif()
+file(GLOB runtime_off_cadence_snapshots "${runtime_smoke_snapshot_dir}/snap_*.hdf5")
+file(GLOB runtime_off_cadence_markers "${runtime_smoke_snapshot_dir}/snap_*.complete")
+list(LENGTH runtime_off_cadence_snapshots runtime_off_cadence_snapshot_count)
+list(LENGTH runtime_off_cadence_markers runtime_off_cadence_marker_count)
+if(NOT runtime_off_cadence_snapshot_count EQUAL 1 OR
+   NOT runtime_off_cadence_marker_count EQUAL 1 OR
+   NOT EXISTS "${runtime_smoke_snapshot_dir}/snap_001.hdf5" OR
+   NOT EXISTS "${runtime_smoke_snapshot_dir}/snap_001.complete")
+  message(FATAL_ERROR
+    "off-cadence endpoint must publish exactly one snap_001.hdf5 and one completion marker")
+endif()
+
+# First-light regression must also pass real drift/gravity dispatch repeatedly.
+file(REMOVE_RECURSE "${runtime_smoke_run_root}")
+file(READ "${runtime_smoke_config}" runtime_multistep_text)
+string(REPLACE "max_global_steps = 1" "max_global_steps = 3" runtime_multistep_text "${runtime_multistep_text}")
+string(REPLACE "time_end_code = 0.0101" "time_end_code = 0.011" runtime_multistep_text "${runtime_multistep_text}")
+file(WRITE "${runtime_smoke_root}/multistep.param.txt" "${runtime_multistep_text}")
+execute_process(COMMAND "@CMAKE_BINARY_DIR@/cosmosim_harness" "${runtime_smoke_root}/multistep.param.txt"
+  RESULT_VARIABLE multistep_result OUTPUT_VARIABLE multistep_out ERROR_VARIABLE multistep_err TIMEOUT 60)
+if(NOT multistep_result EQUAL 0 OR NOT multistep_out MATCHES "completed_steps=3")
+  message(FATAL_ERROR "reference runtime did not complete three force/drift steps: ${multistep_out} ${multistep_err}")
+endif()
+file(READ "${runtime_smoke_run_dir}/operational_events.json" multistep_ops)
+if(NOT multistep_ops MATCHES "gravity.pm_long_range_field")
+  message(FATAL_ERROR "multistep smoke never recorded a gravity force refresh")
+endif()
+
+# The smoke proves artifact creation above, then removes its temporary run tree
+# so ordinary CTest execution does not leave runtime products in the source package.
+file(REMOVE_RECURSE "${runtime_smoke_root}")

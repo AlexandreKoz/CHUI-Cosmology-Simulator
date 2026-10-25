@@ -1,0 +1,5948 @@
+#include "cosmosim/gravity/tree_pm_coupling.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cfenv>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include <limits>
+#include <memory_resource>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "cosmosim/core/checked_arithmetic.hpp"
+#include "cosmosim/core/build_config.hpp"
+#include "cosmosim/core/openmp_runtime.hpp"
+#include "cosmosim/gravity/gravity_memory.hpp"
+
+#if COSMOSIM_HAVE_OPENMP
+#include <omp.h>
+#endif
+
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+#include <mpi.h>
+#endif
+
+// shared hot tree interaction invariants
+#include "internal/tree_interaction_common.hpp"
+#include "internal/tree_pm_acceptance.hpp"
+#include "internal/tree_pm_group_walk.hpp"
+#include "internal/tree_pm_geometry.hpp"
+#include "internal/tree_pm_leaf_kernel.hpp"
+#include "internal/tree_pm_transport_planner.hpp"
+
+namespace cosmosim::gravity {
+namespace {
+
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+bool queryActiveMpiWorld(int& world_size, int& world_rank) noexcept {
+  world_size = 1;
+  world_rank = 0;
+  int initialized = 0;
+  MPI_Initialized(&initialized);
+  if (initialized == 0) {
+    return false;
+  }
+  int finalized = 0;
+  MPI_Finalized(&finalized);
+  if (finalized != 0) {
+    return false;
+  }
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+  return true;
+}
+#endif
+
+[[nodiscard]] double minimumImageDelta(double delta, double box_size_comoving) {
+  if (box_size_comoving <= 0.0) {
+    return delta;
+  }
+  return delta - box_size_comoving * std::nearbyint(delta / box_size_comoving);
+}
+
+struct PeriodicBoxLengths {
+  double lx = 0.0;
+  double ly = 0.0;
+  double lz = 0.0;
+};
+
+[[nodiscard]] PeriodicBoxLengths effectivePeriodicBoxLengths(const PmSolveOptions& options) {
+  const double scalar = options.box_size_mpc_comoving;
+  return PeriodicBoxLengths{
+      .lx = options.box_size_x_mpc_comoving > 0.0 ? options.box_size_x_mpc_comoving : scalar,
+      .ly = options.box_size_y_mpc_comoving > 0.0 ? options.box_size_y_mpc_comoving : scalar,
+      .lz = options.box_size_z_mpc_comoving > 0.0 ? options.box_size_z_mpc_comoving : scalar};
+}
+
+// Wrapped periodic coordinates are finite and non-negative, so IEEE-754 bit
+// order equals numerical order. The sortable representation lives in the
+// tree solver's shared construction key lanes; no coordinate-sized scratch
+// owner is retained by TreePM.
+void radixSortNonNegativeDoubleBits(
+    std::span<std::uint64_t> values,
+    std::span<std::uint64_t> scratch) {
+  if (values.size() < 2U) {
+    return;
+  }
+  if (scratch.size() < values.size()) {
+    throw std::logic_error(
+        "Periodic TreePM radix sort requires pre-sized shared key scratch");
+  }
+  scratch = scratch.first(values.size());
+  constexpr unsigned k_radix_pass_count = sizeof(std::uint64_t);
+  static_assert(k_radix_pass_count == 8U);
+  static_assert((k_radix_pass_count % 2U) == 0U);
+  bool source_is_primary = true;
+  for (unsigned pass = 0; pass < k_radix_pass_count; ++pass) {
+    std::array<std::size_t, 256> counts{};
+    const std::span<const std::uint64_t> source = source_is_primary
+        ? std::span<const std::uint64_t>(values)
+        : std::span<const std::uint64_t>(scratch);
+    const std::span<std::uint64_t> destination = source_is_primary
+        ? scratch
+        : values;
+    const unsigned shift = pass * 8U;
+    for (const std::uint64_t bits : source) {
+      ++counts[(bits >> shift) & 0xffU];
+    }
+    std::array<std::size_t, 256> offsets{};
+    for (std::size_t bucket = 1U; bucket < offsets.size(); ++bucket) {
+      offsets[bucket] = offsets[bucket - 1U] + counts[bucket - 1U];
+    }
+    for (const std::uint64_t bits : source) {
+      const std::size_t bucket = static_cast<std::size_t>((bits >> shift) & 0xffU);
+      destination[offsets[bucket]++] = bits;
+    }
+    source_is_primary = !source_is_primary;
+  }
+  if (!source_is_primary) {
+    throw std::logic_error(
+        "Periodic TreePM radix pass count left authoritative order in scratch storage");
+  }
+}
+
+// Map one periodic coordinate lane into the shortest contiguous interval that
+// contains all sources. The interval begins immediately after the largest
+// circular gap. This gives topology, COMs, quadrupoles, MAC geometry, and
+// exported hierarchy bounds one coherent unwrapped frame.
+double unwrapPeriodicAxis(
+    std::span<const double> input,
+    double box_size_comoving,
+    std::vector<double>& output,
+    std::span<std::uint64_t> ordered_bits,
+    std::span<std::uint64_t> radix_scratch_bits,
+    bool canonical_coordinates = false) {
+  if (!std::isfinite(box_size_comoving) || box_size_comoving <= 0.0) {
+    throw std::invalid_argument("Periodic TreePM tree geometry requires finite positive axis lengths");
+  }
+  output.resize(input.size());
+  if (input.empty()) {
+    return 0.0;
+  }
+  if (ordered_bits.size() < input.size() || radix_scratch_bits.size() < input.size()) {
+    throw std::logic_error(
+        "Periodic TreePM unwrapping requires pre-sized shared construction key lanes");
+  }
+  ordered_bits = ordered_bits.first(input.size());
+  radix_scratch_bits = radix_scratch_bits.first(input.size());
+
+  int non_finite_coordinate = 0;
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel for schedule(static) reduction(| : non_finite_coordinate) if(input.size() >= 1024U)
+#endif
+  for (std::size_t i = 0; i < input.size(); ++i) {
+    if (!std::isfinite(input[i])) {
+      non_finite_coordinate = 1;
+      continue;
+    }
+    double value = canonical_coordinates ? input[i] :
+        input[i] - box_size_comoving * std::floor(input[i] / box_size_comoving);
+    if (value >= box_size_comoving) {
+      value = 0.0;
+    } else if (value < 0.0) {
+      value += box_size_comoving;
+    }
+    // Radix ordering assumes nonnegative IEEE bits; canonical -0 must retain
+    // the old normalization's +0 representation before bit staging.
+    if (value == 0.0) value = 0.0;
+    output[i] = value;
+    ordered_bits[i] = std::bit_cast<std::uint64_t>(value);
+  }
+  if (non_finite_coordinate != 0) {
+    throw std::invalid_argument("Periodic TreePM tree geometry requires finite source coordinates");
+  }
+
+  radixSortNonNegativeDoubleBits(ordered_bits, radix_scratch_bits);
+  double anchor = std::bit_cast<double>(ordered_bits.front());
+  if (ordered_bits.size() > 1U) {
+    double largest_gap = -1.0;
+    double best_anchor = anchor;
+    for (std::size_t i = 0; i < ordered_bits.size(); ++i) {
+      const std::size_t next_index = (i + 1U) % ordered_bits.size();
+      const double current_value = std::bit_cast<double>(ordered_bits[i]);
+      const double candidate_anchor = std::bit_cast<double>(ordered_bits[next_index]);
+      const double next_value = next_index == 0U
+          ? candidate_anchor + box_size_comoving
+          : candidate_anchor;
+      const double gap = next_value - current_value;
+      if (gap > largest_gap || (gap == largest_gap && candidate_anchor < best_anchor)) {
+        largest_gap = gap;
+        best_anchor = candidate_anchor;
+      }
+    }
+    anchor = best_anchor;
+  }
+
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel for schedule(static) if(output.size() >= 1024U)
+#endif
+  for (std::size_t i = 0; i < output.size(); ++i) {
+    if (output[i] < anchor) {
+      output[i] += box_size_comoving;
+    }
+  }
+  return anchor;
+}
+
+[[nodiscard]] double norm3(double x, double y, double z) {
+  return std::sqrt(x * x + y * y + z * z);
+}
+
+[[nodiscard]] bool forceAccumulatorShapeValid(const TreePmForceAccumulatorView& accumulator) {
+  const std::size_t target_count = accumulator.active_particle_index.size();
+  const bool explicit_targets_absent = accumulator.target_pos_x_comoving.empty() &&
+      accumulator.target_pos_y_comoving.empty() && accumulator.target_pos_z_comoving.empty();
+  const bool explicit_targets_complete = accumulator.target_pos_x_comoving.size() == target_count &&
+      accumulator.target_pos_y_comoving.size() == target_count &&
+      accumulator.target_pos_z_comoving.size() == target_count;
+  return target_count == accumulator.accel_x_comoving.size() &&
+      accumulator.active_particle_index.size() == accumulator.accel_y_comoving.size() &&
+      accumulator.active_particle_index.size() == accumulator.accel_z_comoving.size() &&
+      (accumulator.previous_acceleration_magnitude_code.empty() ||
+       accumulator.active_particle_index.size() == accumulator.previous_acceleration_magnitude_code.size()) &&
+      (explicit_targets_absent || explicit_targets_complete) &&
+      ((accumulator.long_range_accel_x_comoving.empty() && accumulator.long_range_accel_y_comoving.empty() &&
+        accumulator.long_range_accel_z_comoving.empty()) ||
+       (accumulator.long_range_accel_x_comoving.size() == target_count &&
+        accumulator.long_range_accel_y_comoving.size() == target_count &&
+        accumulator.long_range_accel_z_comoving.size() == target_count));
+}
+
+void validateTreePmPreflight(
+    std::span<const double> pos_x_comoving,
+    std::span<const double> pos_y_comoving,
+    std::span<const double> pos_z_comoving,
+    std::span<const double> mass_code,
+    const TreePmForceAccumulatorView& accumulator,
+    const TreePmOptions& options,
+    const TreeSofteningView& softening_view,
+    std::array<double, 6>& source_bounds) {
+  source_bounds = {INFINITY, -INFINITY, INFINITY, -INFINITY, INFINITY, -INFINITY};
+  const bool short_output_absent = accumulator.short_range_accel_x_comoving.empty() &&
+      accumulator.short_range_accel_y_comoving.empty() && accumulator.short_range_accel_z_comoving.empty();
+  if (!short_output_absent && (accumulator.short_range_accel_x_comoving.size() != pos_x_comoving.size() ||
+      accumulator.short_range_accel_y_comoving.size() != pos_x_comoving.size() ||
+      accumulator.short_range_accel_z_comoving.size() != pos_x_comoving.size() ||
+      !accumulator.target_pos_x_comoving.empty())) {
+    throw std::invalid_argument("Tree component output requires source-indexed full source extents");
+  }
+  if (!accumulator.short_range_nearest_pair_r2_comoving.empty() &&
+      (accumulator.short_range_nearest_pair_r2_comoving.size() != pos_x_comoving.size() ||
+       !accumulator.target_pos_x_comoving.empty())) {
+    throw std::invalid_argument("Tree nearest-pair output requires source-indexed full source extents");
+  }
+  if (!forceAccumulatorShapeValid(accumulator)) {
+    throw std::invalid_argument(
+        "TreePM force accumulator spans must have matching active-set extent");
+  }
+  if (pos_x_comoving.size() != pos_y_comoving.size() ||
+      pos_x_comoving.size() != pos_z_comoving.size() ||
+      pos_x_comoving.size() != mass_code.size()) {
+    throw std::invalid_argument(
+        "TreePM requires position and mass spans with equal extent");
+  }
+  validateTreePmSplitPolicy(options.split_policy);
+  if (options.tree_exchange_batch_bytes == 0U) {
+    throw std::invalid_argument("TreePM tree_exchange_batch_bytes must be > 0");
+  }
+
+  const PmSolveOptions& pm = options.pm_options;
+  const PeriodicBoxLengths box = effectivePeriodicBoxLengths(pm);
+  if (!std::isfinite(box.lx) || !std::isfinite(box.ly) ||
+      !std::isfinite(box.lz) || box.lx <= 0.0 || box.ly <= 0.0 ||
+      box.lz <= 0.0 || !std::isfinite(pm.scale_factor) ||
+      pm.scale_factor <= 0.0 ||
+      !std::isfinite(pm.gravitational_constant_code) ||
+      pm.gravitational_constant_code <= 0.0 ||
+      !std::isfinite(options.tree_options.gravitational_constant_code) ||
+      options.tree_options.gravitational_constant_code <= 0.0) {
+    throw std::invalid_argument(
+        "TreePM requires finite positive box axes, scale factor, and gravitational constants");
+  }
+  if (options.tree_options.gravitational_constant_code !=
+      pm.gravitational_constant_code) {
+    throw std::invalid_argument(
+        "TreePM PM and tree gravitational_constant_code values must match");
+  }
+  if (!std::isfinite(options.tree_options.opening_theta) ||
+      options.tree_options.opening_theta <= 0.0 ||
+      !std::isfinite(options.tree_options.relative_force_tolerance) ||
+      options.tree_options.relative_force_tolerance <= 0.0 ||
+      !std::isfinite(
+          options.tree_options.relative_force_acceleration_floor_code) ||
+      options.tree_options.relative_force_acceleration_floor_code <= 0.0 ||
+      !std::isfinite(options.adaptive_maximum_opening_angle) ||
+      options.adaptive_maximum_opening_angle <= 0.0 ||
+      options.adaptive_maximum_opening_angle > 1.0 ||
+      options.tree_options.max_leaf_size == 0U ||
+      !std::isfinite(options.tree_options.softening.epsilon_comoving) ||
+      options.tree_options.softening.epsilon_comoving < 0.0 ||
+      options.tree_options.softening.kernel != TreeSofteningKernel::kPlummer) {
+    throw std::invalid_argument("TreePM tree options are invalid");
+  }
+  switch (options.tree_options.opening_criterion) {
+    case TreeOpeningCriterion::kBarnesHutGeometric:
+    case TreeOpeningCriterion::kBarnesHutComDistance:
+    case TreeOpeningCriterion::kRelativeForceError:
+      break;
+    default:
+      throw std::invalid_argument("TreePM tree opening criterion is invalid");
+  }
+  if (options.residual_block_size == 0U || options.residual_block_size > 4096U) {
+    throw std::invalid_argument("TreePM residual_block_size must be in [1,4096]");
+  }
+  switch (options.acceptance_policy) {
+    case TreePmAcceptancePolicy::kStrictReference:
+    case TreePmAcceptancePolicy::kAdaptiveRelative:
+      break;
+    default:
+      throw std::invalid_argument("TreePM acceptance policy is invalid");
+  }
+  switch (options.adaptive_error_estimator) {
+    case TreePmAdaptiveErrorEstimator::kResidualDerivative:
+    case TreePmAdaptiveErrorEstimator::kRelativeMonopole:
+      break;
+    default:
+      throw std::invalid_argument("TreePM adaptive error estimator is invalid");
+  }
+  switch (options.cutoff_node_policy) {
+    case TreePmCutoffNodePolicy::kContainNode:
+    case TreePmCutoffNodePolicy::kComDistance:
+      break;
+    default:
+      throw std::invalid_argument("TreePM cutoff node policy is invalid");
+  }
+  if (options.spatial_work_history_enabled &&
+      options.pm_options.boundary_condition != PmBoundaryCondition::kPeriodic) {
+    throw std::invalid_argument("TreePM spatial work history requires a fixed periodic domain");
+  }
+  switch (options.tree_options.multipole_order) {
+    case TreeMultipoleOrder::kMonopole:
+    case TreeMultipoleOrder::kQuadrupole:
+      break;
+    default:
+      throw std::invalid_argument("TreePM tree multipole order is invalid");
+  }
+  switch (pm.assignment_scheme) {
+    case PmAssignmentScheme::kCic:
+    case PmAssignmentScheme::kTsc:
+      break;
+    default:
+      throw std::invalid_argument("TreePM PM assignment scheme is invalid");
+  }
+  switch (pm.boundary_condition) {
+    case PmBoundaryCondition::kPeriodic:
+    case PmBoundaryCondition::kIsolatedOpen:
+      break;
+    default:
+      throw std::invalid_argument("TreePM PM boundary condition is invalid");
+  }
+  const double half_shortest_periodic_axis =
+      0.5 * std::min({box.lx, box.ly, box.lz});
+  if (pm.boundary_condition == PmBoundaryCondition::kPeriodic &&
+      options.split_policy.cutoff_radius_comoving >=
+          std::nextafter(half_shortest_periodic_axis, 0.0)) {
+    throw std::invalid_argument(
+        "Periodic TreePM requires cutoff_radius_comoving < half the shortest box axis; "
+        "cutoff_radius_comoving=" +
+        std::to_string(options.split_policy.cutoff_radius_comoving) +
+        ", half_shortest_axis=" +
+        std::to_string(half_shortest_periodic_axis) +
+        "; the short-range tree evaluates one minimum image per source");
+  }
+
+  for (std::size_t i = 0; i < mass_code.size(); ++i) {
+    if (!std::isfinite(pos_x_comoving[i]) ||
+        !std::isfinite(pos_y_comoving[i]) ||
+        !std::isfinite(pos_z_comoving[i]) || !std::isfinite(mass_code[i]) ||
+        mass_code[i] < 0.0) {
+      throw std::invalid_argument(
+          "TreePM sources require finite coordinates and finite non-negative masses");
+    }
+    const std::array<double, 3> position{pos_x_comoving[i], pos_y_comoving[i], pos_z_comoving[i]};
+    for (std::size_t axis = 0; axis < 3U; ++axis) {
+      source_bounds[2U*axis] = std::min(source_bounds[2U*axis], position[axis]);
+      source_bounds[2U*axis+1U] = std::max(source_bounds[2U*axis+1U], position[axis]);
+    }
+  }
+
+  const bool explicit_targets = !accumulator.target_pos_x_comoving.empty();
+  for (std::size_t i = 0; i < accumulator.active_particle_index.size(); ++i) {
+    const TreeLocalIndex source_index = accumulator.active_particle_index[i];
+    if (!explicit_targets && source_index >= pos_x_comoving.size()) {
+      throw std::out_of_range("TreePM active index exceeds particle count");
+    }
+    if (explicit_targets && source_index >= pos_x_comoving.size() &&
+        source_index != kInvalidTreeLocalIndex) {
+      throw std::out_of_range(
+          "TreePM explicit target source identity must be local or the invalid local-index sentinel");
+    }
+    const double x = explicit_targets ? accumulator.target_pos_x_comoving[i]
+                                      : pos_x_comoving[source_index];
+    const double y = explicit_targets ? accumulator.target_pos_y_comoving[i]
+                                      : pos_y_comoving[source_index];
+    const double z = explicit_targets ? accumulator.target_pos_z_comoving[i]
+                                      : pos_z_comoving[source_index];
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      throw std::invalid_argument("TreePM target positions must be finite");
+    }
+  }
+
+  const std::size_t source_count = pos_x_comoving.size();
+  const std::size_t target_count = accumulator.active_particle_index.size();
+  if ((!softening_view.source_particle_epsilon_comoving.empty() &&
+       softening_view.source_particle_epsilon_comoving.size() != source_count) ||
+      (!softening_view.source_particle_epsilon_override_mask.empty() &&
+       softening_view.source_particle_epsilon_override_mask.size() != source_count) ||
+      (!softening_view.source_species_tag.empty() &&
+       softening_view.source_species_tag.size() != source_count) ||
+      (!softening_view.target_particle_epsilon_comoving.empty() &&
+       softening_view.target_particle_epsilon_comoving.size() != target_count) ||
+      (!softening_view.target_particle_epsilon_override_mask.empty() &&
+       softening_view.target_particle_epsilon_override_mask.size() != target_count) ||
+      (!softening_view.target_species_tag.empty() &&
+       softening_view.target_species_tag.size() != target_count)) {
+    throw std::invalid_argument("TreePM softening/species sidecar extent mismatch");
+  }
+  const auto validate_epsilon_lane = [](std::span<const double> lane) {
+    for (const double epsilon : lane) {
+      if (!std::isfinite(epsilon) || epsilon < 0.0) {
+        throw std::invalid_argument(
+            "TreePM softening sidecars require finite non-negative values");
+      }
+    }
+  };
+  validate_epsilon_lane(softening_view.source_particle_epsilon_comoving);
+  validate_epsilon_lane(softening_view.target_particle_epsilon_comoving);
+  const auto validate_species_lane = [](std::span<const std::uint32_t> lane) {
+    for (const std::uint32_t species_tag : lane) {
+      if (!core::isValidParticleSpeciesTag(species_tag)) {
+        throw std::invalid_argument("TreePM species sidecars contain an invalid species tag");
+      }
+    }
+  };
+  validate_species_lane(softening_view.source_species_tag);
+  validate_species_lane(softening_view.target_species_tag);
+  if (softening_view.species_policy.enabled) {
+    for (const double epsilon :
+         softening_view.species_policy.epsilon_comoving_by_species) {
+      if (!std::isfinite(epsilon) || epsilon < 0.0) {
+        throw std::invalid_argument(
+            "TreePM species softening requires finite non-negative values");
+      }
+    }
+  }
+  if (explicit_targets &&
+      ((!softening_view.source_particle_epsilon_comoving.empty() &&
+        softening_view.target_particle_epsilon_comoving.empty()) ||
+       (!softening_view.source_species_tag.empty() &&
+        softening_view.target_species_tag.empty()))) {
+    for (const TreeLocalIndex source_index : accumulator.active_particle_index) {
+      if (source_index == kInvalidTreeLocalIndex) {
+        throw std::invalid_argument(
+            "TreePM independent targets require target-owned softening/species sidecars");
+      }
+    }
+  }
+
+  if (options.enable_zoom_long_range_correction) {
+    if (!options.zoom_focused_pm_shape.isValid() ||
+        options.source_is_high_res.size() != source_count ||
+        options.active_is_high_res.size() != target_count ||
+        !std::isfinite(options.zoom_region_center_x_comoving) ||
+        !std::isfinite(options.zoom_region_center_y_comoving) ||
+        !std::isfinite(options.zoom_region_center_z_comoving) ||
+        !std::isfinite(options.zoom_region_radius_comoving) ||
+        !std::isfinite(options.zoom_contamination_radius_comoving) ||
+        options.zoom_region_radius_comoving <= 0.0 ||
+        options.zoom_contamination_radius_comoving < 0.0 ||
+        options.zoom_high_res_allgather_limit_bytes == 0U) {
+      throw std::invalid_argument("TreePM zoom correction options are invalid");
+    }
+  }
+}
+
+[[nodiscard, maybe_unused]] std::uint64_t treePmOptionFingerprint(
+    const PmGridShape& coordinator_pm_shape,
+    const TreePmOptions& options,
+    const PmSolveOptions& effective_pm_options,
+    const TreeSofteningView& softening_view) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  const auto mix = [&hash](std::uint64_t value) {
+    hash ^= value;
+    hash *= 1099511628211ULL;
+  };
+  const auto mix_double = [&mix](double value) {
+    mix(std::bit_cast<std::uint64_t>(value));
+  };
+  mix(static_cast<std::uint64_t>(coordinator_pm_shape.nx));
+  mix(static_cast<std::uint64_t>(coordinator_pm_shape.ny));
+  mix(static_cast<std::uint64_t>(coordinator_pm_shape.nz));
+  const PeriodicBoxLengths box = effectivePeriodicBoxLengths(effective_pm_options);
+  mix_double(box.lx);
+  mix_double(box.ly);
+  mix_double(box.lz);
+  mix_double(effective_pm_options.scale_factor);
+  mix_double(effective_pm_options.gravitational_constant_code);
+  mix_double(effective_pm_options.tree_pm_split_scale_comoving);
+  mix(static_cast<std::uint64_t>(effective_pm_options.assignment_scheme));
+  mix(effective_pm_options.enable_window_deconvolution ? 1U : 0U);
+  mix(static_cast<std::uint64_t>(effective_pm_options.decomposition_mode));
+  mix(static_cast<std::uint64_t>(effective_pm_options.boundary_condition));
+  mix(static_cast<std::uint64_t>(effective_pm_options.execution_policy));
+  mix(static_cast<std::uint64_t>(effective_pm_options.data_residency));
+  mix(effective_pm_options.routing_exchange_batch_bytes);
+  mix(effective_pm_options.isolated_open_root_workspace_limit_bytes);
+  mix(options.identical_source_tree_reuse_enabled ? 1U : 0U);
+  mix(options.topology_refit_enabled ? 1U : 0U);
+  mix(options.short_range_only ? 1U : 0U);
+  mix(options.spatial_work_history_enabled ? 1U : 0U);
+  mix(options.gaussian_pair_lookup_enabled ? 1U : 0U);
+  mix(options.full_residual_lookup_enabled ? 1U : 0U);
+  mix(options.leaf_simd_enabled ? 1U : 0U);
+  mix(options.radial_coefficients_enabled ? 1U : 0U);
+  mix(options.full_mac_diagnostics ? 1U : 0U);
+  mix(options.residual_block_size);
+  mix(static_cast<std::uint64_t>(options.acceptance_policy));
+  mix_double(options.adaptive_maximum_opening_angle);
+  mix(static_cast<std::uint64_t>(options.adaptive_error_estimator));
+  mix(static_cast<std::uint64_t>(options.cutoff_node_policy));
+  mix(options.group_walk_enabled ? 1U : 0U);
+  mix(static_cast<std::uint64_t>(options.tree_options.opening_criterion));
+  mix(static_cast<std::uint64_t>(options.tree_options.multipole_order));
+  mix_double(options.tree_options.opening_theta);
+  mix_double(options.tree_options.relative_force_tolerance);
+  mix_double(options.tree_options.relative_force_acceleration_floor_code);
+  mix_double(options.tree_options.gravitational_constant_code);
+  mix(static_cast<std::uint64_t>(options.tree_options.max_leaf_size));
+  mix(static_cast<std::uint64_t>(options.tree_options.softening.kernel));
+  mix_double(options.tree_options.softening.epsilon_comoving);
+  mix_double(options.split_policy.mesh_spacing_comoving);
+  mix_double(options.split_policy.asmth_cells);
+  mix_double(options.split_policy.rcut_cells);
+  mix_double(options.split_policy.split_scale_comoving);
+  mix_double(options.split_policy.cutoff_radius_comoving);
+  mix(options.decomposition_epoch.value);
+  mix(options.source_generation.value);
+  mix(options.force_epoch.sequence);
+  mix_double(options.force_epoch.scale_factor);
+  mix(options.tree_exchange_batch_bytes);
+  mix(options.enable_zoom_long_range_correction ? 1U : 0U);
+  mix(static_cast<std::uint64_t>(options.zoom_focused_pm_shape.nx));
+  mix(static_cast<std::uint64_t>(options.zoom_focused_pm_shape.ny));
+  mix(static_cast<std::uint64_t>(options.zoom_focused_pm_shape.nz));
+  mix_double(options.zoom_region_center_x_comoving);
+  mix_double(options.zoom_region_center_y_comoving);
+  mix_double(options.zoom_region_center_z_comoving);
+  mix_double(options.zoom_region_radius_comoving);
+  mix_double(options.zoom_contamination_radius_comoving);
+  mix(options.zoom_high_res_allgather_limit_bytes);
+  mix(softening_view.species_policy.enabled ? 1U : 0U);
+  for (const double epsilon :
+       softening_view.species_policy.epsilon_comoving_by_species) {
+    mix_double(epsilon);
+  }
+  return hash;
+}
+
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+[[nodiscard]] std::uint64_t checkedZoomGatherBytes(
+    std::size_t particle_count,
+    std::string_view context) {
+  constexpr std::uint64_t k_fields = 4U;
+  if (particle_count > std::numeric_limits<std::uint64_t>::max() / (k_fields * sizeof(double))) {
+    throw std::overflow_error(std::string(context) + " byte estimate overflows uint64_t");
+  }
+  return static_cast<std::uint64_t>(particle_count) * k_fields * sizeof(double);
+}
+
+struct GatheredParticleField {
+  std::vector<double> x;
+  std::vector<double> y;
+  std::vector<double> z;
+  std::vector<double> m;
+};
+
+[[nodiscard]] GatheredParticleField allGatherParticleField(
+    const parallel::MpiContext& mpi_context,
+    std::span<const double> x,
+    std::span<const double> y,
+    std::span<const double> z,
+    std::span<const double> m,
+    std::uint64_t gather_limit_bytes,
+    std::uint64_t* gathered_bytes = nullptr) {
+  std::exception_ptr local_failure;
+  try {
+    if (x.size() != y.size() || x.size() != z.size() || x.size() != m.size()) {
+      throw std::invalid_argument("allGatherParticleField requires equal local span lengths");
+    }
+    if (!mpi_context.isEnabled() || mpi_context.worldSize() <= 1) {
+      throw std::runtime_error("TreePM zoom high-res all-gather requires an active multi-rank MPI runtime");
+    }
+  } catch (...) {
+    local_failure = std::current_exception();
+  }
+  mpi_context.rethrowCollectivePreparationFailure(
+      local_failure, "TreePM zoom high-res local gather validation");
+
+  std::uint64_t local_count64 = 0U;
+  std::vector<std::uint64_t> counts64;
+  local_failure = nullptr;
+  try {
+    local_count64 = core::checkedIntegralNarrow<std::uint64_t>(
+        x.size(), "TreePM zoom high-res local source count");
+    counts64.resize(static_cast<std::size_t>(mpi_context.worldSize()), 0U);
+  } catch (...) {
+    local_failure = std::current_exception();
+  }
+  mpi_context.rethrowCollectivePreparationFailure(
+      local_failure, "TreePM zoom high-res count-buffer preparation");
+
+  if (MPI_Allgather(
+          &local_count64, 1, MPI_UINT64_T,
+          counts64.data(), 1, MPI_UINT64_T,
+          MPI_COMM_WORLD) != MPI_SUCCESS) {
+    throw std::runtime_error("TreePM zoom high-res source-count Allgather failed");
+  }
+
+  parallel::BoundedMpiTransferPlan plan;
+  GatheredParticleField out;
+  std::vector<double> round_receive_buffer;
+  local_failure = nullptr;
+  try {
+    std::vector<std::size_t> logical_counts(counts64.size(), 0U);
+    for (std::size_t rank = 0; rank < counts64.size(); ++rank) {
+      logical_counts[rank] = core::checkedIntegralNarrow<std::size_t>(
+          counts64[rank], "TreePM zoom high-res received source count");
+    }
+    const std::size_t round_elements =
+        parallel::mpiTransportRoundLimitBytes() / sizeof(double);
+    if (round_elements == 0U) {
+      throw std::runtime_error("TreePM zoom high-res MPI round is smaller than one double");
+    }
+    plan = parallel::planBoundedMpiTransferRounds(
+        logical_counts,
+        static_cast<std::size_t>(std::numeric_limits<int>::max()),
+        round_elements);
+    const std::uint64_t total_bytes = checkedZoomGatherBytes(
+        plan.logical_total_count, "TreePM zoom high-res all-gather");
+    if (gathered_bytes != nullptr) {
+      *gathered_bytes = total_bytes;
+    }
+    if (gather_limit_bytes == 0U || total_bytes > gather_limit_bytes) {
+      throw std::runtime_error(
+          "TreePM zoom high-res source all-gather guard exceeded on rank " +
+          std::to_string(mpi_context.worldRank()) +
+          ": gathered_high_res_sources=" + std::to_string(plan.logical_total_count) +
+          " ranks=" + std::to_string(mpi_context.worldSize()) +
+          " estimated_bytes=" + std::to_string(total_bytes) +
+          " configured_limit_bytes=" + std::to_string(gather_limit_bytes) +
+          " route=allgather policy=bounded_zoom_correction_only");
+    }
+
+    // Treat every destination field plus round scratch as one distributed
+    // preparation transaction. No field payload collective is entered unless
+    // every rank has all four arrays ready.
+    out.x.resize(plan.logical_total_count);
+    out.y.resize(plan.logical_total_count);
+    out.z.resize(plan.logical_total_count);
+    out.m.resize(plan.logical_total_count);
+    std::size_t maximum_round_count = 0U;
+    for (const auto& round : plan.rounds) {
+      maximum_round_count = std::max(maximum_round_count, round.round_count);
+    }
+    round_receive_buffer.resize(maximum_round_count);
+  } catch (...) {
+    local_failure = std::current_exception();
+  }
+  mpi_context.rethrowCollectivePreparationFailure(
+      local_failure, "TreePM zoom high-res field-array preparation");
+
+  const auto gather_field = [&](std::span<const double> local_field,
+                                std::vector<double>& global_field,
+                                std::string_view field_name) {
+    for (const parallel::BoundedMpiRoundLayout& round : plan.rounds) {
+      const std::size_t local_rank = static_cast<std::size_t>(mpi_context.worldRank());
+      const int send_count = round.counts[local_rank];
+      const double* send_pointer = send_count == 0
+          ? nullptr
+          : local_field.data() + round.logical_offsets[local_rank];
+      if (MPI_Allgatherv(
+              const_cast<double*>(send_pointer), send_count, MPI_DOUBLE,
+              round_receive_buffer.empty() ? nullptr : round_receive_buffer.data(),
+              round.counts.data(), round.displacements.data(), MPI_DOUBLE,
+              MPI_COMM_WORLD) != MPI_SUCCESS) {
+        throw std::runtime_error(
+            "TreePM zoom high-res bounded Allgatherv failed for field " +
+            std::string(field_name));
+      }
+      for (std::size_t rank = 0; rank < round.counts.size(); ++rank) {
+        const std::size_t count = static_cast<std::size_t>(round.counts[rank]);
+        if (count == 0U) {
+          continue;
+        }
+        // The bounded plan proved the logical prefix, offset, and scratch
+        // extent before the first field payload collective.
+        const std::size_t destination =
+            plan.logical_displacements[rank] + round.logical_offsets[rank];
+        const std::size_t copy_bytes = count * sizeof(double);
+        std::memcpy(
+            global_field.data() + destination,
+            round_receive_buffer.data() +
+                static_cast<std::size_t>(round.displacements[rank]),
+            copy_bytes);
+      }
+    }
+  };
+
+  gather_field(x, out.x, "x");
+  gather_field(y, out.y, "y");
+  gather_field(z, out.z, "z");
+  gather_field(m, out.m, "m");
+  return out;
+}
+#endif
+
+[[nodiscard]] std::array<double, 3> monopolePlusQuadrupoleAccelPeriodicReference(
+    const TreeNodeSoa& nodes,
+    TreeLocalIndex node_index,
+    double dx,
+    double dy,
+    double dz,
+    double target_softening_comoving,
+    const TreeGravityOptions& options,
+    double split_scale_comoving) {
+  const double r2 = dx * dx + dy * dy + dz * dz;
+  const double safe_r2 = std::max(r2, 1.0e-30);
+  const double r = std::sqrt(safe_r2);
+  const double pair_epsilon =
+      combineSofteningPairEpsilonUnchecked(nodes.softening_max_comoving[node_index], target_softening_comoving);
+  const double eps2 = pair_epsilon * pair_epsilon;
+  const double denom = std::max(r2 + eps2, 1.0e-30);
+  const double softened_inv_r3 = 1.0 / (denom * std::sqrt(denom));
+  const double split_factor = treePmGaussianShortRangeForceFactorUnchecked(r, split_scale_comoving);
+  const double newton_inv_r3 = 1.0 / (safe_r2 * r);
+  const double radial_kernel = softened_inv_r3 + (split_factor - 1.0) * newton_inv_r3;
+  const double prefactor = options.gravitational_constant_code;
+
+  double ax = prefactor * nodes.mass_code[node_index] * radial_kernel * dx;
+  double ay = prefactor * nodes.mass_code[node_index] * radial_kernel * dy;
+  double az = prefactor * nodes.mass_code[node_index] * radial_kernel * dz;
+  if (options.multipole_order != TreeMultipoleOrder::kQuadrupole) {
+    return {ax, ay, az};
+  }
+
+  const double qxx = nodes.quad_xx[node_index];
+  const double qxy = nodes.quad_xy[node_index];
+  const double qxz = nodes.quad_xz[node_index];
+  const double qyy = nodes.quad_yy[node_index];
+  const double qyz = nodes.quad_yz[node_index];
+  const double qzz = nodes.quad_zz[node_index];
+
+  // A screened/softened radial kernel is not harmonic, so its second-order
+  // expansion needs both the traceless quadrupole and the trace of the raw
+  // central second moment.  Multiplying the Newtonian quadrupole by the split
+  // factor would omit derivatives of that factor and is not a valid TreePM
+  // multipole expansion near the split scale.
+  const double moment_trace = nodes.second_moment_trace[node_index];
+  const double mxx = (qxx + moment_trace) / 3.0;
+  const double mxy = qxy / 3.0;
+  const double mxz = qxz / 3.0;
+  const double myy = (qyy + moment_trace) / 3.0;
+  const double myz = qyz / 3.0;
+  const double mzz = (qzz + moment_trace) / 3.0;
+  const double mdx = mxx * dx + mxy * dy + mxz * dz;
+  const double mdy = mxy * dx + myy * dy + myz * dz;
+  const double mdz = mxz * dx + myz * dy + mzz * dz;
+  const double dmd = dx * mdx + dy * mdy + dz * mdz;
+
+  constexpr double inv_sqrt_pi = 0.564189583547756286948079451560772586;
+  const double split_scale2 = split_scale_comoving * split_scale_comoving;
+  const double exponential = std::exp(-r2 / (4.0 * split_scale2));
+  const double split_first =
+      -0.5 * inv_sqrt_pi * r2 * exponential /
+      (split_scale_comoving * split_scale2);
+  const double split_second = inv_sqrt_pi * exponential *
+      (-r / (split_scale_comoving * split_scale2) +
+       0.25 * r * r2 / (split_scale_comoving * split_scale2 * split_scale2));
+  const double softened_first = -3.0 * r / (denom * denom * std::sqrt(denom));
+  const double softened_second =
+      -3.0 / (denom * denom * std::sqrt(denom)) +
+      15.0 * r2 / (denom * denom * denom * std::sqrt(denom));
+  const double newton_first = -3.0 / (safe_r2 * safe_r2);
+  const double newton_second = 12.0 / (safe_r2 * safe_r2 * r);
+  const double radial_first = softened_first +
+      split_first * newton_inv_r3 + (split_factor - 1.0) * newton_first;
+  const double radial_second = softened_second + split_second * newton_inv_r3 +
+      2.0 * split_first * newton_first + (split_factor - 1.0) * newton_second;
+  const double first_over_r = radial_first / r;
+  const double contracted_radial = radial_second / r2 - radial_first / (r2 * r);
+  ax += prefactor *
+      (mdx * first_over_r + 0.5 * moment_trace * dx * first_over_r +
+       0.5 * dx * dmd * contracted_radial);
+  ay += prefactor *
+      (mdy * first_over_r + 0.5 * moment_trace * dy * first_over_r +
+       0.5 * dy * dmd * contracted_radial);
+  az += prefactor *
+      (mdz * first_over_r + 0.5 * moment_trace * dz * first_over_r +
+       0.5 * dz * dmd * contracted_radial);
+  return {ax, ay, az};
+}
+
+[[nodiscard]] std::array<double, 3> monopolePlusQuadrupoleAccelPeriodic(
+    const TreeNodeSoa& nodes,
+    TreeLocalIndex node_index,
+    double dx,
+    double dy,
+    double dz,
+    double target_softening_comoving,
+    const TreeGravityOptions& options,
+    double split_scale_comoving) {
+  const double r2 = dx * dx + dy * dy + dz * dz;
+  const double safe_r2 = std::max(r2, 1.0e-30);
+  const double pair_epsilon =
+      combineSofteningPairEpsilonUnchecked(nodes.softening_max_comoving[node_index], target_softening_comoving);
+  const auto radial = treePmResidualRadialCoefficients(safe_r2, pair_epsilon, split_scale_comoving);
+  if (!std::isfinite(radial.value) || !std::isfinite(radial.first_over_r) ||
+      !std::isfinite(radial.contracted_second)) {
+    return monopolePlusQuadrupoleAccelPeriodicReference(nodes, node_index, dx, dy, dz,
+        target_softening_comoving, options, split_scale_comoving);
+  }
+  const double radial_kernel = radial.value;
+  const double prefactor = options.gravitational_constant_code;
+
+  double ax = prefactor * nodes.mass_code[node_index] * radial_kernel * dx;
+  double ay = prefactor * nodes.mass_code[node_index] * radial_kernel * dy;
+  double az = prefactor * nodes.mass_code[node_index] * radial_kernel * dz;
+  if (options.multipole_order != TreeMultipoleOrder::kQuadrupole) {
+    return {ax, ay, az};
+  }
+
+  const double qxx = nodes.quad_xx[node_index];
+  const double qxy = nodes.quad_xy[node_index];
+  const double qxz = nodes.quad_xz[node_index];
+  const double qyy = nodes.quad_yy[node_index];
+  const double qyz = nodes.quad_yz[node_index];
+  const double qzz = nodes.quad_zz[node_index];
+
+  // A screened/softened radial kernel is not harmonic, so its second-order
+  // expansion needs both the traceless quadrupole and the trace of the raw
+  // central second moment.  Multiplying the Newtonian quadrupole by the split
+  // factor would omit derivatives of that factor and is not a valid TreePM
+  // multipole expansion near the split scale.
+  const double moment_trace = nodes.second_moment_trace[node_index];
+  const double mxx = (qxx + moment_trace) / 3.0;
+  const double mxy = qxy / 3.0;
+  const double mxz = qxz / 3.0;
+  const double myy = (qyy + moment_trace) / 3.0;
+  const double myz = qyz / 3.0;
+  const double mzz = (qzz + moment_trace) / 3.0;
+  const double mdx = mxx * dx + mxy * dy + mxz * dz;
+  const double mdy = mxy * dx + myy * dy + myz * dz;
+  const double mdz = mxz * dx + myz * dy + mzz * dz;
+  const double dmd = dx * mdx + dy * mdy + dz * mdz;
+
+  const double first_over_r = radial.first_over_r;
+  const double contracted_radial = radial.contracted_second;
+  ax += prefactor *
+      (mdx * first_over_r + 0.5 * moment_trace * dx * first_over_r +
+       0.5 * dx * dmd * contracted_radial);
+  ay += prefactor *
+      (mdy * first_over_r + 0.5 * moment_trace * dy * first_over_r +
+       0.5 * dy * dmd * contracted_radial);
+  az += prefactor *
+      (mdz * first_over_r + 0.5 * moment_trace * dz * first_over_r +
+       0.5 * dz * dmd * contracted_radial);
+  return {ax, ay, az};
+}
+
+// Fixed-capacity residual DFS stack. Workers own one contiguous slot of
+// S = 1 + 7 * max_depth entries so no hot path allocates and no shared
+// std::vector is mutated across OpenMP threads.
+struct BoundedTreeStack {
+  TreeLocalIndex* data = nullptr;
+  std::size_t capacity = 0;
+  std::size_t size = 0;
+
+  void clear() noexcept { size = 0; }
+  [[nodiscard]] bool empty() const noexcept { return size == 0; }
+  [[nodiscard]] TreeLocalIndex back() const noexcept { return data[size - 1U]; }
+  void pop_back() noexcept { --size; }
+  void push_back(TreeLocalIndex value) {
+    if (size >= capacity) {
+      throw std::runtime_error("TreePM residual traversal stack overflow");
+    }
+    data[size++] = value;
+  }
+};
+
+void pushChildrenReverseOctant(
+    const TreeNodeSoa& nodes, TreeLocalIndex node_index, BoundedTreeStack& stack) {
+  // LIFO visits increasing octants. Independent of target position and worker
+  // count; the bounded stack retains exactly the same worst-case occupancy.
+  const std::size_t child_offset = static_cast<std::size_t>(node_index) * 8U;
+  for (std::size_t octant = 8U; octant > 0U; --octant) {
+    const TreeLocalIndex child = nodes.child_index[child_offset + octant - 1U];
+    if (child != kInvalidTreeLocalIndex) stack.push_back(child);
+  }
+}
+
+void resizeCompactSidecars(std::vector<double>& first, std::vector<double>& second, std::vector<double>& third, std::size_t size) {
+  first.resize(size);
+  second.resize(size);
+  third.resize(size);
+}
+
+[[nodiscard]] double l2NormFromComponents(
+    std::span<const double> ax,
+    std::span<const double> ay,
+    std::span<const double> az) {
+  double sum = 0.0;
+  for (std::size_t i = 0; i < ax.size(); ++i) {
+    sum += ax[i] * ax[i] + ay[i] * ay[i] + az[i] * az[i];
+  }
+  return std::sqrt(sum);
+}
+
+template <typename ByteContainer>
+void appendWireU32(ByteContainer& bytes, std::uint32_t value) {
+  for (unsigned shift = 0; shift < 32U; shift += 8U) {
+    bytes.push_back(static_cast<std::uint8_t>((value >> shift) & 0xffU));
+  }
+}
+
+template <typename ByteContainer>
+void appendWireU64(ByteContainer& bytes, std::uint64_t value) {
+  for (unsigned shift = 0; shift < 64U; shift += 8U) {
+    bytes.push_back(static_cast<std::uint8_t>((value >> shift) & 0xffU));
+  }
+}
+
+[[nodiscard]] std::uint32_t readWireU32(std::span<const std::uint8_t> bytes, std::size_t& offset) {
+  if (bytes.size() - std::min(bytes.size(), offset) < sizeof(std::uint32_t)) {
+    throw std::runtime_error("TreePM short-range wire record is truncated");
+  }
+  std::uint32_t value = 0U;
+  for (unsigned shift = 0; shift < 32U; shift += 8U) {
+    value |= static_cast<std::uint32_t>(bytes[offset++]) << shift;
+  }
+  return value;
+}
+
+[[nodiscard]] std::uint64_t readWireU64(std::span<const std::uint8_t> bytes, std::size_t& offset) {
+  if (bytes.size() - std::min(bytes.size(), offset) < sizeof(std::uint64_t)) {
+    throw std::runtime_error("TreePM short-range wire record is truncated");
+  }
+  std::uint64_t value = 0U;
+  for (unsigned shift = 0; shift < 64U; shift += 8U) {
+    value |= static_cast<std::uint64_t>(bytes[offset++]) << shift;
+  }
+  return value;
+}
+
+template <typename ByteContainer>
+void appendWireDouble(ByteContainer& bytes, double value) {
+  appendWireU64(bytes, std::bit_cast<std::uint64_t>(value));
+}
+
+[[nodiscard]] double readWireDouble(std::span<const std::uint8_t> bytes, std::size_t& offset) {
+  return std::bit_cast<double>(readWireU64(bytes, offset));
+}
+
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+[[nodiscard]] int checkedMpiByteCount(
+    std::size_t record_count,
+    std::size_t record_bytes,
+    std::string_view context) {
+  if (record_bytes != 0U &&
+      record_count > static_cast<std::size_t>(std::numeric_limits<int>::max()) / record_bytes) {
+    throw std::overflow_error(std::string(context) + " exceeds MPI int byte-count capacity");
+  }
+  return static_cast<int>(record_count * record_bytes);
+}
+
+[[nodiscard]] int populateMpiByteDisplacements(
+    std::span<const int> counts,
+    std::span<int> displacements,
+    std::string_view context) {
+  if (counts.size() != displacements.size()) {
+    throw std::invalid_argument(std::string(context) + " count/displacement vector sizes differ");
+  }
+  int total_bytes = 0;
+  for (std::size_t peer = 0; peer < counts.size(); ++peer) {
+    const int count = counts[peer];
+    if (count < 0) {
+      throw std::runtime_error(std::string(context) + " contains a negative byte count");
+    }
+    displacements[peer] = total_bytes;
+    if (count > std::numeric_limits<int>::max() - total_bytes) {
+      throw std::overflow_error(std::string(context) + " total byte count exceeds MPI int capacity");
+    }
+    total_bytes += count;
+  }
+  return total_bytes;
+}
+
+void requireTreePmMpiSuccess(int error_code, std::string_view context);
+
+struct SparsePeerGraph {
+  MPI_Comm communicator = MPI_COMM_NULL;
+  std::vector<int> incoming_peers;
+  std::vector<int> outgoing_peers;
+
+  void close() {
+    if (communicator == MPI_COMM_NULL) {
+      return;
+    }
+    int initialized = 0;
+    requireTreePmMpiSuccess(MPI_Initialized(&initialized),
+                            "TreePM sparse graph MPI_Initialized during shutdown");
+    if (initialized == 0) {
+      throw std::runtime_error(
+          "TreePM sparse graph shutdown reached an owned communicator before MPI initialization");
+    }
+    int finalized = 0;
+    requireTreePmMpiSuccess(MPI_Finalized(&finalized),
+                            "TreePM sparse graph MPI_Finalized during shutdown");
+    if (finalized != 0) {
+      throw std::runtime_error(
+          "TreePM sparse graph shutdown reached an owned communicator after MPI_Finalize");
+    }
+    requireTreePmMpiSuccess(MPI_Comm_free(&communicator),
+                            "TreePM sparse graph MPI_Comm_free");
+  }
+
+  static void releaseCommunicatorNoexcept(MPI_Comm& communicator) noexcept {
+    if (communicator == MPI_COMM_NULL) {
+      return;
+    }
+    int initialized = 0;
+    int finalized = 0;
+    const int initialized_rc = MPI_Initialized(&initialized);
+    const int finalized_rc = initialized_rc == MPI_SUCCESS && initialized != 0
+        ? MPI_Finalized(&finalized)
+        : MPI_SUCCESS;
+    if (initialized_rc == MPI_SUCCESS && finalized_rc == MPI_SUCCESS &&
+        initialized != 0 && finalized == 0) {
+      const int free_rc = MPI_Comm_free(&communicator);
+      if (free_rc == MPI_SUCCESS) {
+        return;
+      }
+      std::fprintf(stderr,
+          "CHUI MPI LIFETIME ERROR: TreePM sparse communicator destructor could not free communicator before MPI_Finalize (rc=%d)\n",
+          free_rc);
+      communicator = MPI_COMM_NULL;
+      return;
+    }
+    // Emergency containment only. Normal owners call close() explicitly while
+    // MPI is active. Make a late teardown visible rather than normalizing it.
+    std::fprintf(stderr,
+        "CHUI MPI LIFETIME ERROR: TreePM sparse communicator reached destructor outside an active MPI session; explicit shutdown ordering was violated\n");
+    communicator = MPI_COMM_NULL;
+  }
+
+  SparsePeerGraph() = default;
+  SparsePeerGraph(const SparsePeerGraph&) = delete;
+  SparsePeerGraph& operator=(const SparsePeerGraph&) = delete;
+  SparsePeerGraph(SparsePeerGraph&& other) noexcept
+      : communicator(std::exchange(other.communicator, MPI_COMM_NULL)),
+        incoming_peers(std::move(other.incoming_peers)),
+        outgoing_peers(std::move(other.outgoing_peers)) {}
+  SparsePeerGraph& operator=(SparsePeerGraph&& other) noexcept {
+    if (this != &other) {
+      releaseCommunicatorNoexcept(communicator);
+      communicator = std::exchange(other.communicator, MPI_COMM_NULL);
+      incoming_peers = std::move(other.incoming_peers);
+      outgoing_peers = std::move(other.outgoing_peers);
+    }
+    return *this;
+  }
+  ~SparsePeerGraph() { releaseCommunicatorNoexcept(communicator); }
+};
+
+[[nodiscard]] std::string treePmMpiErrorText(int error_code) {
+  char message[MPI_MAX_ERROR_STRING]{};
+  int length = 0;
+  if (MPI_Error_string(error_code, message, &length) != MPI_SUCCESS || length <= 0) {
+    return "MPI error code " + std::to_string(error_code);
+  }
+  return std::string(message, static_cast<std::size_t>(length));
+}
+
+void requireTreePmMpiSuccess(int error_code, std::string_view context) {
+  if (error_code != MPI_SUCCESS) {
+    throw std::runtime_error(
+        std::string(context) + " failed: " + treePmMpiErrorText(error_code));
+  }
+}
+
+[[nodiscard]] SparsePeerGraph makeSymmetricSparsePeerGraph(
+    int world_rank,
+    std::span<const int> requested_outgoing_peers) {
+  int world_size = 1;
+  requireTreePmMpiSuccess(
+      MPI_Comm_size(MPI_COMM_WORLD, &world_size),
+      "TreePM sparse graph MPI_Comm_size");
+  if (world_rank < 0 || world_rank >= world_size) {
+    throw std::invalid_argument("TreePM sparse graph world rank is out of range");
+  }
+  if (requested_outgoing_peers.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("TreePM sparse peer degree exceeds MPI int capacity");
+  }
+
+  // Discover incoming peers using only O(world_size) integer topology metadata.
+  // This avoids MPI_Dist_graph_create's implementation-sensitive zero-degree
+  // source-array corner case while retaining a genuinely sparse neighborhood
+  // communicator for all subsequent payload exchange.
+  std::vector<int> outgoing_flags(static_cast<std::size_t>(world_size), 0);
+  bool local_topology_valid = true;
+  for (const int peer : requested_outgoing_peers) {
+    if (peer < 0 || peer >= world_size || peer == world_rank) {
+      local_topology_valid = false;
+      continue;
+    }
+    outgoing_flags[static_cast<std::size_t>(peer)] = 1;
+  }
+  const int local_valid = local_topology_valid ? 1 : 0;
+  int global_valid = 0;
+  requireTreePmMpiSuccess(
+      MPI_Allreduce(&local_valid, &global_valid, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD),
+      "TreePM sparse graph topology validation");
+  if (global_valid == 0) {
+    throw std::invalid_argument(
+        "TreePM sparse peer topology contains an out-of-range or self peer on at least one rank");
+  }
+
+  std::vector<int> incoming_flags(static_cast<std::size_t>(world_size), 0);
+  requireTreePmMpiSuccess(
+      MPI_Alltoall(
+          outgoing_flags.data(), 1, MPI_INT,
+          incoming_flags.data(), 1, MPI_INT,
+          MPI_COMM_WORLD),
+      "TreePM sparse graph incoming-peer discovery");
+
+  std::vector<int> symmetric_peers;
+  symmetric_peers.reserve(requested_outgoing_peers.size() + static_cast<std::size_t>(world_size));
+  for (int peer = 0; peer < world_size; ++peer) {
+    if (peer == world_rank) {
+      continue;
+    }
+    if (outgoing_flags[static_cast<std::size_t>(peer)] != 0 ||
+        incoming_flags[static_cast<std::size_t>(peer)] != 0) {
+      symmetric_peers.push_back(peer);
+    }
+  }
+  if (symmetric_peers.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::overflow_error("TreePM symmetric sparse peer degree exceeds MPI int capacity");
+  }
+
+  SparsePeerGraph graph;
+  MPI_Comm base = MPI_COMM_NULL;
+  requireTreePmMpiSuccess(
+      MPI_Comm_dup(MPI_COMM_WORLD, &base),
+      "TreePM sparse graph MPI_Comm_dup");
+  try {
+    requireTreePmMpiSuccess(
+        MPI_Comm_set_errhandler(base, MPI_ERRORS_RETURN),
+        "TreePM sparse graph error-handler setup");
+    const int symmetric_degree = static_cast<int>(symmetric_peers.size());
+    // Some MPI implementations are unnecessarily strict about nullptr even
+    // when degree==0. A non-null dummy address with count zero is standards-
+    // valid and does not create a fake neighbor.
+    const int dummy_peer = 0;
+    const int* symmetric_data = symmetric_peers.empty()
+        ? &dummy_peer
+        : symmetric_peers.data();
+    requireTreePmMpiSuccess(
+        MPI_Dist_graph_create_adjacent(
+            base,
+            symmetric_degree,
+            symmetric_data,
+            MPI_UNWEIGHTED,
+            symmetric_degree,
+            symmetric_data,
+            MPI_UNWEIGHTED,
+            MPI_INFO_NULL,
+            0,
+            &graph.communicator),
+        "TreePM symmetric MPI_Dist_graph_create_adjacent");
+  } catch (...) {
+    (void)MPI_Comm_free(&base);
+    throw;
+  }
+  requireTreePmMpiSuccess(
+      MPI_Comm_free(&base),
+      "TreePM sparse graph base communicator release");
+  if (graph.communicator == MPI_COMM_NULL) {
+    throw std::runtime_error("TreePM failed to create symmetric sparse peer graph");
+  }
+  requireTreePmMpiSuccess(
+      MPI_Comm_set_errhandler(graph.communicator, MPI_ERRORS_RETURN),
+      "TreePM sparse graph communicator error-handler setup");
+
+  int indegree = 0;
+  int outdegree = 0;
+  int weighted = 0;
+  requireTreePmMpiSuccess(
+      MPI_Dist_graph_neighbors_count(
+          graph.communicator, &indegree, &outdegree, &weighted),
+      "TreePM sparse graph neighbor count");
+  if (indegree < 0 || outdegree < 0) {
+    throw std::runtime_error("TreePM sparse graph returned a negative peer degree");
+  }
+  graph.incoming_peers.resize(static_cast<std::size_t>(indegree));
+  graph.outgoing_peers.resize(static_cast<std::size_t>(outdegree));
+  int dummy_neighbor = 0;
+  requireTreePmMpiSuccess(
+      MPI_Dist_graph_neighbors(
+          graph.communicator,
+          indegree,
+          graph.incoming_peers.empty() ? &dummy_neighbor : graph.incoming_peers.data(),
+          MPI_UNWEIGHTED,
+          outdegree,
+          graph.outgoing_peers.empty() ? &dummy_neighbor : graph.outgoing_peers.data(),
+          MPI_UNWEIGHTED),
+      "TreePM sparse graph neighbor query");
+  return graph;
+}
+#endif
+
+
+struct ShortRangeTargetRequestPacket {
+  std::uint32_t wire_version = 1U;
+  int origin_rank = -1;
+  int destination_rank = -1;
+  std::uint32_t flags = 0U;
+  std::uint32_t batch_token = 0;
+  std::uint32_t request_id = 0;
+  std::uint64_t exchange_sequence = 0U;
+  std::uint64_t decomposition_epoch = 0U;
+  std::uint64_t force_epoch = 0U;
+  std::uint64_t target_identity = 0U;
+  double target_x_comoving = 0.0;
+  double target_y_comoving = 0.0;
+  double target_z_comoving = 0.0;
+  double target_softening_epsilon_comoving = 0.0;
+  double previous_acceleration_magnitude = 0.0;
+};
+
+struct ShortRangeTargetResponsePacket {
+  std::uint32_t wire_version = 1U;
+  int target_owner_rank = -1;
+  int source_rank = -1;
+  std::uint32_t flags = 0U;
+  std::uint32_t batch_token = 0;
+  std::uint32_t request_id = 0;
+  std::uint64_t exchange_sequence = 0U;
+  std::uint64_t decomposition_epoch = 0U;
+  std::uint64_t force_epoch = 0U;
+  std::uint64_t target_identity = 0U;
+  double accel_x_comoving = 0.0;
+  double accel_y_comoving = 0.0;
+  double accel_z_comoving = 0.0;
+  // Nearest distinct direct-pair separation squared on the serving rank
+  // (+infinity when none); min-combined by the target owner.
+  double nearest_pair_r2_comoving = std::numeric_limits<double>::infinity();
+};
+
+// v2 appends nearest_pair_r2_comoving to the response record.
+constexpr std::uint32_t k_short_range_wire_version = 2U;
+constexpr std::uint32_t k_short_range_flag_previous_acceleration = 1U << 0U;
+constexpr std::size_t k_short_range_request_wire_bytes = kTreePmShortRangeRequestWireBytes;
+constexpr std::size_t k_short_range_response_wire_bytes = kTreePmShortRangeResponseWireBytes;
+
+// The memory estimator and runtime telemetry model structured host packet
+// capacity with the wire record widths. Enforce that identity at compile
+// time: if a supported ABI ever pads these structs differently, the build
+// fails here instead of silently using wire bytes as host object bytes.
+static_assert(sizeof(ShortRangeTargetRequestPacket) == kTreePmShortRangeRequestWireBytes,
+    "ShortRangeTargetRequestPacket host layout must equal the request wire record width");
+static_assert(sizeof(ShortRangeTargetResponsePacket) == kTreePmShortRangeResponseWireBytes,
+    "ShortRangeTargetResponsePacket host layout must equal the response wire record width");
+
+template <typename ByteContainer>
+void encodeShortRangeRequests(
+    std::span<const ShortRangeTargetRequestPacket> records,
+    ByteContainer& bytes) {
+  if (records.size() > std::numeric_limits<std::size_t>::max() / k_short_range_request_wire_bytes) {
+    throw std::overflow_error("TreePM short-range request serialization size overflows size_t");
+  }
+  const std::size_t required = records.size() * k_short_range_request_wire_bytes;
+  bytes.clear();
+  if (bytes.capacity() < required) {
+    bytes.reserve(required);
+  }
+  for (const ShortRangeTargetRequestPacket& record : records) {
+    appendWireU32(bytes, record.wire_version);
+    appendWireU32(bytes, static_cast<std::uint32_t>(record.origin_rank));
+    appendWireU32(bytes, static_cast<std::uint32_t>(record.destination_rank));
+    appendWireU32(bytes, record.flags);
+    appendWireU32(bytes, record.batch_token);
+    appendWireU32(bytes, record.request_id);
+    appendWireU64(bytes, record.exchange_sequence);
+    appendWireU64(bytes, record.decomposition_epoch);
+    appendWireU64(bytes, record.force_epoch);
+    appendWireU64(bytes, record.target_identity);
+    appendWireDouble(bytes, record.target_x_comoving);
+    appendWireDouble(bytes, record.target_y_comoving);
+    appendWireDouble(bytes, record.target_z_comoving);
+    appendWireDouble(bytes, record.target_softening_epsilon_comoving);
+    appendWireDouble(bytes, record.previous_acceleration_magnitude);
+  }
+}
+
+template <typename RecordContainer>
+void decodeShortRangeRequests(
+    std::span<const std::uint8_t> bytes,
+    RecordContainer& records) {
+  if (bytes.size() % k_short_range_request_wire_bytes != 0U) {
+    throw std::runtime_error("TreePM short-range request wire payload is misaligned");
+  }
+  const std::size_t required = bytes.size() / k_short_range_request_wire_bytes;
+  records.clear();
+  if (records.capacity() < required) {
+    records.reserve(required);
+  }
+  std::size_t offset = 0U;
+  while (offset < bytes.size()) {
+    ShortRangeTargetRequestPacket record;
+    record.wire_version = readWireU32(bytes, offset);
+    record.origin_rank = static_cast<int>(readWireU32(bytes, offset));
+    record.destination_rank = static_cast<int>(readWireU32(bytes, offset));
+    record.flags = readWireU32(bytes, offset);
+    record.batch_token = readWireU32(bytes, offset);
+    record.request_id = readWireU32(bytes, offset);
+    record.exchange_sequence = readWireU64(bytes, offset);
+    record.decomposition_epoch = readWireU64(bytes, offset);
+    record.force_epoch = readWireU64(bytes, offset);
+    record.target_identity = readWireU64(bytes, offset);
+    record.target_x_comoving = readWireDouble(bytes, offset);
+    record.target_y_comoving = readWireDouble(bytes, offset);
+    record.target_z_comoving = readWireDouble(bytes, offset);
+    record.target_softening_epsilon_comoving = readWireDouble(bytes, offset);
+    record.previous_acceleration_magnitude = readWireDouble(bytes, offset);
+    records.push_back(record);
+  }
+}
+
+template <typename ByteContainer>
+void encodeShortRangeResponses(
+    std::span<const ShortRangeTargetResponsePacket> records,
+    ByteContainer& bytes) {
+  if (records.size() > std::numeric_limits<std::size_t>::max() / k_short_range_response_wire_bytes) {
+    throw std::overflow_error("TreePM short-range response serialization size overflows size_t");
+  }
+  const std::size_t required = records.size() * k_short_range_response_wire_bytes;
+  bytes.clear();
+  if (bytes.capacity() < required) {
+    bytes.reserve(required);
+  }
+  for (const ShortRangeTargetResponsePacket& record : records) {
+    appendWireU32(bytes, record.wire_version);
+    appendWireU32(bytes, static_cast<std::uint32_t>(record.target_owner_rank));
+    appendWireU32(bytes, static_cast<std::uint32_t>(record.source_rank));
+    appendWireU32(bytes, record.flags);
+    appendWireU32(bytes, record.batch_token);
+    appendWireU32(bytes, record.request_id);
+    appendWireU64(bytes, record.exchange_sequence);
+    appendWireU64(bytes, record.decomposition_epoch);
+    appendWireU64(bytes, record.force_epoch);
+    appendWireU64(bytes, record.target_identity);
+    appendWireDouble(bytes, record.accel_x_comoving);
+    appendWireDouble(bytes, record.accel_y_comoving);
+    appendWireDouble(bytes, record.accel_z_comoving);
+    appendWireDouble(bytes, record.nearest_pair_r2_comoving);
+  }
+}
+
+template <typename RecordContainer>
+void decodeShortRangeResponses(
+    std::span<const std::uint8_t> bytes,
+    RecordContainer& records) {
+  if (bytes.size() % k_short_range_response_wire_bytes != 0U) {
+    throw std::runtime_error("TreePM short-range response wire payload is misaligned");
+  }
+  const std::size_t required = bytes.size() / k_short_range_response_wire_bytes;
+  records.clear();
+  if (records.capacity() < required) {
+    records.reserve(required);
+  }
+  std::size_t offset = 0U;
+  while (offset < bytes.size()) {
+    ShortRangeTargetResponsePacket record;
+    record.wire_version = readWireU32(bytes, offset);
+    record.target_owner_rank = static_cast<int>(readWireU32(bytes, offset));
+    record.source_rank = static_cast<int>(readWireU32(bytes, offset));
+    record.flags = readWireU32(bytes, offset);
+    record.batch_token = readWireU32(bytes, offset);
+    record.request_id = readWireU32(bytes, offset);
+    record.exchange_sequence = readWireU64(bytes, offset);
+    record.decomposition_epoch = readWireU64(bytes, offset);
+    record.force_epoch = readWireU64(bytes, offset);
+    record.target_identity = readWireU64(bytes, offset);
+    record.accel_x_comoving = readWireDouble(bytes, offset);
+    record.accel_y_comoving = readWireDouble(bytes, offset);
+    record.accel_z_comoving = readWireDouble(bytes, offset);
+    record.nearest_pair_r2_comoving = readWireDouble(bytes, offset);
+    records.push_back(record);
+  }
+}
+
+struct SourceDomainBoundsPacket {
+  double min_x_comoving = 0.0;
+  double max_x_comoving = 0.0;
+  double min_y_comoving = 0.0;
+  double max_y_comoving = 0.0;
+  double min_z_comoving = 0.0;
+  double max_z_comoving = 0.0;
+  std::uint8_t wraps_x = 0;
+  std::uint8_t wraps_y = 0;
+  std::uint8_t wraps_z = 0;
+  std::uint8_t reserved0 = 0;
+  std::uint64_t source_particle_count = 0;
+};
+
+static_assert(std::is_trivially_copyable_v<SourceDomainBoundsPacket>);
+
+[[nodiscard]] double minimumDistanceToPeriodicInterval(
+    double coordinate,
+    double interval_min,
+    double interval_max,
+    bool interval_wraps,
+    double box_size_comoving) {
+  if (interval_max < interval_min && !interval_wraps) {
+    return 0.0;
+  }
+  auto interval_distance = [](double value, double lower, double upper) {
+    if (value < lower) {
+      return lower - value;
+    }
+    if (value > upper) {
+      return value - upper;
+    }
+    return 0.0;
+  };
+  if (interval_wraps) {
+    if (box_size_comoving <= 0.0) {
+      return 0.0;
+    }
+    const double d0 = interval_distance(coordinate, interval_min, box_size_comoving);
+    const double d1 = interval_distance(coordinate, 0.0, interval_max);
+    return std::min(d0, d1);
+  }
+  if (box_size_comoving <= 0.0) {
+    return interval_distance(coordinate, interval_min, interval_max);
+  }
+  const double width = interval_max - interval_min;
+  if (width >= box_size_comoving) {
+    return 0.0;
+  }
+  const double center = 0.5 * (interval_min + interval_max);
+  const double center_distance = std::abs(minimumImageDelta(coordinate - center, box_size_comoving));
+  return std::max(0.0, center_distance - 0.5 * width);
+}
+
+[[nodiscard]] double minimumDistanceToPeriodicBounds(
+    double px,
+    double py,
+    double pz,
+    const SourceDomainBoundsPacket& bounds,
+    const PeriodicBoxLengths& box_lengths) {
+  if (bounds.source_particle_count == 0) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const double dx = minimumDistanceToPeriodicInterval(
+      px,
+      bounds.min_x_comoving,
+      bounds.max_x_comoving,
+      bounds.wraps_x != 0U,
+      box_lengths.lx);
+  const double dy = minimumDistanceToPeriodicInterval(
+      py,
+      bounds.min_y_comoving,
+      bounds.max_y_comoving,
+      bounds.wraps_y != 0U,
+      box_lengths.ly);
+  const double dz = minimumDistanceToPeriodicInterval(
+      pz,
+      bounds.min_z_comoving,
+      bounds.max_z_comoving,
+      bounds.wraps_z != 0U,
+      box_lengths.lz);
+  return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+[[nodiscard, maybe_unused]] parallel::TreePseudoParticlePacket makeLocalTreePseudoParticlePacket(
+    int world_rank,
+    std::uint64_t decomposition_epoch,
+    std::uint64_t force_epoch,
+    std::uint64_t exchange_sequence,
+    const TreeNodeSoa& nodes,
+    std::size_t source_count) {
+  parallel::TreePseudoParticlePacket packet;
+  packet.descriptor = parallel::TreePseudoParticleDescriptor{
+      .pseudo_particle_id = (static_cast<std::uint64_t>(std::max(world_rank, 0)) << 32U) ^ decomposition_epoch,
+      .source_rank = world_rank,
+      .decomposition_epoch = decomposition_epoch,
+      .force_epoch = force_epoch,
+      .exchange_sequence = exchange_sequence,
+      .derived_not_authoritative = true,
+  };
+  packet.source_count = static_cast<std::uint64_t>(source_count);
+  packet.geometry_frame = 1U;
+  packet.is_leaf = 1U;
+  if (source_count == 0U || nodes.size() == 0U) {
+    parallel::validateTreePseudoParticlePacket(packet);
+    return packet;
+  }
+  const std::size_t root = 0U;
+  const double half_size = nodes.half_size_comoving[root];
+  packet.mass_code = nodes.mass_code[root];
+  packet.center_x_comoving = nodes.com_x_comoving[root];
+  packet.center_y_comoving = nodes.com_y_comoving[root];
+  packet.center_z_comoving = nodes.com_z_comoving[root];
+  packet.min_x_comoving = nodes.center_x_comoving[root] - half_size;
+  packet.max_x_comoving = nodes.center_x_comoving[root] + half_size;
+  packet.min_y_comoving = nodes.center_y_comoving[root] - half_size;
+  packet.max_y_comoving = nodes.center_y_comoving[root] + half_size;
+  packet.min_z_comoving = nodes.center_z_comoving[root] - half_size;
+  packet.max_z_comoving = nodes.center_z_comoving[root] + half_size;
+  parallel::validateTreePseudoParticlePacket(packet);
+  return packet;
+}
+
+[[nodiscard, maybe_unused]] std::vector<parallel::TreePseudoParticlePacket>
+makeAuthoritativeTopDomainPackets(
+    std::span<const parallel::TopDomainLeaf> leaves,
+    int world_rank,
+    std::uint64_t decomposition_epoch,
+    std::uint64_t force_epoch,
+    std::uint64_t exchange_sequence) {
+  std::vector<parallel::TreePseudoParticlePacket> packets;
+  packets.reserve(leaves.size());
+  for (const parallel::TopDomainLeaf& leaf : leaves) {
+    if (leaf.owner_rank != world_rank || leaf.decomposition_epoch != decomposition_epoch) {
+      throw std::invalid_argument(
+          "authoritative TreePM top-domain leaf owner/epoch does not match local force evaluation");
+    }
+    parallel::TreePseudoParticlePacket packet;
+    packet.descriptor = parallel::TreePseudoParticleDescriptor{
+        .pseudo_particle_id = leaf.domain_leaf_id,
+        .source_rank = world_rank,
+        .decomposition_epoch = decomposition_epoch,
+        .force_epoch = force_epoch,
+        .exchange_sequence = exchange_sequence,
+        .derived_not_authoritative = false,
+    };
+    // Routing-only authoritative leaves intentionally carry no multipole mass.
+    // The remote owner evaluates exported targets against its local tree.
+    packet.mass_code = 0.0;
+    packet.center_x_comoving = 0.5 * (leaf.min_x_comov + leaf.max_x_comov);
+    packet.center_y_comoving = 0.5 * (leaf.min_y_comov + leaf.max_y_comov);
+    packet.center_z_comoving = 0.5 * (leaf.min_z_comov + leaf.max_z_comov);
+    packet.min_x_comoving = leaf.min_x_comov;
+    packet.max_x_comoving = leaf.max_x_comov;
+    packet.min_y_comoving = leaf.min_y_comov;
+    packet.max_y_comoving = leaf.max_y_comov;
+    packet.min_z_comoving = leaf.min_z_comov;
+    packet.max_z_comoving = leaf.max_z_comov;
+    packet.source_count = leaf.entity_count;
+    packet.hierarchy_level = 0U;
+    packet.local_node_index = 0U;
+    packet.child_count = 0U;
+    packet.is_leaf = 1U;
+    packet.geometry_frame = leaf.periodic_geometry ? 0U : 0U;
+    parallel::validateTreePseudoParticlePacket(packet);
+    packets.push_back(packet);
+  }
+  return packets;
+}
+
+struct DomainCoverageResult {
+  bool covered = false;
+  bool epoch_mismatch = false;
+  std::uint64_t uncovered_source_count = 0;
+  std::size_t first_uncovered_source_index = 0;
+};
+
+[[nodiscard, maybe_unused]] DomainCoverageResult authoritativeDomainCoversLocalSourcesEx(
+    std::span<const parallel::TopDomainLeaf> leaves,
+    int world_rank,
+    std::uint64_t decomposition_epoch,
+    std::span<const double> pos_x_comoving,
+    std::span<const double> pos_y_comoving,
+    std::span<const double> pos_z_comoving,
+    const PeriodicBoxLengths& box_lengths) {
+  DomainCoverageResult result;
+  if (pos_x_comoving.size() != pos_y_comoving.size() ||
+      pos_x_comoving.size() != pos_z_comoving.size()) {
+    result.uncovered_source_count = pos_x_comoving.size();
+    result.first_uncovered_source_index = 0U;
+    return result;
+  }
+  if (pos_x_comoving.empty()) {
+    result.covered = true;
+    return result;
+  }
+  if (leaves.empty()) {
+    result.uncovered_source_count = static_cast<std::uint64_t>(pos_x_comoving.size());
+    result.first_uncovered_source_index = 0U;
+    return result;
+  }
+  constexpr double k_geometry_tolerance = 1.0e-12;
+  bool epoch_mismatch_seen = false;
+  std::uint64_t uncovered = 0U;
+  std::size_t first_uncovered = 0U;
+  bool first_uncovered_recorded = false;
+  for (std::size_t source_index = 0; source_index < pos_x_comoving.size(); ++source_index) {
+    bool covered = false;
+    for (const parallel::TopDomainLeaf& leaf : leaves) {
+      if (leaf.owner_rank != world_rank || leaf.decomposition_epoch != decomposition_epoch) {
+        epoch_mismatch_seen = true;
+        continue;
+      }
+      SourceDomainBoundsPacket bounds;
+      bounds.min_x_comoving = leaf.min_x_comov;
+      bounds.max_x_comoving = leaf.max_x_comov;
+      bounds.min_y_comoving = leaf.min_y_comov;
+      bounds.max_y_comoving = leaf.max_y_comov;
+      bounds.min_z_comoving = leaf.min_z_comov;
+      bounds.max_z_comoving = leaf.max_z_comov;
+      bounds.source_particle_count = leaf.entity_count;
+      if (minimumDistanceToPeriodicBounds(
+              pos_x_comoving[source_index],
+              pos_y_comoving[source_index],
+              pos_z_comoving[source_index],
+              bounds, box_lengths) <= k_geometry_tolerance) {
+        covered = true;
+        break;
+      }
+    }
+    if (!covered) {
+      ++uncovered;
+      if (!first_uncovered_recorded) {
+        first_uncovered = source_index;
+        first_uncovered_recorded = true;
+      }
+    }
+  }
+  result.epoch_mismatch = epoch_mismatch_seen && uncovered > 0U;
+  result.uncovered_source_count = uncovered;
+  result.first_uncovered_source_index = first_uncovered;
+  result.covered = uncovered == 0U && !epoch_mismatch_seen;
+  return result;
+}
+
+[[nodiscard, maybe_unused]] bool authoritativeDomainCoversLocalSources(
+    std::span<const parallel::TopDomainLeaf> leaves,
+    int world_rank,
+    std::uint64_t decomposition_epoch,
+    std::span<const double> pos_x_comoving,
+    std::span<const double> pos_y_comoving,
+    std::span<const double> pos_z_comoving,
+    const PeriodicBoxLengths& box_lengths) {
+  return authoritativeDomainCoversLocalSourcesEx(
+      leaves, world_rank, decomposition_epoch, pos_x_comoving, pos_y_comoving, pos_z_comoving,
+      box_lengths)
+      .covered;
+}
+
+[[nodiscard]] SourceDomainBoundsPacket boundsFromTreePseudoParticlePacket(
+    const parallel::TreePseudoParticlePacket& packet) {
+  parallel::validateTreePseudoParticlePacket(packet);
+  SourceDomainBoundsPacket bounds;
+  bounds.min_x_comoving = packet.min_x_comoving;
+  bounds.max_x_comoving = packet.max_x_comoving;
+  bounds.min_y_comoving = packet.min_y_comoving;
+  bounds.max_y_comoving = packet.max_y_comoving;
+  bounds.min_z_comoving = packet.min_z_comoving;
+  bounds.max_z_comoving = packet.max_z_comoving;
+  bounds.source_particle_count = packet.source_count;
+  return bounds;
+}
+
+[[nodiscard, maybe_unused]] bool remoteTreeHierarchyIntersectsCutoff(
+    double px,
+    double py,
+    double pz,
+    std::span<const parallel::TreePseudoParticlePacket> packets,
+    const PeriodicBoxLengths& box_lengths,
+  double cutoff_radius_comoving) {
+  for (const parallel::TreePseudoParticlePacket& packet : packets) {
+    if (packet.source_count == 0U) {
+      continue;
+    }
+    if (minimumDistanceToPeriodicBounds(px, py, pz, boundsFromTreePseudoParticlePacket(packet), box_lengths) <=
+        cutoff_radius_comoving) {
+      return true;
+    }
+  }
+  return false;
+}
+
+
+class TopLevelDomainHierarchy {
+ public:
+  explicit TopLevelDomainHierarchy(
+      std::span<const parallel::TreePseudoParticlePacket> leaves)
+      : m_leaves(leaves.begin(), leaves.end()) {
+    m_order.resize(m_leaves.size());
+    std::iota(m_order.begin(), m_order.end(), 0U);
+    if (!m_order.empty()) {
+      m_nodes.reserve(m_order.size() * 2U);
+      (void)buildNode(0U, m_order.size());
+    }
+  }
+
+  struct QueryScratch {
+    std::vector<int> owners;
+    std::vector<std::size_t> stack;
+    std::vector<std::uint8_t> owner_seen;
+
+    void prepare(std::size_t node_count, std::size_t owner_capacity) {
+      owners.clear();
+      stack.clear();
+      owner_seen.assign(owner_capacity, 0U);
+      owners.reserve(owner_capacity);
+      stack.reserve(node_count);
+    }
+  };
+
+  [[nodiscard]] std::size_t nodeCount() const noexcept { return m_nodes.size(); }
+
+  [[nodiscard]] std::span<const int> ownersWithinCutoff(
+      double px, double py, double pz,
+      double cutoff_radius_comoving,
+      const PeriodicBoxLengths& box_lengths,
+      int excluded_rank,
+      QueryScratch& scratch) const {
+    for (const int owner : scratch.owners) {
+      scratch.owner_seen[static_cast<std::size_t>(owner)] = 0U;
+    }
+    scratch.owners.clear();
+    scratch.stack.clear();
+    if (m_nodes.empty()) {
+      return scratch.owners;
+    }
+    scratch.stack.push_back(0U);
+    while (!scratch.stack.empty()) {
+      const std::size_t node_index = scratch.stack.back();
+      scratch.stack.pop_back();
+      const Node& node = m_nodes[node_index];
+      if (minimumDistanceToPeriodicBounds(
+              px, py, pz, node.bounds, box_lengths) > cutoff_radius_comoving) {
+        continue;
+      }
+      if (node.leaf_count != 0U) {
+        for (std::size_t slot = node.leaf_begin;
+             slot < node.leaf_begin + node.leaf_count; ++slot) {
+          const auto& leaf = m_leaves[m_order[slot]];
+          if (leaf.descriptor.source_rank == excluded_rank ||
+              leaf.source_count == 0U) {
+            continue;
+          }
+          if (minimumDistanceToPeriodicBounds(
+                  px, py, pz, boundsFromTreePseudoParticlePacket(leaf),
+                  box_lengths) <= cutoff_radius_comoving) {
+            const std::size_t owner_index =
+                static_cast<std::size_t>(leaf.descriptor.source_rank);
+            if (owner_index >= scratch.owner_seen.size()) {
+              throw std::logic_error(
+                  "TreePM top-level owner query encountered a rank outside prepared scratch");
+            }
+            if (scratch.owner_seen[owner_index] == 0U) {
+              scratch.owner_seen[owner_index] = 1U;
+              scratch.owners.push_back(leaf.descriptor.source_rank);
+            }
+          }
+        }
+      } else {
+        scratch.stack.push_back(node.left);
+        scratch.stack.push_back(node.right);
+      }
+    }
+    std::sort(scratch.owners.begin(), scratch.owners.end());
+    scratch.owners.erase(
+        std::unique(scratch.owners.begin(), scratch.owners.end()),
+        scratch.owners.end());
+    return scratch.owners;
+  }
+
+ private:
+  struct Node {
+    SourceDomainBoundsPacket bounds{};
+    std::size_t left = 0U;
+    std::size_t right = 0U;
+    std::size_t leaf_begin = 0U;
+    std::size_t leaf_count = 0U;
+  };
+
+  [[nodiscard]] std::size_t buildNode(std::size_t begin, std::size_t end) {
+    Node node;
+    const auto first_bounds = boundsFromTreePseudoParticlePacket(
+        m_leaves[m_order[begin]]);
+    node.bounds = first_bounds;
+    for (std::size_t slot = begin + 1U; slot < end; ++slot) {
+      const auto b = boundsFromTreePseudoParticlePacket(m_leaves[m_order[slot]]);
+      node.bounds.min_x_comoving = std::min(node.bounds.min_x_comoving, b.min_x_comoving);
+      node.bounds.max_x_comoving = std::max(node.bounds.max_x_comoving, b.max_x_comoving);
+      node.bounds.min_y_comoving = std::min(node.bounds.min_y_comoving, b.min_y_comoving);
+      node.bounds.max_y_comoving = std::max(node.bounds.max_y_comoving, b.max_y_comoving);
+      node.bounds.min_z_comoving = std::min(node.bounds.min_z_comoving, b.min_z_comoving);
+      node.bounds.max_z_comoving = std::max(node.bounds.max_z_comoving, b.max_z_comoving);
+      node.bounds.source_particle_count += b.source_particle_count;
+    }
+    const std::size_t node_index = m_nodes.size();
+    m_nodes.push_back(node);
+    const std::size_t count = end - begin;
+    if (count <= 2U) {
+      m_nodes[node_index].leaf_begin = begin;
+      m_nodes[node_index].leaf_count = count;
+      return node_index;
+    }
+    const double ex = node.bounds.max_x_comoving - node.bounds.min_x_comoving;
+    const double ey = node.bounds.max_y_comoving - node.bounds.min_y_comoving;
+    const double ez = node.bounds.max_z_comoving - node.bounds.min_z_comoving;
+    const int axis = ey > ex && ey >= ez ? 1 : (ez > ex && ez > ey ? 2 : 0);
+    const std::size_t middle = begin + count / 2U;
+    std::nth_element(
+        m_order.begin() + static_cast<std::ptrdiff_t>(begin),
+        m_order.begin() + static_cast<std::ptrdiff_t>(middle),
+        m_order.begin() + static_cast<std::ptrdiff_t>(end),
+        [&](std::size_t lhs, std::size_t rhs) {
+          const auto center = [&](const parallel::TreePseudoParticlePacket& p) {
+            if (axis == 1) return p.center_y_comoving;
+            if (axis == 2) return p.center_z_comoving;
+            return p.center_x_comoving;
+          };
+          return center(m_leaves[lhs]) < center(m_leaves[rhs]);
+        });
+    m_nodes[node_index].left = buildNode(begin, middle);
+    m_nodes[node_index].right = buildNode(middle, end);
+    return node_index;
+  }
+
+  std::vector<parallel::TreePseudoParticlePacket> m_leaves;
+  std::vector<std::size_t> m_order;
+  std::vector<Node> m_nodes;
+};
+
+[[nodiscard, maybe_unused]] std::uint64_t domainGeometryFingerprint(
+    std::span<const parallel::TreePseudoParticlePacket> leaves) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  auto mix = [&](std::uint64_t value) {
+    hash ^= value;
+    hash *= 1099511628211ULL;
+  };
+  for (const auto& leaf : leaves) {
+    mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(leaf.descriptor.source_rank)));
+    mix(leaf.descriptor.decomposition_epoch);
+    mix(std::bit_cast<std::uint64_t>(leaf.min_x_comoving));
+    mix(std::bit_cast<std::uint64_t>(leaf.max_x_comoving));
+    mix(std::bit_cast<std::uint64_t>(leaf.min_y_comoving));
+    mix(std::bit_cast<std::uint64_t>(leaf.max_y_comoving));
+    mix(std::bit_cast<std::uint64_t>(leaf.min_z_comoving));
+    mix(std::bit_cast<std::uint64_t>(leaf.max_z_comoving));
+  }
+  return hash;
+}
+
+}  // namespace
+
+struct TreePmCoordinator::LetDomainHierarchyCacheOpaque {
+  bool valid = false;
+  std::uint64_t geometry_fingerprint = 0U;
+  std::unique_ptr<TopLevelDomainHierarchy> hierarchy;
+};
+
+struct TreePmCoordinator::SparsePeerGraphCacheOpaque {
+  bool valid = false;
+  DecompositionEpoch decomposition_epoch{};
+  int world_size = 1;
+  std::vector<int> requested_outgoing_peers;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  SparsePeerGraph graph;
+#endif
+};
+
+void TreePmForceAccumulatorView::reset() const {
+  std::fill(accel_x_comoving.begin(), accel_x_comoving.end(), 0.0);
+  std::fill(accel_y_comoving.begin(), accel_y_comoving.end(), 0.0);
+  std::fill(accel_z_comoving.begin(), accel_z_comoving.end(), 0.0);
+}
+
+void TreePmForceAccumulatorView::addToActiveSlot(
+    std::size_t active_slot,
+    double ax_comoving,
+    double ay_comoving,
+    double az_comoving) const {
+  accel_x_comoving[active_slot] += ax_comoving;
+  accel_y_comoving[active_slot] += ay_comoving;
+  accel_z_comoving[active_slot] += az_comoving;
+}
+
+TreePmCoordinator::TreePmCoordinator(PmGridShape pm_shape)
+    : m_shape(pm_shape),
+      m_mpi_context(),
+      m_grid(pm_shape),
+      m_pm_solver(pm_shape),
+      m_tree_solver(),
+      m_communication_arena(nullptr),
+      m_let_domain_hierarchy_cache(std::make_unique<LetDomainHierarchyCacheOpaque>()),
+      m_sparse_peer_graph_cache(std::make_unique<SparsePeerGraphCacheOpaque>()) {}
+
+TreePmCoordinator::TreePmCoordinator(PmGridShape pm_shape, parallel::PmSlabLayout pm_layout)
+    : TreePmCoordinator(pm_shape, std::move(pm_layout), parallel::MpiContext()) {}
+
+TreePmCoordinator::TreePmCoordinator(
+    PmGridShape pm_shape,
+    parallel::PmSlabLayout pm_layout,
+    parallel::MpiContext mpi_context,
+    core::MemoryGovernor* memory_governor)
+    : m_memory_governor(memory_governor),
+      m_shape(pm_shape),
+      m_mpi_context(std::move(mpi_context)),
+      m_grid(pm_shape, std::move(pm_layout)),
+      m_pm_solver(pm_shape),
+      m_tree_solver(),
+      m_communication_arena(memory_governor),
+      m_let_domain_hierarchy_cache(std::make_unique<LetDomainHierarchyCacheOpaque>()),
+      m_sparse_peer_graph_cache(std::make_unique<SparsePeerGraphCacheOpaque>()) {}
+
+TreePmCoordinator::~TreePmCoordinator() = default;
+
+void TreePmCoordinator::trimOptionalAccelerationCaches(std::uint64_t required_headroom_bytes) {
+  if (m_memory_governor == nullptr ||
+      m_memory_governor->snapshot().headroom_bytes >= required_headroom_bytes) return;
+  m_residual_table.reset();
+  m_residual_table_commitment = {};
+  m_worker_leaf_storage.reset();
+  m_worker_leaf_commitment = {};
+  m_worker_leaf_capacity = 0U;
+}
+
+void TreePmForceAccumulatorView::addShortRangeToActiveSlot(
+    std::size_t slot, double ax, double ay, double az) const {
+  addToActiveSlot(slot, ax, ay, az);
+  if (!short_range_accel_x_comoving.empty()) {
+    const auto row = active_particle_index[slot];
+    short_range_accel_x_comoving[row] += ax;
+    short_range_accel_y_comoving[row] += ay;
+    short_range_accel_z_comoving[row] += az;
+  }
+}
+
+void TreePmForceAccumulatorView::noteNearestPairToActiveSlot(
+    std::size_t slot, double nearest_pair_r2_comoving) const {
+  if (short_range_nearest_pair_r2_comoving.empty()) return;
+  const auto row = active_particle_index[slot];
+  short_range_nearest_pair_r2_comoving[row] =
+      std::min(short_range_nearest_pair_r2_comoving[row], nearest_pair_r2_comoving);
+}
+
+void TreePmCoordinator::shutdownMpiResources() {
+  m_pm_solver.shutdownBackendResources();
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  if (m_sparse_peer_graph_cache &&
+      m_sparse_peer_graph_cache->graph.communicator != MPI_COMM_NULL) {
+    m_sparse_peer_graph_cache->graph.close();
+  }
+#endif
+  if (m_sparse_peer_graph_cache) {
+    m_sparse_peer_graph_cache->valid = false;
+    m_sparse_peer_graph_cache->requested_outgoing_peers.clear();
+  }
+}
+
+const parallel::PmSlabLayout& TreePmCoordinator::slabLayout() const noexcept {
+  return m_grid.slabLayout();
+}
+
+bool TreePmCoordinator::ownsFullPmDomain() const noexcept {
+  return m_grid.ownsFullDomain();
+}
+
+const parallel::PmSlabHaloExchangeResult& TreePmCoordinator::lastPmSlabHaloExchange() const noexcept {
+  return m_last_pm_slab_halo_exchange;
+}
+
+core::MemoryReport TreePmCoordinator::memoryReport() const {
+  core::MemoryReportBuilder builder;
+  if (m_gaussian_table) {
+    builder.addEntry(core::MemoryEntry{
+        .subsystem = core::MemorySubsystem::kTree,
+        .lifetime = core::MemoryLifetime::kPersistent,
+        .memory_class = core::MemoryClass::kPersistentCache,
+        .label = "treepm.gaussian_pair_table",
+        .current_size_bytes = sizeof(TreePmGaussianCoefficientTable),
+        .owned_capacity_bytes = sizeof(TreePmGaussianCoefficientTable),
+        .high_water_bytes = sizeof(TreePmGaussianCoefficientTable),
+        .governed_commitment = m_gaussian_table_commitment.committed()});
+  }
+  if (m_residual_table) {
+    builder.addEntry(core::MemoryEntry{
+        .subsystem = core::MemorySubsystem::kTree,
+        .lifetime = core::MemoryLifetime::kPersistent,
+        .memory_class = core::MemoryClass::kPersistentCache,
+        .label = "treepm.full_residual_table",
+        .current_size_bytes = sizeof(TreePmResidualCoefficientTable),
+        .owned_capacity_bytes = sizeof(TreePmResidualCoefficientTable),
+        .high_water_bytes = sizeof(TreePmResidualCoefficientTable),
+        .governed_commitment = m_residual_table_commitment.committed()});
+  }
+  if (m_worker_leaf_storage) {
+    const auto bytes = m_worker_leaf_capacity*sizeof(TreePmLeafScratch);
+    builder.addEntry(core::MemoryEntry{
+        .subsystem = core::MemorySubsystem::kTree,
+        .lifetime = core::MemoryLifetime::kPersistent,
+        .memory_class = core::MemoryClass::kPersistentCache,
+        .label = "treepm.worker_leaf_scratch",
+        .current_size_bytes = bytes, .owned_capacity_bytes = bytes, .high_water_bytes = bytes,
+        .governed_commitment = m_worker_leaf_commitment.committed()});
+  }
+  m_grid.appendMemoryReport(builder);
+  m_pm_solver.appendMemoryReport(builder);
+  m_tree_solver.appendMemoryReport(builder);
+  const std::uint64_t fixed_feedback_bytes = sizeof(m_spatial_work_history) +
+      sizeof(m_spatial_target_history) + sizeof(m_last_residual_stats.traversal_summary) +
+      sizeof(m_source_coordinate_bounds) + sizeof(m_node_coordinate_bounds);
+  builder.addEntry(core::MemoryEntry{
+      .subsystem = core::MemorySubsystem::kTree,
+      .lifetime = core::MemoryLifetime::kPersistent,
+      .memory_class = core::MemoryClass::kDiagnostic,
+      .label = "treepm.bounded_spatial_work_and_traversal_summary",
+      .current_size_bytes = fixed_feedback_bytes,
+      .owned_capacity_bytes = fixed_feedback_bytes,
+      .high_water_bytes = fixed_feedback_bytes});
+
+  const auto add_active = [&builder](
+                              std::string label,
+                              const auto& container,
+                              std::uint64_t high_water_bytes) {
+    const std::uint64_t bytes = core::ownedCapacityBytesForContainer(container);
+    builder.addEntry(core::MemoryEntry{.subsystem = core::MemorySubsystem::kActiveSets,
+                                       .lifetime = core::MemoryLifetime::kTransient,
+                                       .label = std::move(label),
+                                       .current_size_bytes = core::currentSizeBytesForContainer(container),
+                                       .owned_capacity_bytes = bytes,
+                                       .high_water_bytes = high_water_bytes,
+                                       .estimated_next_step_bytes = 0U,
+                                       .uncertainty_note = "historical high-water tracked; next-step zoom requirement is profile-dependent"});
+  };
+  add_active("treepm.active_zoom_corr_ax_comoving", m_active_zoom_corr_ax_comoving, m_zoom_corr_high_water_bytes[0]);
+  add_active("treepm.active_zoom_corr_ay_comoving", m_active_zoom_corr_ay_comoving, m_zoom_corr_high_water_bytes[1]);
+  add_active("treepm.active_zoom_corr_az_comoving", m_active_zoom_corr_az_comoving, m_zoom_corr_high_water_bytes[2]);
+
+  const auto add_tree_scratch = [&builder](std::string label, const auto& container) {
+    const std::uint64_t bytes = core::ownedCapacityBytesForContainer(container);
+    builder.addEntry(core::MemoryEntry{.subsystem = core::MemorySubsystem::kTree,
+                                       .lifetime = core::MemoryLifetime::kTransient,
+                                       .label = std::move(label),
+                                       .current_size_bytes = core::currentSizeBytesForContainer(container),
+                                       .owned_capacity_bytes = bytes,
+                                       .high_water_bytes = bytes,
+                                       .estimated_next_step_bytes = 0U,
+                                       .uncertainty_note = "next-step requirement not predicted from retained capacity"});
+  };
+   add_tree_scratch("treepm.periodic_tree_source_x_comoving", m_tree_source_x_comoving);
+   add_tree_scratch("treepm.periodic_tree_source_y_comoving", m_tree_source_y_comoving);
+   add_tree_scratch("treepm.periodic_tree_source_z_comoving", m_tree_source_z_comoving);
+   add_tree_scratch("treepm.tree_ordered_source_x_comoving", m_tree_ordered_source_x_comoving);
+   add_tree_scratch("treepm.tree_ordered_source_y_comoving", m_tree_ordered_source_y_comoving);
+   add_tree_scratch("treepm.tree_ordered_source_z_comoving", m_tree_ordered_source_z_comoving);
+   add_tree_scratch("treepm.tree_ordered_source_mass_code", m_tree_ordered_source_mass_code);
+   add_tree_scratch("treepm.tree_order_position_by_row", m_tree_order_position_by_row);
+   add_tree_scratch("treepm.target_visit_order", m_target_visit_order);
+   add_tree_scratch("treepm.group_walk_leaf_of_tree_position", m_leaf_of_tree_position);
+   {
+     std::uint64_t group_bytes = 0U;
+     for (const auto& scratch : m_worker_group_scratch) {
+       group_bytes += core::ownedCapacityBytesForContainer(scratch.multipole_nodes) +
+           core::ownedCapacityBytesForContainer(scratch.range_begin) +
+           core::ownedCapacityBytesForContainer(scratch.range_end);
+     }
+     builder.addEntry(core::MemoryEntry{.subsystem = core::MemorySubsystem::kTree,
+                                        .lifetime = core::MemoryLifetime::kTransient,
+                                        .label = "treepm.group_walk_worker_interaction_lists",
+                                        .current_size_bytes = group_bytes,
+                                        .owned_capacity_bytes = group_bytes,
+                                        .high_water_bytes = group_bytes,
+                                        .estimated_next_step_bytes = 0U,
+                                        .uncertainty_note = "per-worker group interaction lists; grow to the largest group list"});
+   }
+   add_tree_scratch("treepm.let_domain_cache.top_level_leaves", m_let_domain_cache.top_level_domain_leaves);
+
+   const auto add_mpi = [&builder](std::string label, const auto& container) {
+     const std::uint64_t bytes = core::ownedCapacityBytesForContainer(container);
+     builder.addEntry(core::MemoryEntry{
+         .subsystem = core::MemorySubsystem::kMpiBuffers,
+         .lifetime = core::MemoryLifetime::kTransient,
+         .label = std::move(label),
+         .current_size_bytes = core::currentSizeBytesForContainer(container),
+         .owned_capacity_bytes = bytes,
+         .high_water_bytes = bytes,
+         .estimated_next_step_bytes = 0U,
+         .uncertainty_note = "small retained communication-topology metadata"});
+   };
+
+   if (m_communication_arena.configured()) {
+     builder.addEntry(core::MemoryEntry{
+         .subsystem = core::MemorySubsystem::kMpiBuffers,
+         .lifetime = core::MemoryLifetime::kTransient,
+         .memory_class = core::MemoryClass::kCommunication,
+         .label = "treepm.communication_arena",
+         .current_size_bytes = 0U,
+         .owned_capacity_bytes = m_communication_arena.capacityBytes(),
+         .high_water_bytes = m_communication_arena.capacityBytes(),
+         .estimated_next_step_bytes = m_communication_arena.capacityBytes(),
+         .governed_commitment = m_communication_arena.governed(),
+         .uncertainty_note =
+             "one governed physical backing allocation reused sequentially by PM density, halo staging, PM interpolation, and Tree exchange"});
+   }
+
+   const auto add_logical_phase = [&builder](
+       std::string label, std::uint64_t high_water_bytes) {
+     builder.addEntry(core::MemoryEntry{
+         .subsystem = core::MemorySubsystem::kMpiBuffers,
+         .lifetime = core::MemoryLifetime::kTransient,
+         .memory_class = core::MemoryClass::kCommunication,
+         .label = std::move(label),
+         .current_size_bytes = 0U,
+         .owned_capacity_bytes = 0U,
+         .high_water_bytes = high_water_bytes,
+         .estimated_next_step_bytes = 0U,
+         .estimate_only = true,
+         .uncertainty_note =
+             "logical non-owning arena phase high-water; do not sum as physical capacity"});
+   };
+   add_logical_phase(
+       "treepm.communication.pm_density_logical_high_water",
+       m_communication_arena.logicalHighWater(
+           GravityCommunicationArena::Phase::kPmDensity));
+   add_logical_phase(
+       "treepm.communication.pm_halo_logical_high_water",
+       m_communication_arena.logicalHighWater(
+           GravityCommunicationArena::Phase::kPmHalo));
+   add_logical_phase(
+       "treepm.communication.pm_interpolation_logical_high_water",
+       m_communication_arena.logicalHighWater(
+           GravityCommunicationArena::Phase::kPmInterpolation));
+   add_logical_phase(
+       "treepm.communication.tree_exchange_logical_high_water",
+       std::max(
+           m_tree_exchange_logical_high_water_bytes,
+           m_communication_arena.logicalHighWater(
+               GravityCommunicationArena::Phase::kTreeExchange)));
+
+   if (m_sparse_peer_graph_cache != nullptr) {
+     add_mpi(
+         "treepm.let_domain_cache.requested_peers",
+         m_sparse_peer_graph_cache->requested_outgoing_peers);
+   }
+
+   {
+
+     const std::uint64_t bytes = core::ownedCapacityBytesForContainer(m_worker_stack_storage);
+     builder.addEntry(core::MemoryEntry{
+         .subsystem = core::MemorySubsystem::kScratch,
+         .lifetime = core::MemoryLifetime::kTransient,
+         .label = "treepm.residual.worker_stack_storage",
+         .current_size_bytes = core::currentSizeBytesForContainer(m_worker_stack_storage),
+         .owned_capacity_bytes = bytes,
+         .high_water_bytes = m_worker_stack_high_water_bytes,
+         .estimated_next_step_bytes = bytes,
+         .uncertainty_note =
+             "contiguous OpenMP residual DFS slots sized worker_count * (1 + 7 * tree max depth); high-water is retained capacity"});
+   }
+   {
+     const std::uint64_t bytes = core::ownedCapacityBytesForContainer(m_worker_counter_storage);
+     builder.addEntry(core::MemoryEntry{
+         .subsystem = core::MemorySubsystem::kScratch,
+         .lifetime = core::MemoryLifetime::kTransient,
+         .label = "treepm.residual.worker_counter_storage",
+         .current_size_bytes = core::currentSizeBytesForContainer(m_worker_counter_storage),
+         .owned_capacity_bytes = bytes,
+         .high_water_bytes = m_worker_counter_high_water_bytes,
+         .estimated_next_step_bytes = bytes,
+         .uncertainty_note = "one integer counter bundle per planned OpenMP worker"});
+   }
+   {
+     const std::uint64_t bytes = core::ownedCapacityBytesForContainer(m_worker_spatial_counter_storage);
+     builder.addEntry(core::MemoryEntry{
+         .subsystem = core::MemorySubsystem::kScratch,
+         .lifetime = core::MemoryLifetime::kTransient,
+         .label = "treepm.residual.worker_spatial_counter_storage",
+         .current_size_bytes = core::currentSizeBytesForContainer(m_worker_spatial_counter_storage),
+         .owned_capacity_bytes = bytes,
+         .high_water_bytes = m_worker_spatial_counter_high_water_bytes,
+         .estimated_next_step_bytes = bytes,
+         .uncertainty_note = "optional aligned 64-bin work/target scratch per worker; allocated and updated only when spatial feedback is enabled"});
+   }
+   {
+     const std::uint64_t bytes = core::ownedCapacityBytesForContainer(m_block_sum_sq_storage);
+     builder.addEntry(core::MemoryEntry{
+         .subsystem = core::MemorySubsystem::kScratch,
+         .lifetime = core::MemoryLifetime::kTransient,
+         .label = "treepm.residual.block_sum_sq_storage",
+         .current_size_bytes = core::currentSizeBytesForContainer(m_block_sum_sq_storage),
+         .owned_capacity_bytes = bytes,
+         .high_water_bytes = m_block_sum_sq_high_water_bytes,
+         .estimated_next_step_bytes = bytes,
+         .uncertainty_note = "deterministic floating diagnostic block sums; force accumulation order is unchanged"});
+   }
+
+   builder.addEntry(core::MemoryEntry{.subsystem = core::MemorySubsystem::kPmMesh,
+
+                                     .lifetime = core::MemoryLifetime::kUnknown,
+                                     .label = "pm_solver.external_fftw_or_cuda_plan_cache",
+                                     .estimate_only = true,
+                                     .uncertainty_note = "FFTW/cuFFT plan internals are backend-owned; cached plan count is reported elsewhere."});
+  core::MemoryReport report = std::move(builder).finish();
+  report.notes.push_back("TreePM report covers owned host mesh, tree-node, active-set, and exchange-buffer capacities.");
+  report.notes.push_back("FFTW/GPU library internals remain unknown unless a backend exposes exact allocation hooks.");
+  return report;
+}
+
+void TreePmCoordinator::solveActiveSet(
+    std::span<const double> pos_x_comoving,
+    std::span<const double> pos_y_comoving,
+    std::span<const double> pos_z_comoving,
+    std::span<const double> mass_code,
+    const TreePmForceAccumulatorView& accumulator,
+    const TreePmOptions& options,
+    TreePmProfileEvent* profile,
+    TreePmDiagnostics* diagnostics,
+    const TreeSofteningView& softening_view) {
+  solveActiveSetWithPmCadence(
+      pos_x_comoving,
+      pos_y_comoving,
+      pos_z_comoving,
+      mass_code,
+      accumulator,
+      options,
+      true,
+      profile,
+      diagnostics,
+      softening_view);
+}
+
+void TreePmCoordinator::solveActiveSetWithPmCadence(
+    std::span<const double> pos_x_comoving,
+    std::span<const double> pos_y_comoving,
+    std::span<const double> pos_z_comoving,
+    std::span<const double> mass_code,
+    const TreePmForceAccumulatorView& accumulator,
+    const TreePmOptions& options,
+    bool refresh_long_range_field,
+    TreePmProfileEvent* profile,
+    TreePmDiagnostics* diagnostics,
+    const TreeSofteningView& softening_view) {
+  int tree_pm_entry_world_size = 1;
+  bool tree_pm_rank_local_serial_mode = true;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  int tree_pm_entry_world_rank = 0;
+  bool tree_pm_layout_mode_diverged = false;
+  queryActiveMpiWorld(tree_pm_entry_world_size, tree_pm_entry_world_rank);
+  const int local_rank_serial_mode =
+      m_grid.slabLayout().world_size == 1 && m_grid.ownsFullDomain() ? 1 : 0;
+  int minimum_rank_serial_mode = local_rank_serial_mode;
+  int maximum_rank_serial_mode = local_rank_serial_mode;
+  if (tree_pm_entry_world_size > 1) {
+    MPI_Allreduce(
+        &local_rank_serial_mode,
+        &minimum_rank_serial_mode,
+        1,
+        MPI_INT,
+        MPI_MIN,
+        MPI_COMM_WORLD);
+    MPI_Allreduce(
+        &local_rank_serial_mode,
+        &maximum_rank_serial_mode,
+        1,
+        MPI_INT,
+        MPI_MAX,
+        MPI_COMM_WORLD);
+  }
+  tree_pm_layout_mode_diverged =
+      minimum_rank_serial_mode != maximum_rank_serial_mode;
+  tree_pm_rank_local_serial_mode = minimum_rank_serial_mode == 1;
+#endif
+  std::exception_ptr local_preflight_failure;
+  try {
+    validateTreePmPreflight(
+        pos_x_comoving,
+        pos_y_comoving,
+        pos_z_comoving,
+        mass_code,
+        accumulator,
+        options,
+        softening_view,
+        m_source_coordinate_bounds);
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+    const parallel::PmSlabLayout& layout = m_grid.slabLayout();
+    if (tree_pm_layout_mode_diverged) {
+      throw std::invalid_argument(
+          "TreePM ranks disagree on rank-local-serial versus distributed PM layout mode");
+    }
+    const bool layout_matches_selected_mode = tree_pm_rank_local_serial_mode
+        ? layout.world_size == 1 && layout.world_rank == 0 &&
+              m_grid.ownsFullDomain()
+        : layout.world_size == tree_pm_entry_world_size &&
+              layout.world_rank == tree_pm_entry_world_rank;
+    if (!layout_matches_selected_mode ||
+        m_mpi_context.worldSize() != tree_pm_entry_world_size ||
+        m_mpi_context.worldRank() != tree_pm_entry_world_rank ||
+        (tree_pm_entry_world_size > 1 && !m_mpi_context.isEnabled())) {
+      throw std::invalid_argument(
+          "TreePM PM layout and MPI context world metadata must match MPI_COMM_WORLD");
+    }
+#else
+    if (m_grid.slabLayout().world_size != 1 ||
+        m_grid.slabLayout().world_rank != 0) {
+      throw std::invalid_argument(
+          "TreePM distributed PM layout requires COSMOSIM_ENABLE_MPI=ON");
+    }
+#endif
+  } catch (...) {
+    local_preflight_failure = std::current_exception();
+  }
+  std::uint64_t preflight_failure_count = local_preflight_failure ? 1U : 0U;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  if (tree_pm_entry_world_size > 1) {
+    std::uint64_t global_preflight_failure_count = 0U;
+    MPI_Allreduce(
+        &preflight_failure_count,
+        &global_preflight_failure_count,
+        1,
+        MPI_UINT64_T,
+        MPI_SUM,
+        MPI_COMM_WORLD);
+    preflight_failure_count = global_preflight_failure_count;
+  }
+#endif
+  if (preflight_failure_count != 0U) {
+    if (local_preflight_failure) {
+      std::rethrow_exception(local_preflight_failure);
+    }
+    throw std::runtime_error(
+        "TreePM peer rank rejected its local input during coordinated preflight");
+  }
+  // The hosting MPI world and the selected gravity communication topology are
+  // distinct contracts.  A communicator may contain multiple ranks while each
+  // rank owns a complete serial PM grid.  In that agreed rank-local-serial mode
+  // we still execute communicator-wide consensus/failure votes, but no PM
+  // routing, PM halo, PM interpolation routing, or residual Tree payload uses
+  // the shared communication arena.
+  const bool tree_pm_uses_distributed_payload_communication =
+      tree_pm_entry_world_size > 1 && !tree_pm_rank_local_serial_mode;
+  const auto coordinate_tree_pm_failure = [&](std::exception_ptr local_failure,
+                                               std::string_view phase) {
+    std::uint64_t failure_count = local_failure ? 1U : 0U;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+    if (tree_pm_entry_world_size > 1) {
+      std::uint64_t global_failure_count = 0U;
+      MPI_Allreduce(
+          &failure_count,
+          &global_failure_count,
+          1,
+          MPI_UINT64_T,
+          MPI_SUM,
+          MPI_COMM_WORLD);
+      failure_count = global_failure_count;
+    }
+#endif
+    if (failure_count == 0U) {
+      return;
+    }
+    if (local_failure) {
+      std::rethrow_exception(local_failure);
+    }
+    throw std::runtime_error(
+        "TreePM peer rank rejected " + std::string(phase));
+  };
+  const auto start = std::chrono::steady_clock::now();
+  accumulator.reset();
+  if (!accumulator.short_range_accel_x_comoving.empty()) {
+    for (const auto row : accumulator.active_particle_index) {
+      accumulator.short_range_accel_x_comoving[row] = 0.0;
+      accumulator.short_range_accel_y_comoving[row] = 0.0;
+      accumulator.short_range_accel_z_comoving[row] = 0.0;
+    }
+  }
+  if (!accumulator.short_range_nearest_pair_r2_comoving.empty()) {
+    for (const auto row : accumulator.active_particle_index) {
+      accumulator.short_range_nearest_pair_r2_comoving[row] = std::numeric_limits<double>::infinity();
+    }
+  }
+
+  // PM owns long-range force via explicit Gaussian Fourier filter. Cadence-aware callers
+  // may choose to reuse the previously solved PM mesh field.
+  PmSolveOptions pm_options = options.pm_options;
+  pm_options.tree_pm_split_scale_comoving = options.split_policy.split_scale_comoving;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  if (tree_pm_entry_world_size > 1) {
+    const std::uint64_t local_fingerprint =
+        treePmOptionFingerprint(m_shape, options, pm_options, softening_view);
+    std::uint64_t minimum_fingerprint = 0U;
+    std::uint64_t maximum_fingerprint = 0U;
+    MPI_Allreduce(
+        &local_fingerprint,
+        &minimum_fingerprint,
+        1,
+        MPI_UINT64_T,
+        MPI_MIN,
+        MPI_COMM_WORLD);
+    MPI_Allreduce(
+        &local_fingerprint,
+        &maximum_fingerprint,
+        1,
+        MPI_UINT64_T,
+        MPI_MAX,
+        MPI_COMM_WORLD);
+    if (minimum_fingerprint != maximum_fingerprint) {
+      throw std::runtime_error(
+          "TreePM mesh shape, physical options, or protocol epochs diverged across ranks before PM collectives");
+    }
+  }
+#endif
+  const double comoving_gravity_prefactor =
+      pm_options.gravitational_constant_code;
+  if (!std::isfinite(comoving_gravity_prefactor) ||
+      comoving_gravity_prefactor <= 0.0) {
+    throw std::overflow_error(
+        "TreePM code-unit gravitational prefactor is non-finite or non-positive");
+  }
+
+  // TreePM returns the scale-free comoving Newtonian kernel A. The KDK
+  // integrator applies its cosmological 1/a^2 kick factor to physical peculiar
+  // velocity, so neither PM nor the complementary residual may insert another
+  // scale-factor power here. Keep the caller-owned standalone-tree options
+  // unchanged and derive the effective TreePM short-range options locally.
+  TreePmOptions short_range_options = options;
+  short_range_options.pm_options = pm_options;
+  short_range_options.tree_options.gravitational_constant_code =
+      comoving_gravity_prefactor;
+  const PeriodicBoxLengths cache_box_lengths = effectivePeriodicBoxLengths(pm_options);
+  // Particle ownership changes advance the tree protocol epoch, but do not
+  // invalidate a mesh field whose FFT slab ownership, physical force epoch,
+  // scale factor, and mesh options are unchanged. Interpolation is routed to
+  // the fixed slab owners for the caller's current target decomposition.
+  const auto cache_matches_request = [&]() {
+    return m_long_range_field_validity.valid &&
+        m_long_range_field_validity.source_generation == options.source_generation &&
+        m_long_range_field_validity.last_force_epoch == options.force_epoch &&
+        m_long_range_field_validity.pm_field_version == options.pm_field_version &&
+        m_long_range_field_validity.scale_factor == pm_options.scale_factor &&
+        m_long_range_field_validity.gravitational_constant_code == pm_options.gravitational_constant_code &&
+        m_long_range_field_validity.split_scale_comoving == pm_options.tree_pm_split_scale_comoving &&
+        m_long_range_field_validity.box_size_x_comoving == cache_box_lengths.lx &&
+        m_long_range_field_validity.box_size_y_comoving == cache_box_lengths.ly &&
+        m_long_range_field_validity.box_size_z_comoving == cache_box_lengths.lz &&
+        m_long_range_field_validity.assignment_scheme == pm_options.assignment_scheme &&
+        m_long_range_field_validity.boundary_condition == pm_options.boundary_condition &&
+        m_long_range_field_validity.decomposition_mode == pm_options.decomposition_mode &&
+        m_long_range_field_validity.window_deconvolution == pm_options.enable_window_deconvolution;
+  };
+
+  if (options.short_range_only && (refresh_long_range_field || options.enable_zoom_long_range_correction ||
+      !accumulator.long_range_accel_x_comoving.empty())) {
+    throw std::invalid_argument("short-range split surface cannot request a PM refresh/capture or zoom correction");
+  }
+  bool perform_long_range_refresh = refresh_long_range_field;
+  if (!options.short_range_only && tree_pm_entry_world_size > 1) {
+    const std::uint64_t requested_refresh_votes =
+        m_mpi_context.allreduceSumUint64(refresh_long_range_field ? 1U : 0U);
+    const std::uint64_t world_size =
+        static_cast<std::uint64_t>(tree_pm_entry_world_size);
+    if (requested_refresh_votes != 0U && requested_refresh_votes != world_size) {
+      throw std::runtime_error(
+          "TreePM long-range refresh/reuse request diverged across ranks before PM collectives");
+    }
+    const std::uint64_t compatible_cache_votes =
+        m_mpi_context.allreduceSumUint64(cache_matches_request() ? 1U : 0U);
+    if (requested_refresh_votes == 0U && compatible_cache_votes != world_size) {
+      throw std::runtime_error(
+          "TreePM long-range reuse requested without a compatible PM field on every rank");
+    }
+    perform_long_range_refresh = requested_refresh_votes == world_size;
+  } else if (!options.short_range_only && !refresh_long_range_field && !cache_matches_request()) {
+    throw std::runtime_error(
+        "TreePM long-range reuse requested without a compatible PM field");
+  }
+
+  // Configure the one production communication backing allocation before any
+  // distributed gravity protocol can borrow it. The capacity is the maximum
+  // source-derived live set of the sequential PM-density, halo-staging,
+  // interpolation, and short-range Tree exchange phases.
+  if (tree_pm_uses_distributed_payload_communication) {
+    std::exception_ptr arena_configuration_failure;
+    try {
+      const GravityCommunicationArenaMemoryEstimate arena_estimate =
+          estimateGravityCommunicationArenaMemory(
+              GravityCommunicationArenaMemoryInput{
+                  .pm_shape = m_shape,
+                  .pm_layout = m_grid.slabLayout(),
+                  .pm_exchange_batch_bytes = pm_options.routing_exchange_batch_bytes,
+                  .tree_exchange_batch_bytes = options.tree_exchange_batch_bytes,
+              });
+      m_communication_arena.configure(arena_estimate.required_capacity_bytes);
+    } catch (...) {
+      arena_configuration_failure = std::current_exception();
+    }
+    coordinate_tree_pm_failure(
+        arena_configuration_failure, "gravity communication-arena admission");
+  }
+
+  const auto run_pm_communication_phase = [&](
+      GravityCommunicationArena::Phase phase, const auto& operation) {
+    std::optional<GravityCommunicationArena::Lease> arena_lease;
+    if (tree_pm_uses_distributed_payload_communication) {
+      std::exception_ptr lease_failure;
+      try {
+        arena_lease.emplace(m_communication_arena.begin(phase));
+        m_pm_solver.attachCommunicationArena(&m_communication_arena);
+      } catch (...) {
+        m_pm_solver.detachCommunicationArena();
+        lease_failure = std::current_exception();
+      }
+      coordinate_tree_pm_failure(lease_failure, "PM communication-arena lease");
+    }
+
+    std::exception_ptr operation_failure;
+    try {
+      operation();
+    } catch (...) {
+      operation_failure = std::current_exception();
+    }
+    if (tree_pm_uses_distributed_payload_communication) {
+      // PmSolver's arena-backed containers have been destroyed on return from
+      // operation(); no MPI request or decoder may retain their storage now.
+      m_pm_solver.detachCommunicationArena();
+    }
+    // The payload may be rank-local, but an MPI-hosted solve still needs a
+    // coherent failure boundary before peers advance to the next collective.
+    coordinate_tree_pm_failure(operation_failure, "PM communication phase");
+    if (arena_lease.has_value()) {
+      arena_lease->release();
+    }
+  };
+
+  // Inclusive PM-phase wall clock: long-range refresh (when requested),
+  // compact-target preparation, force interpolation, and optional zoom
+  // correction through the point control transfers to the tree residual.
+  // Subphase PmProfileEvent fields overlap and must not replace this value.
+  const auto pm_phase_start = std::chrono::steady_clock::now();
+  if (perform_long_range_refresh) {
+    run_pm_communication_phase(
+        GravityCommunicationArena::Phase::kPmDensity, [&] {
+          if (pm_options.boundary_condition == PmBoundaryCondition::kPeriodic &&
+              pm_options.execution_policy != core::ExecutionPolicy::kCuda) {
+            m_pm_solver.assignDensityPeriodicFftBacked(
+                m_grid,
+                pos_x_comoving,
+                pos_y_comoving,
+                pos_z_comoving,
+                mass_code,
+                pm_options,
+                profile != nullptr ? &profile->pm_profile : nullptr);
+          } else {
+            m_pm_solver.assignDensity(
+                m_grid,
+                pos_x_comoving,
+                pos_y_comoving,
+                pos_z_comoving,
+                mass_code,
+                pm_options,
+                profile != nullptr ? &profile->pm_profile : nullptr);
+          }
+        });
+    m_last_pm_slab_halo_exchange = {};
+    m_grid.clearForceHaloCache();
+    if (pm_options.boundary_condition == PmBoundaryCondition::kPeriodic) {
+      m_pm_solver.solvePoissonPeriodicForcesOnly(
+          m_grid, pm_options, profile != nullptr ? &profile->pm_profile : nullptr);
+    } else {
+      m_pm_solver.solvePoissonIsolatedOpen(m_grid, pm_options, profile != nullptr ? &profile->pm_profile : nullptr);
+    }
+    if (tree_pm_uses_distributed_payload_communication &&
+        !m_grid.ownsFullDomain() && m_grid.slabLayout().world_size > 1) {
+      const auto halo_start = std::chrono::steady_clock::now();
+      const std::uint64_t exchange_sequence = ++m_pm_halo_exchange_sequence;
+      std::exception_ptr halo_cache_prepare_failure;
+      try {
+        m_grid.beginForceHaloCacheRefresh(/*halo_depth_x=*/1U);
+      } catch (...) {
+        m_grid.clearForceHaloCache();
+        halo_cache_prepare_failure = std::current_exception();
+      }
+      coordinate_tree_pm_failure(
+          halo_cache_prepare_failure, "PM halo-cache preparation");
+
+      std::array<parallel::PmSlabHaloExchangeStatus, 3> halo_status{};
+      const std::array<std::span<const double>, 3> force_components{
+          m_grid.force_x(), m_grid.force_y(), m_grid.force_z()};
+      std::exception_ptr halo_exchange_failure;
+      try {
+        for (std::size_t component = 0; component < force_components.size(); ++component) {
+          // Each component completes its MPI transfers before this lease is
+          // reset, so X/Y/Z reuse the same physical staging pages instead of
+          // retaining three complete temporary result objects.
+          auto halo_lease =
+              m_communication_arena.begin(GravityCommunicationArena::Phase::kPmHalo);
+          const PmGridStorage::ForceHaloWriteView write_view =
+              m_grid.forceHaloWriteView(component);
+          halo_status[component] = parallel::executeBlockingPmSlabHaloExchangeInto(
+              m_mpi_context,
+              m_grid.slabLayout(),
+              force_components[component],
+              /*halo_depth_x=*/1U,
+              pm_options.boundary_condition == PmBoundaryCondition::kPeriodic,
+              write_view.left,
+              write_view.right,
+              halo_lease.resource(),
+              exchange_sequence * 3U + static_cast<std::uint64_t>(component));
+          const std::uint64_t staging_bytes = static_cast<std::uint64_t>(
+              core::checkedSizeMultiply(
+                  2U,
+                  core::checkedSizeMultiply(
+                      write_view.left.size(), sizeof(double),
+                      "TreePM PM halo staging lane bytes"),
+                  "TreePM PM halo staging logical high-water"));
+          halo_lease.recordLogicalHighWater(staging_bytes);
+          // executeBlocking...Into has returned from all MPI operations and
+          // direct receive writes before the lease is released here.
+          halo_lease.release();
+        }
+      } catch (...) {
+        m_grid.clearForceHaloCache();
+        halo_exchange_failure = std::current_exception();
+      }
+      coordinate_tree_pm_failure(halo_exchange_failure, "PM halo exchange");
+
+      std::exception_ptr halo_cache_commit_failure;
+      try {
+        const auto& first = halo_status.front();
+        for (const auto& status : halo_status) {
+          if (status.halo_depth_x != first.halo_depth_x ||
+              status.left_peer_rank != first.left_peer_rank ||
+              status.right_peer_rank != first.right_peer_rank) {
+            throw std::runtime_error(
+                "TreePM PM halo components disagree on shape or peer metadata");
+          }
+        }
+        m_grid.commitForceHaloCacheRefresh(
+            first.halo_depth_x, first.left_peer_rank, first.right_peer_rank, exchange_sequence);
+        m_last_pm_slab_halo_exchange = {};
+        m_last_pm_slab_halo_exchange.halo_depth_x = first.halo_depth_x;
+        m_last_pm_slab_halo_exchange.left_peer_rank = first.left_peer_rank;
+        m_last_pm_slab_halo_exchange.right_peer_rank = first.right_peer_rank;
+        m_last_pm_slab_halo_exchange.exchange_sequence = exchange_sequence;
+        for (const auto& status : halo_status) {
+          m_last_pm_slab_halo_exchange.sent_bytes += status.sent_bytes;
+          m_last_pm_slab_halo_exchange.received_bytes += status.received_bytes;
+        }
+        if (profile != nullptr) {
+          profile->pm_profile.bytes_moved +=
+              m_last_pm_slab_halo_exchange.sent_bytes +
+              m_last_pm_slab_halo_exchange.received_bytes;
+        }
+      } catch (...) {
+        m_grid.clearForceHaloCache();
+        halo_cache_commit_failure = std::current_exception();
+      }
+      coordinate_tree_pm_failure(
+          halo_cache_commit_failure, "PM halo-cache commit");
+      if (profile != nullptr) {
+        profile->pm_profile.halo_exchange_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - halo_start).count();
+      }
+    }
+    m_long_range_field_validity = LongRangeFieldValidity{
+        .valid = true,
+        .decomposition_epoch = options.decomposition_epoch,
+        .source_generation = options.source_generation,
+        .pm_field_version = options.pm_field_version,
+        .last_force_epoch = options.force_epoch,
+        .scale_factor = pm_options.scale_factor,
+        .gravitational_constant_code = pm_options.gravitational_constant_code,
+        .split_scale_comoving = pm_options.tree_pm_split_scale_comoving,
+        .box_size_x_comoving = cache_box_lengths.lx,
+        .box_size_y_comoving = cache_box_lengths.ly,
+        .box_size_z_comoving = cache_box_lengths.lz,
+        .assignment_scheme = pm_options.assignment_scheme,
+        .boundary_condition = pm_options.boundary_condition,
+        .decomposition_mode = pm_options.decomposition_mode,
+        .window_deconvolution = pm_options.enable_window_deconvolution,
+    };
+  }
+  if (!options.short_range_only && !m_long_range_field_validity.valid) {
+    throw std::runtime_error("TreePM long-range mesh field is unavailable for reuse");
+  }
+
+  const std::size_t active_count = accumulator.active_particle_index.size();
+  std::uint64_t zoom_high_res_allgather_bytes = 0;
+  const bool has_explicit_target_positions = !accumulator.target_pos_x_comoving.empty();
+  std::exception_ptr compact_target_preparation_failure;
+  try {
+    if (has_explicit_target_positions) {
+      if (accumulator.target_pos_x_comoving.size() != active_count ||
+          accumulator.target_pos_y_comoving.size() != active_count ||
+          accumulator.target_pos_z_comoving.size() != active_count) {
+        throw std::invalid_argument(
+            "TreePM independent target coordinate extents must match active count");
+      }
+    } else if (!accumulator.target_pos_y_comoving.empty() ||
+               !accumulator.target_pos_z_comoving.empty()) {
+      throw std::invalid_argument(
+          "TreePM independent target coordinate triplet must be entirely present or absent");
+    }
+    for (std::size_t i = 0; i < active_count; ++i) {
+      const TreeLocalIndex source_index = accumulator.active_particle_index[i];
+      if (!has_explicit_target_positions &&
+          static_cast<std::size_t>(source_index) >= pos_x_comoving.size()) {
+        throw std::out_of_range("TreePM active source index exceeds source count");
+      }
+      const double px = has_explicit_target_positions
+          ? accumulator.target_pos_x_comoving[i]
+          : pos_x_comoving[source_index];
+      const double py = has_explicit_target_positions
+          ? accumulator.target_pos_y_comoving[i]
+          : pos_y_comoving[source_index];
+      const double pz = has_explicit_target_positions
+          ? accumulator.target_pos_z_comoving[i]
+          : pos_z_comoving[source_index];
+      if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz)) {
+        throw std::invalid_argument("TreePM target positions must be finite");
+      }
+    }
+    if (options.enable_zoom_long_range_correction) {
+      resizeCompactSidecars(
+          m_active_zoom_corr_ax_comoving,
+          m_active_zoom_corr_ay_comoving,
+          m_active_zoom_corr_az_comoving,
+          active_count);
+      m_zoom_corr_high_water_bytes[0] = std::max(
+          m_zoom_corr_high_water_bytes[0],
+          core::ownedCapacityBytesForContainer(m_active_zoom_corr_ax_comoving));
+      m_zoom_corr_high_water_bytes[1] = std::max(
+          m_zoom_corr_high_water_bytes[1],
+          core::ownedCapacityBytesForContainer(m_active_zoom_corr_ay_comoving));
+      m_zoom_corr_high_water_bytes[2] = std::max(
+          m_zoom_corr_high_water_bytes[2],
+          core::ownedCapacityBytesForContainer(m_active_zoom_corr_az_comoving));
+      std::fill(m_active_zoom_corr_ax_comoving.begin(), m_active_zoom_corr_ax_comoving.end(), 0.0);
+      std::fill(m_active_zoom_corr_ay_comoving.begin(), m_active_zoom_corr_ay_comoving.end(), 0.0);
+      std::fill(m_active_zoom_corr_az_comoving.begin(), m_active_zoom_corr_az_comoving.end(), 0.0);
+    } else {
+      std::vector<double>().swap(m_active_zoom_corr_ax_comoving);
+      std::vector<double>().swap(m_active_zoom_corr_ay_comoving);
+      std::vector<double>().swap(m_active_zoom_corr_az_comoving);
+    }
+  } catch (...) {
+    compact_target_preparation_failure = std::current_exception();
+  }
+  coordinate_tree_pm_failure(
+      compact_target_preparation_failure, "compact PM target preparation");
+
+  const auto target_x = [&](std::size_t active_i) -> double {
+    return has_explicit_target_positions
+        ? accumulator.target_pos_x_comoving[active_i]
+        : pos_x_comoving[accumulator.active_particle_index[active_i]];
+  };
+  const auto target_y = [&](std::size_t active_i) -> double {
+    return has_explicit_target_positions
+        ? accumulator.target_pos_y_comoving[active_i]
+        : pos_y_comoving[accumulator.active_particle_index[active_i]];
+  };
+  const auto target_z = [&](std::size_t active_i) -> double {
+    return has_explicit_target_positions
+        ? accumulator.target_pos_z_comoving[active_i]
+        : pos_z_comoving[accumulator.active_particle_index[active_i]];
+  };
+
+  if (!options.short_range_only) run_pm_communication_phase(
+      GravityCommunicationArena::Phase::kPmInterpolation, [&] {
+    m_pm_solver.interpolateForces(
+        m_grid,
+        PmSolver::PmForceTargetView{
+            .active_particle_index = accumulator.active_particle_index,
+            .pos_x_comoving = has_explicit_target_positions
+                ? accumulator.target_pos_x_comoving : pos_x_comoving,
+            .pos_y_comoving = has_explicit_target_positions
+                ? accumulator.target_pos_y_comoving : pos_y_comoving,
+            .pos_z_comoving = has_explicit_target_positions
+                ? accumulator.target_pos_z_comoving : pos_z_comoving,
+            .accel_x_comoving = accumulator.accel_x_comoving,
+            .accel_y_comoving = accumulator.accel_y_comoving,
+            .accel_z_comoving = accumulator.accel_z_comoving,
+            .coordinate_layout = has_explicit_target_positions
+                ? PmSolver::PmForceCoordinateLayout::kCompactActive
+                : PmSolver::PmForceCoordinateLayout::kIndexedSource,
+            .output_layout = PmSolver::PmForceOutputLayout::kCompactActive,
+            .coordinate_source_index = has_explicit_target_positions
+                ? std::span<const TreeLocalIndex>{}
+                : accumulator.active_particle_index,
+        },
+        pm_options,
+        profile != nullptr ? &profile->pm_profile : nullptr);
+      });
+  if (!accumulator.long_range_accel_x_comoving.empty()) {
+    std::copy(accumulator.accel_x_comoving.begin(), accumulator.accel_x_comoving.end(), accumulator.long_range_accel_x_comoving.begin());
+    std::copy(accumulator.accel_y_comoving.begin(), accumulator.accel_y_comoving.end(), accumulator.long_range_accel_y_comoving.begin());
+    std::copy(accumulator.accel_z_comoving.begin(), accumulator.accel_z_comoving.end(), accumulator.long_range_accel_z_comoving.begin());
+  }
+  const double pm_force_l2_global = l2NormFromComponents(
+      accumulator.accel_x_comoving,
+      accumulator.accel_y_comoving,
+      accumulator.accel_z_comoving);
+
+  if (options.enable_zoom_long_range_correction) {
+    if (!options.zoom_focused_pm_shape.isValid()) {
+      throw std::invalid_argument("zoom_focused_pm_shape must be valid when zoom correction is enabled");
+    }
+    if (options.source_is_high_res.size() != pos_x_comoving.size()) {
+      throw std::invalid_argument("zoom source high-res mask size must match source particle count");
+    }
+    if (options.active_is_high_res.size() != accumulator.active_particle_index.size()) {
+      throw std::invalid_argument("zoom active high-res mask size must match active set");
+    }
+    std::vector<double> high_res_source_x;
+    std::vector<double> high_res_source_y;
+    std::vector<double> high_res_source_z;
+    std::vector<double> high_res_source_mass;
+    high_res_source_x.reserve(pos_x_comoving.size());
+    high_res_source_y.reserve(pos_y_comoving.size());
+    high_res_source_z.reserve(pos_z_comoving.size());
+    high_res_source_mass.reserve(mass_code.size());
+    for (std::size_t i = 0; i < pos_x_comoving.size(); ++i) {
+      if (options.source_is_high_res[i] == 0U) {
+        continue;
+      }
+      high_res_source_x.push_back(pos_x_comoving[i]);
+      high_res_source_y.push_back(pos_y_comoving[i]);
+      high_res_source_z.push_back(pos_z_comoving[i]);
+      high_res_source_mass.push_back(mass_code[i]);
+    }
+
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+    if (m_grid.slabLayout().world_size > 1) {
+      const auto gathered = allGatherParticleField(
+          m_mpi_context,
+          high_res_source_x,
+          high_res_source_y,
+          high_res_source_z,
+          high_res_source_mass,
+          options.zoom_high_res_allgather_limit_bytes,
+          &zoom_high_res_allgather_bytes);
+      high_res_source_x = std::move(gathered.x);
+      high_res_source_y = std::move(gathered.y);
+      high_res_source_z = std::move(gathered.z);
+      high_res_source_mass = std::move(gathered.m);
+      if (profile != nullptr) {
+        profile->pm_profile.bytes_moved += zoom_high_res_allgather_bytes;
+      }
+    }
+#endif
+
+    if (!high_res_source_x.empty()) {
+      std::vector<double> high_res_pm_coarse_ax(active_count, 0.0);
+      std::vector<double> high_res_pm_coarse_ay(active_count, 0.0);
+      std::vector<double> high_res_pm_coarse_az(active_count, 0.0);
+
+      // The coarse and focused PM grids can each be a dominant temporary.
+      // Interpolate the coarse contribution while its grid is live and release
+      // it before allocating the focused grid so peak memory is bounded by one
+      // correction mesh rather than their sum.
+      {
+        PmGridStorage high_res_coarse_grid(m_shape);
+        m_pm_solver.assignDensity(
+            high_res_coarse_grid,
+            high_res_source_x,
+            high_res_source_y,
+            high_res_source_z,
+            high_res_source_mass,
+            pm_options,
+            profile != nullptr ? &profile->pm_profile : nullptr);
+        if (pm_options.boundary_condition == PmBoundaryCondition::kPeriodic) {
+          m_pm_solver.solvePoissonPeriodicForcesOnly(
+              high_res_coarse_grid, pm_options, profile != nullptr ? &profile->pm_profile : nullptr);
+        } else {
+          m_pm_solver.solvePoissonIsolatedOpen(
+              high_res_coarse_grid, pm_options, profile != nullptr ? &profile->pm_profile : nullptr);
+        }
+        m_pm_solver.interpolateForces(
+            high_res_coarse_grid,
+            PmSolver::PmForceTargetView{
+                .active_particle_index = accumulator.active_particle_index,
+                .pos_x_comoving = has_explicit_target_positions
+                    ? accumulator.target_pos_x_comoving : pos_x_comoving,
+                .pos_y_comoving = has_explicit_target_positions
+                    ? accumulator.target_pos_y_comoving : pos_y_comoving,
+                .pos_z_comoving = has_explicit_target_positions
+                    ? accumulator.target_pos_z_comoving : pos_z_comoving,
+                .accel_x_comoving = high_res_pm_coarse_ax,
+                .accel_y_comoving = high_res_pm_coarse_ay,
+                .accel_z_comoving = high_res_pm_coarse_az,
+                .coordinate_layout = has_explicit_target_positions
+                    ? PmSolver::PmForceCoordinateLayout::kCompactActive
+                    : PmSolver::PmForceCoordinateLayout::kIndexedSource,
+                .output_layout = PmSolver::PmForceOutputLayout::kCompactActive,
+                .coordinate_source_index = has_explicit_target_positions
+                    ? std::span<const TreeLocalIndex>{}
+                    : accumulator.active_particle_index,
+            },
+            pm_options,
+            profile != nullptr ? &profile->pm_profile : nullptr);
+      }
+
+      const PeriodicBoxLengths box_lengths = effectivePeriodicBoxLengths(pm_options);
+      const double focused_half_extent = std::max({
+          options.zoom_region_radius_comoving,
+          options.zoom_contamination_radius_comoving,
+          options.split_policy.cutoff_radius_comoving});
+      PmSolveOptions zoom_pm_options = pm_options;
+      zoom_pm_options.boundary_condition = PmBoundaryCondition::kIsolatedOpen;
+      // The focused correction is an isolated/open convolution. Assignment-
+      // window deconvolution is currently certified only for the periodic
+      // spectral operator, so this branch must select its documented
+      // non-deconvolved isolated policy explicitly rather than inheriting the
+      // global periodic PM setting.
+      zoom_pm_options.enable_window_deconvolution = false;
+      zoom_pm_options.box_size_x_mpc_comoving = 2.0 * focused_half_extent;
+      zoom_pm_options.box_size_y_mpc_comoving = 2.0 * focused_half_extent;
+      zoom_pm_options.box_size_z_mpc_comoving = 2.0 * focused_half_extent;
+      zoom_pm_options.box_size_mpc_comoving = 2.0 * focused_half_extent;
+      PmSolver zoom_solver(options.zoom_focused_pm_shape);
+      PmGridStorage high_res_focused_grid(options.zoom_focused_pm_shape);
+      std::vector<double> focused_source_x;
+      std::vector<double> focused_source_y;
+      std::vector<double> focused_source_z;
+      std::vector<double> focused_source_mass;
+      focused_source_x.reserve(high_res_source_x.size());
+      focused_source_y.reserve(high_res_source_y.size());
+      focused_source_z.reserve(high_res_source_z.size());
+      focused_source_mass.reserve(high_res_source_mass.size());
+      for (std::size_t i = 0; i < high_res_source_x.size(); ++i) {
+        const double dx_local = (pm_options.boundary_condition == PmBoundaryCondition::kPeriodic)
+            ? minimumImageDelta(high_res_source_x[i] - options.zoom_region_center_x_comoving, box_lengths.lx)
+            : (high_res_source_x[i] - options.zoom_region_center_x_comoving);
+        const double dy_local = (pm_options.boundary_condition == PmBoundaryCondition::kPeriodic)
+            ? minimumImageDelta(high_res_source_y[i] - options.zoom_region_center_y_comoving, box_lengths.ly)
+            : (high_res_source_y[i] - options.zoom_region_center_y_comoving);
+        const double dz_local = (pm_options.boundary_condition == PmBoundaryCondition::kPeriodic)
+            ? minimumImageDelta(high_res_source_z[i] - options.zoom_region_center_z_comoving, box_lengths.lz)
+            : (high_res_source_z[i] - options.zoom_region_center_z_comoving);
+        if (std::abs(dx_local) > focused_half_extent ||
+            std::abs(dy_local) > focused_half_extent ||
+            std::abs(dz_local) > focused_half_extent) {
+          continue;
+        }
+        focused_source_x.push_back(dx_local + focused_half_extent);
+        focused_source_y.push_back(dy_local + focused_half_extent);
+        focused_source_z.push_back(dz_local + focused_half_extent);
+        focused_source_mass.push_back(high_res_source_mass[i]);
+      }
+      zoom_solver.assignDensity(
+          high_res_focused_grid,
+          focused_source_x,
+          focused_source_y,
+          focused_source_z,
+          focused_source_mass,
+          zoom_pm_options,
+          profile != nullptr ? &profile->pm_profile : nullptr);
+      zoom_solver.solvePoissonIsolatedOpen(
+          high_res_focused_grid, zoom_pm_options, profile != nullptr ? &profile->pm_profile : nullptr);
+
+      std::vector<double> focused_active_x(active_count, focused_half_extent);
+      std::vector<double> focused_active_y(active_count, focused_half_extent);
+      std::vector<double> focused_active_z(active_count, focused_half_extent);
+      for (std::size_t i = 0; i < active_count; ++i) {
+        const double dx_local = (pm_options.boundary_condition == PmBoundaryCondition::kPeriodic)
+            ? minimumImageDelta(target_x(i) - options.zoom_region_center_x_comoving, box_lengths.lx)
+            : (target_x(i) - options.zoom_region_center_x_comoving);
+        const double dy_local = (pm_options.boundary_condition == PmBoundaryCondition::kPeriodic)
+            ? minimumImageDelta(target_y(i) - options.zoom_region_center_y_comoving, box_lengths.ly)
+            : (target_y(i) - options.zoom_region_center_y_comoving);
+        const double dz_local = (pm_options.boundary_condition == PmBoundaryCondition::kPeriodic)
+            ? minimumImageDelta(target_z(i) - options.zoom_region_center_z_comoving, box_lengths.lz)
+            : (target_z(i) - options.zoom_region_center_z_comoving);
+        focused_active_x[i] = dx_local + focused_half_extent;
+        focused_active_y[i] = dy_local + focused_half_extent;
+        focused_active_z[i] = dz_local + focused_half_extent;
+      }
+      zoom_solver.interpolateForces(
+          high_res_focused_grid,
+          focused_active_x,
+          focused_active_y,
+          focused_active_z,
+          m_active_zoom_corr_ax_comoving,
+          m_active_zoom_corr_ay_comoving,
+          m_active_zoom_corr_az_comoving,
+          zoom_pm_options,
+          profile != nullptr ? &profile->pm_profile : nullptr);
+
+      for (std::size_t i = 0; i < active_count; ++i) {
+        if (options.active_is_high_res[i] == 0U) {
+          m_active_zoom_corr_ax_comoving[i] = 0.0;
+          m_active_zoom_corr_ay_comoving[i] = 0.0;
+          m_active_zoom_corr_az_comoving[i] = 0.0;
+          continue;
+        }
+        const double corr_x = m_active_zoom_corr_ax_comoving[i] - high_res_pm_coarse_ax[i];
+        const double corr_y = m_active_zoom_corr_ay_comoving[i] - high_res_pm_coarse_ay[i];
+        const double corr_z = m_active_zoom_corr_az_comoving[i] - high_res_pm_coarse_az[i];
+        m_active_zoom_corr_ax_comoving[i] = corr_x;
+        m_active_zoom_corr_ay_comoving[i] = corr_y;
+        m_active_zoom_corr_az_comoving[i] = corr_z;
+        accumulator.addToActiveSlot(i, corr_x, corr_y, corr_z);
+      }
+    }
+  }
+
+  if (profile != nullptr) {
+    profile->pm_profile.total_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - pm_phase_start).count();
+  }
+
+  // Tree owns short-range residual with the complementary real-space kernel.
+  const auto tree_start = std::chrono::steady_clock::now();
+  std::span<const double> tree_source_x = pos_x_comoving;
+  std::span<const double> tree_source_y = pos_y_comoving;
+  std::span<const double> tree_source_z = pos_z_comoving;
+  std::exception_ptr local_tree_build_failure;
+  try {
+    const auto box = effectivePeriodicBoxLengths(options.pm_options);
+    const std::array<double, 3U> box_lengths{box.lx, box.ly, box.lz};
+    const bool frame_matches = m_tree_boundary == options.pm_options.boundary_condition &&
+        m_tree_box_lengths == box_lengths &&
+        m_tree_decomposition_epoch == options.decomposition_epoch;
+    const bool uniform_softening_contract = softening_view.source_particle_epsilon_comoving.empty() &&
+        softening_view.source_particle_epsilon_override_mask.empty() &&
+        (!softening_view.species_policy.enabled || softening_view.source_species_tag.empty());
+    const bool layout_matches = options.source_layout_generation != 0U &&
+        options.source_layout_generation == m_tree_source_layout_generation;
+    const bool build_options_match =
+        short_range_options.tree_options.multipole_order == m_tree_solver.m_build_multipole_order &&
+        short_range_options.tree_options.max_leaf_size == m_tree_solver.m_build_max_leaf_size &&
+        short_range_options.tree_options.softening.kernel == m_tree_solver.m_build_softening.kernel &&
+        short_range_options.tree_options.softening.epsilon_comoving == m_tree_solver.m_build_softening.epsilon_comoving;
+    const bool reuse = options.identical_source_tree_reuse_enabled && frame_matches && layout_matches &&
+        uniform_softening_contract &&
+        m_tree_solver.canReuseIdenticalSource(pos_x_comoving.size(),
+            options.source_generation, short_range_options.tree_options);
+    std::uint64_t reason = 0U;
+    if (options.identical_source_tree_reuse_enabled || options.topology_refit_enabled) {
+      if (reuse) reason = 5U;
+      else if (!m_tree_solver.m_build_valid || m_tree_solver.m_nodes.size() == 0U) reason = 1U;
+      else if (!frame_matches) reason = 3U;
+      else if (!layout_matches) reason = 8U;
+      else if (!uniform_softening_contract || !build_options_match) reason = 4U;
+      else if (!options.source_generation.valid() ||
+          options.source_generation.value == std::numeric_limits<std::uint64_t>::max() ||
+          options.source_generation.value < m_tree_solver.m_build_source_generation.value ||
+          options.source_generation != m_tree_solver.m_build_source_generation ||
+          pos_x_comoving.size() != m_tree_solver.m_build_source_count) reason = 2U;
+    }
+    bool refitted = false;
+    bool refit_attempted = false;
+    if (!reuse && options.topology_refit_enabled && frame_matches &&
+        uniform_softening_contract && build_options_match && layout_matches &&
+        pos_x_comoving.size() == m_tree_solver.m_build_source_count &&
+        m_tree_solver.m_build_valid && m_tree_solver.m_nodes.size() != 0U && options.source_generation.valid() &&
+        options.source_generation.value != std::numeric_limits<std::uint64_t>::max() &&
+        m_tree_solver.m_build_source_generation.valid() &&
+        options.source_generation.value >= m_tree_solver.m_build_source_generation.value) {
+      refit_attempted = true;
+      const auto preprocess_start = std::chrono::steady_clock::now();
+      if (options.pm_options.boundary_condition == PmBoundaryCondition::kPeriodic) {
+        // Preserve the original unwrap frame. No periodic sorting workspace is
+        // borrowed until refit is rejected, so the old membership stays valid.
+        const auto unwrap_fixed = [](std::span<const double> in, double length,
+            double anchor, std::vector<double>& out, bool canonical) {
+          out.resize(in.size());
+          for (std::size_t row = 0U; row < in.size(); ++row) {
+            if (!std::isfinite(in[row])) throw std::invalid_argument("tree refit source is nonfinite");
+            double value = canonical ? in[row] : in[row] - length * std::floor(in[row] / length);
+            if (value >= length) value = 0.0;
+            if (value < 0.0) value += length;
+            if (value == 0.0) value = 0.0;
+            out[row] = value < anchor ? value + length : value;
+          }
+        };
+        unwrap_fixed(pos_x_comoving, box.lx, m_tree_unwrap_anchor[0], m_tree_source_x_comoving,
+            m_source_coordinate_bounds[0] >= 0.0 && m_source_coordinate_bounds[1] < box.lx);
+        unwrap_fixed(pos_y_comoving, box.ly, m_tree_unwrap_anchor[1], m_tree_source_y_comoving,
+            m_source_coordinate_bounds[2] >= 0.0 && m_source_coordinate_bounds[3] < box.ly);
+        unwrap_fixed(pos_z_comoving, box.lz, m_tree_unwrap_anchor[2], m_tree_source_z_comoving,
+            m_source_coordinate_bounds[4] >= 0.0 && m_source_coordinate_bounds[5] < box.lz);
+        tree_source_x = m_tree_source_x_comoving;
+        tree_source_y = m_tree_source_y_comoving;
+        tree_source_z = m_tree_source_z_comoving;
+      }
+      if (profile != nullptr) profile->source_preprocess_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - preprocess_start).count();
+      refitted = m_tree_solver.refitWithinOriginalLeafCells(
+          {.pos_x_comoving = tree_source_x, .pos_y_comoving = tree_source_y,
+           .pos_z_comoving = tree_source_z, .mass_code = mass_code,
+           .source_generation = options.source_generation}, short_range_options.tree_options,
+          profile != nullptr ? &profile->tree_profile : nullptr);
+      reason = refitted ? 6U : 7U; // certified motion refit / original leaf escape
+    }
+    if (!reuse && !refitted) {
+      const auto source_preprocess_start = std::chrono::steady_clock::now();
+      if (options.pm_options.boundary_condition == PmBoundaryCondition::kPeriodic) {
+        const PeriodicBoxLengths box_lengths = effectivePeriodicBoxLengths(options.pm_options);
+        const auto construction_scratch =
+            m_tree_solver.beginConstructionWorkspace(pos_x_comoving.size());
+        m_tree_unwrap_anchor[0] = unwrapPeriodicAxis(
+            pos_x_comoving, box_lengths.lx, m_tree_source_x_comoving,
+            construction_scratch.key_primary, construction_scratch.key_scratch,
+            m_source_coordinate_bounds[0] >= 0.0 && m_source_coordinate_bounds[1] < box_lengths.lx);
+        m_tree_unwrap_anchor[1] = unwrapPeriodicAxis(
+            pos_y_comoving, box_lengths.ly, m_tree_source_y_comoving,
+            construction_scratch.key_primary, construction_scratch.key_scratch,
+            m_source_coordinate_bounds[2] >= 0.0 && m_source_coordinate_bounds[3] < box_lengths.ly);
+        m_tree_unwrap_anchor[2] = unwrapPeriodicAxis(
+            pos_z_comoving, box_lengths.lz, m_tree_source_z_comoving,
+            construction_scratch.key_primary, construction_scratch.key_scratch,
+            m_source_coordinate_bounds[4] >= 0.0 && m_source_coordinate_bounds[5] < box_lengths.lz);
+        tree_source_x = m_tree_source_x_comoving;
+        tree_source_y = m_tree_source_y_comoving;
+        tree_source_z = m_tree_source_z_comoving;
+      }
+      if (profile != nullptr) {
+        profile->source_preprocess_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - source_preprocess_start).count();
+      }
+      const double rejected_validity_ms = profile != nullptr ? profile->tree_profile.topology_validity_ms : 0.0;
+      m_tree_solver.build(
+          tree_source_x,
+          tree_source_y,
+          tree_source_z,
+          mass_code,
+          short_range_options.tree_options,
+          profile != nullptr ? &profile->tree_profile : nullptr,
+          softening_view,
+          options.source_generation);
+      if (profile != nullptr) {
+        profile->tree_profile.topology_validity_ms += rejected_validity_ms;
+        profile->tree_profile.full_rebuild_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - source_preprocess_start).count();
+      }
+      m_tree_boundary = options.pm_options.boundary_condition;
+      m_tree_box_lengths = box_lengths;
+      m_tree_decomposition_epoch = options.decomposition_epoch;
+      m_tree_source_layout_generation = options.source_layout_generation;
+    }
+    if (!reuse) {
+      const auto geometry_start = std::chrono::steady_clock::now();
+      // Certify actual geometry after build/refit, including zero-mass COMs.
+      // Reuse keeps this bounded metadata with the installed node generation.
+      m_node_coordinate_bounds = {INFINITY, -INFINITY, INFINITY, -INFINITY, INFINITY, -INFINITY};
+      const auto& n = m_tree_solver.nodes();
+      const std::array<std::span<const double>, 3> center{n.center_x_comoving, n.center_y_comoving, n.center_z_comoving};
+      const std::array<std::span<const double>, 3> com{n.com_x_comoving, n.com_y_comoving, n.com_z_comoving};
+      for (std::size_t axis = 0; axis < 3U; ++axis) {
+        for (std::size_t row = 0; row < n.size(); ++row) {
+          m_node_coordinate_bounds[2U*axis] = std::min({m_node_coordinate_bounds[2U*axis], center[axis][row], com[axis][row]});
+          m_node_coordinate_bounds[2U*axis+1U] = std::max({m_node_coordinate_bounds[2U*axis+1U], center[axis][row], com[axis][row]});
+        }
+      }
+      if (profile != nullptr) {
+        profile->tree_profile.geometry_preparation_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now()-geometry_start).count();
+        if (!refitted) profile->tree_profile.full_rebuild_ms += profile->tree_profile.geometry_preparation_ms;
+      }
+    }
+    if (profile != nullptr) {
+      profile->tree_profile.refit_attempted = refit_attempted ? 1U : 0U;
+      profile->tree_profile.refit_accepted = refitted ? 1U : 0U;
+      profile->tree_profile.refit_rejected = refit_attempted && !refitted ? 1U : 0U;
+      profile->tree_profile.reuse_attempted = (options.identical_source_tree_reuse_enabled || options.topology_refit_enabled) ? 1U : 0U;
+      profile->tree_profile.reuse_accepted = (reuse || refitted) ? 1U : 0U;
+      profile->tree_profile.rebuild_reason = reason;
+      profile->tree_profile.actual_node_count = m_tree_solver.m_nodes.size();
+      profile->tree_profile.maximum_depth = m_tree_solver.maxDepth();
+      profile->tree_profile.source_identity_used_generation = options.source_generation.valid() ? 1U : 0U;
+    }
+
+  } catch (...) {
+    local_tree_build_failure = std::current_exception();
+  }
+  std::uint64_t tree_build_failure_count = local_tree_build_failure ? 1U : 0U;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  if (tree_pm_entry_world_size > 1) {
+    std::uint64_t global_tree_build_failure_count = 0U;
+    MPI_Allreduce(
+        &tree_build_failure_count,
+        &global_tree_build_failure_count,
+        1,
+        MPI_UINT64_T,
+        MPI_SUM,
+        MPI_COMM_WORLD);
+    tree_build_failure_count = global_tree_build_failure_count;
+  }
+#endif
+  if (tree_build_failure_count != 0U) {
+    if (local_tree_build_failure) {
+      std::rethrow_exception(local_tree_build_failure);
+    }
+    throw std::runtime_error(
+        "TreePM peer rank rejected periodic unwrapping or local tree build");
+  }
+  evaluateShortRangeResidual(
+      pos_x_comoving,
+      pos_y_comoving,
+      pos_z_comoving,
+      mass_code,
+      accumulator,
+      short_range_options,
+       softening_view,
+       tree_pm_uses_distributed_payload_communication,
+       profile != nullptr ? &profile->tree_profile : nullptr);
+
+  const auto tree_stop = std::chrono::steady_clock::now();
+
+  std::uint64_t empty_source_rank_count = pos_x_comoving.empty() ? 1U : 0U;
+  std::uint64_t empty_target_rank_count = active_count == 0U ? 1U : 0U;
+  if (m_grid.slabLayout().world_size > 1) {
+    empty_source_rank_count = m_mpi_context.allreduceSumUint64(empty_source_rank_count);
+    empty_target_rank_count = m_mpi_context.allreduceSumUint64(empty_target_rank_count);
+  }
+
+  if (diagnostics != nullptr) {
+    const PeriodicBoxLengths diagnostic_box_lengths = effectivePeriodicBoxLengths(options.pm_options);
+    *diagnostics = computeTreePmDiagnostics(options.split_policy);
+    diagnostics->communication_arena_capacity_bytes = m_communication_arena.capacityBytes();
+    for (const auto phase : {GravityCommunicationArena::Phase::kPmDensity,
+                            GravityCommunicationArena::Phase::kPmHalo,
+                            GravityCommunicationArena::Phase::kPmInterpolation,
+                            GravityCommunicationArena::Phase::kTreeExchange}) {
+      diagnostics->communication_arena_logical_high_water_bytes = std::max(
+          diagnostics->communication_arena_logical_high_water_bytes,
+          m_communication_arena.logicalHighWater(phase));
+    }
+    diagnostics->exported_targets_per_requested_target =
+        m_last_residual_stats.remote_targets_with_requests > 0U
+        ? static_cast<double>(m_last_residual_stats.let_exported_target_count) /
+            static_cast<double>(m_last_residual_stats.remote_targets_with_requests) : 0.0;
+    diagnostics->spatial_work_per_target = m_last_residual_stats.traversal_summary.spatial_work_per_target;
+    diagnostics->spatial_work_history_solves = m_last_residual_stats.traversal_summary.spatial_work_history_solves;
+    diagnostics->local_traversal = m_last_residual_stats.traversal_summary.local_traversal;
+    diagnostics->incoming_traversal = m_last_residual_stats.traversal_summary.incoming_traversal;
+    diagnostics->worker_region_count = m_last_residual_stats.traversal_summary.worker_region_count;
+    diagnostics->worker_targets_min = m_last_residual_stats.traversal_summary.worker_targets_min;
+    diagnostics->worker_targets_max = m_last_residual_stats.traversal_summary.worker_targets_max;
+    diagnostics->worker_visits_max = m_last_residual_stats.traversal_summary.worker_visits_max;
+    diagnostics->worker_pairs_max = m_last_residual_stats.traversal_summary.worker_pairs_max;
+    diagnostics->worker_multipoles_max = m_last_residual_stats.traversal_summary.worker_multipoles_max;
+    diagnostics->worker_work_ms_min = m_last_residual_stats.traversal_summary.worker_work_ms_min;
+    diagnostics->worker_work_ms_max = m_last_residual_stats.traversal_summary.worker_work_ms_max;
+    diagnostics->worker_work_ms_sum = m_last_residual_stats.traversal_summary.worker_work_ms_sum;
+    diagnostics->domain_geometry_source_generation =
+        m_last_residual_stats.domain_geometry_source_generation;
+    diagnostics->current_gravity_source_generation =
+        m_last_residual_stats.current_gravity_source_generation;
+    diagnostics->domain_geometry_fresh =
+        m_last_residual_stats.domain_geometry_fresh;
+    diagnostics->domain_geometry_fallback_used =
+        m_last_residual_stats.domain_geometry_fallback_used;
+    diagnostics->domain_geometry_fallback_reason =
+        m_last_residual_stats.domain_geometry_fallback_reason;
+    diagnostics->domain_geometry_uncovered_source_count =
+        m_last_residual_stats.domain_geometry_uncovered_source_count;
+    diagnostics->local_source_count = static_cast<std::uint64_t>(pos_x_comoving.size());
+    diagnostics->local_active_target_count = static_cast<std::uint64_t>(active_count);
+    diagnostics->local_tree_node_count = static_cast<std::uint64_t>(m_tree_solver.nodes().size());
+    diagnostics->pm_solve_count = perform_long_range_refresh ? 1U : 0U;
+    diagnostics->pm_reuse_count = (perform_long_range_refresh || options.short_range_only) ? 0U : 1U;
+    diagnostics->pm_halo_value_count = static_cast<std::uint64_t>(
+        2U * m_last_pm_slab_halo_exchange.halo_depth_x * m_shape.ny * m_shape.nz);
+    diagnostics->pm_local_nx = static_cast<std::uint64_t>(m_grid.slabLayout().local_nx());
+    diagnostics->pm_local_ny = static_cast<std::uint64_t>(m_shape.ny);
+    diagnostics->pm_local_nz = static_cast<std::uint64_t>(m_shape.nz);
+    diagnostics->empty_source_rank_count = empty_source_rank_count;
+    diagnostics->empty_target_rank_count = empty_target_rank_count;
+    diagnostics->zoom_high_res_allgather_bytes = zoom_high_res_allgather_bytes;
+    diagnostics->zoom_high_res_allgather_limit_bytes = options.zoom_high_res_allgather_limit_bytes;
+    diagnostics->residual_pruned_nodes = m_last_residual_stats.pruned_nodes;
+    diagnostics->residual_pair_skips_cutoff = m_last_residual_stats.pair_skips_cutoff;
+    diagnostics->residual_pair_evaluations = m_last_residual_stats.pair_evaluations;
+    diagnostics->local_pair_evaluations = m_last_residual_stats.local_pair_evaluations;
+    diagnostics->incoming_remote_pair_evaluations =
+        m_last_residual_stats.incoming_remote_pair_evaluations;
+    diagnostics->residual_remote_request_packets = m_last_residual_stats.remote_request_packets;
+    diagnostics->residual_remote_response_packets = m_last_residual_stats.remote_response_packets;
+    diagnostics->residual_remote_request_bytes = m_last_residual_stats.remote_request_bytes;
+    diagnostics->residual_remote_response_bytes = m_last_residual_stats.remote_response_bytes;
+    diagnostics->residual_remote_request_batches = m_last_residual_stats.remote_request_batches;
+    diagnostics->residual_remote_peer_participations = m_last_residual_stats.remote_peer_participations;
+    diagnostics->residual_remote_targets_with_requests = m_last_residual_stats.remote_targets_with_requests;
+    diagnostics->residual_remote_targets_without_requests = m_last_residual_stats.remote_targets_without_requests;
+    diagnostics->residual_remote_pairs_pruned_by_bounds = m_last_residual_stats.remote_pairs_pruned_by_bounds;
+    diagnostics->openmp_compiled = core::openMpRuntimeInfo().compiled ? 1U : 0U;
+    const core::OpenMpRuntimeInfo residual_openmp_info = core::openMpRuntimeInfo();
+    const std::uint64_t planned_openmp_workers =
+        residual_openmp_info.compiled
+            ? static_cast<std::uint64_t>(std::max(
+                  1,
+                  std::max(residual_openmp_info.configured_threads,
+                           residual_openmp_info.maximum_threads)))
+            : 1U;
+    diagnostics->openmp_configured_workers = planned_openmp_workers;
+     diagnostics->openmp_observed_workers =
+         m_last_residual_stats.openmp_observed_workers > 0U
+             ? m_last_residual_stats.openmp_observed_workers
+             : 1U;
+
+    diagnostics->residual_local_target_count =
+        static_cast<std::uint64_t>(accumulator.active_particle_index.size());
+    diagnostics->residual_incoming_target_count =
+        m_last_residual_stats.incoming_remote_target_evaluations;
+    diagnostics->residual_worker_scratch_high_water_bytes = m_worker_stack_high_water_bytes;
+    diagnostics->residual_remote_request_packets_max_peer = m_last_residual_stats.remote_request_packets_max_peer;
+    diagnostics->residual_remote_response_packets_max_peer = m_last_residual_stats.remote_response_packets_max_peer;
+    diagnostics->residual_remote_request_packet_imbalance_ratio =
+        m_last_residual_stats.remote_request_packet_imbalance_ratio;
+    diagnostics->remote_hierarchy_packet_count = m_last_residual_stats.remote_hierarchy_packets;
+    diagnostics->communicating_peer_count = m_last_residual_stats.communicating_peer_count;
+    diagnostics->top_level_domain_leaf_count = m_last_residual_stats.top_level_domain_leaf_count;
+    diagnostics->authoritative_domain_leaf_count = m_last_residual_stats.authoritative_domain_leaf_count;
+    diagnostics->domain_hierarchy_node_count = m_last_residual_stats.domain_hierarchy_node_count;
+    diagnostics->domain_cache_hit_count = m_last_residual_stats.domain_cache_hit_count;
+    diagnostics->domain_cache_miss_count = m_last_residual_stats.domain_cache_miss_count;
+    diagnostics->graph_cache_hit_count = m_last_residual_stats.graph_cache_hit_count;
+    diagnostics->graph_cache_miss_count = m_last_residual_stats.graph_cache_miss_count;
+    diagnostics->let_candidate_peer_count = m_last_residual_stats.let_candidate_peer_count;
+    diagnostics->let_exported_target_count = m_last_residual_stats.let_exported_target_count;
+    diagnostics->let_imported_target_count = m_last_residual_stats.let_imported_target_count;
+    diagnostics->let_wire_bytes_sent = m_last_residual_stats.let_wire_bytes_sent;
+    diagnostics->let_wire_bytes_received = m_last_residual_stats.let_wire_bytes_received;
+    diagnostics->let_high_water_bytes = m_last_residual_stats.let_high_water_bytes;
+    diagnostics->let_wire_buffer_high_water_bytes =
+        m_last_residual_stats.let_wire_buffer_high_water_bytes;
+    diagnostics->let_known_workspace_high_water_bytes =
+        m_last_residual_stats.let_known_workspace_high_water_bytes;
+    diagnostics->let_discovery_ms = m_last_residual_stats.let_discovery_ms;
+    diagnostics->let_graph_setup_ms = m_last_residual_stats.let_graph_setup_ms;
+    diagnostics->let_communication_ms = m_last_residual_stats.let_communication_ms;
+    diagnostics->let_overlap_local_work_ms = m_last_residual_stats.let_overlap_local_work_ms;
+    diagnostics->let_communication_wait_ms = m_last_residual_stats.let_communication_wait_ms;
+    diagnostics->let_overlap_efficiency = m_last_residual_stats.let_overlap_efficiency;
+    diagnostics->let_remote_traversal_ms = m_last_residual_stats.let_remote_traversal_ms;
+    diagnostics->incoming_request_decode_validation_ms =
+        m_last_residual_stats.incoming_request_decode_validation_ms;
+    diagnostics->incoming_remote_target_compute_ms =
+        m_last_residual_stats.incoming_remote_target_compute_ms;
+    diagnostics->incoming_response_encode_pack_ms =
+        m_last_residual_stats.incoming_response_encode_pack_ms;
+    diagnostics->protocol_validation_ms = m_last_residual_stats.protocol_validation_ms;
+    diagnostics->protocol_consensus_ms = m_last_residual_stats.protocol_consensus_ms;
+    diagnostics->response_exchange_ms = m_last_residual_stats.response_exchange_ms;
+    diagnostics->force_l2_pm_global = pm_force_l2_global;
+    diagnostics->force_l2_pm_zoom_correction = l2NormFromComponents(
+        m_active_zoom_corr_ax_comoving,
+        m_active_zoom_corr_ay_comoving,
+        m_active_zoom_corr_az_comoving);
+    double total_sq = 0.0;
+    for (std::size_t i = 0; i < active_count; ++i) {
+      const double total_x = accumulator.accel_x_comoving[i];
+      const double total_y = accumulator.accel_y_comoving[i];
+      const double total_z = accumulator.accel_z_comoving[i];
+      total_sq += total_x * total_x + total_y * total_y + total_z * total_z;
+    }
+    diagnostics->force_l2_tree_short_range = std::sqrt(
+        m_last_residual_stats.local_short_range_sum_sq +
+        m_last_residual_stats.remote_short_range_sum_sq);
+    diagnostics->force_l2_tree_short_range_local = std::sqrt(m_last_residual_stats.local_short_range_sum_sq);
+    diagnostics->force_l2_tree_short_range_remote = std::sqrt(m_last_residual_stats.remote_short_range_sum_sq);
+    diagnostics->force_l2_total = std::sqrt(total_sq);
+    if (m_tree_solver.nodes().size() > 0U) {
+      diagnostics->tree_root_half_size_comoving = m_tree_solver.nodes().half_size_comoving.front();
+      diagnostics->tree_root_com_x_comoving = m_tree_solver.nodes().com_x_comoving.front();
+      diagnostics->tree_root_com_y_comoving = m_tree_solver.nodes().com_y_comoving.front();
+      diagnostics->tree_root_com_z_comoving = m_tree_solver.nodes().com_z_comoving.front();
+    }
+    for (std::size_t i = 0; i < options.source_is_high_res.size(); ++i) {
+      if (options.source_is_high_res[i] != 0U) {
+        ++diagnostics->zoom_high_res_source_count;
+      } else {
+        ++diagnostics->zoom_low_res_source_count;
+        const double dx = minimumImageDelta(
+            pos_x_comoving[i] - options.zoom_region_center_x_comoving,
+            diagnostic_box_lengths.lx);
+        const double dy = minimumImageDelta(
+            pos_y_comoving[i] - options.zoom_region_center_y_comoving,
+            diagnostic_box_lengths.ly);
+        const double dz = minimumImageDelta(
+            pos_z_comoving[i] - options.zoom_region_center_z_comoving,
+            diagnostic_box_lengths.lz);
+        const double r = norm3(dx, dy, dz);
+        if (r <= options.zoom_contamination_radius_comoving) {
+          ++diagnostics->zoom_low_res_contamination_count;
+          diagnostics->zoom_low_res_contamination_mass_code += mass_code[i];
+        }
+      }
+    }
+  }
+
+  if (profile != nullptr) {
+    profile->tree_short_range_ms += std::chrono::duration<double, std::milli>(tree_stop - tree_start).count();
+    profile->let_discovery_ms += m_last_residual_stats.let_discovery_ms;
+    profile->let_graph_setup_ms += m_last_residual_stats.let_graph_setup_ms;
+    profile->let_communication_ms += m_last_residual_stats.let_communication_ms;
+    profile->let_overlap_local_work_ms += m_last_residual_stats.let_overlap_local_work_ms;
+    profile->let_communication_wait_ms += m_last_residual_stats.let_communication_wait_ms;
+    profile->let_overlap_efficiency = m_last_residual_stats.let_overlap_efficiency;
+    profile->remote_traversal_ms += m_last_residual_stats.let_remote_traversal_ms;
+    profile->incoming_request_decode_validation_ms +=
+        m_last_residual_stats.incoming_request_decode_validation_ms;
+    profile->incoming_remote_target_compute_ms +=
+        m_last_residual_stats.incoming_remote_target_compute_ms;
+    profile->incoming_response_encode_pack_ms +=
+        m_last_residual_stats.incoming_response_encode_pack_ms;
+    profile->protocol_validation_ms += m_last_residual_stats.protocol_validation_ms;
+    profile->protocol_consensus_ms += m_last_residual_stats.protocol_consensus_ms;
+    profile->response_exchange_ms += m_last_residual_stats.response_exchange_ms;
+    profile->coupling_overhead_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  }
+}
+
+void TreePmCoordinator::evaluateShortRangeResidual(
+    std::span<const double> pos_x_comoving,
+    std::span<const double> pos_y_comoving,
+    std::span<const double> pos_z_comoving,
+    std::span<const double> mass_code,
+    const TreePmForceAccumulatorView& accumulator,
+    const TreePmOptions& options,
+     const TreeSofteningView& softening_view,
+     bool distributed_payload_communication_required,
+     TreeGravityProfile* tree_profile) {
+
+  ResidualTraversalCounters local_owned_targets;
+  ResidualTraversalCounters incoming_remote_targets;
+  m_last_residual_stats = {};
+
+  const bool has_explicit_target_positions = !accumulator.target_pos_x_comoving.empty();
+  const auto target_x = [&](std::size_t active_i) -> double {
+    return has_explicit_target_positions
+        ? accumulator.target_pos_x_comoving[active_i]
+        : pos_x_comoving[accumulator.active_particle_index[active_i]];
+  };
+  const auto target_y = [&](std::size_t active_i) -> double {
+    return has_explicit_target_positions
+        ? accumulator.target_pos_y_comoving[active_i]
+        : pos_y_comoving[accumulator.active_particle_index[active_i]];
+  };
+  const auto target_z = [&](std::size_t active_i) -> double {
+    return has_explicit_target_positions
+        ? accumulator.target_pos_z_comoving[active_i]
+        : pos_z_comoving[accumulator.active_particle_index[active_i]];
+  };
+
+  const auto traversal_start = std::chrono::steady_clock::now();
+  const std::size_t k_residual_block_size = options.residual_block_size;
+
+  const TreeNodeSoa& nodes = m_tree_solver.nodes();
+  const TreeMortonOrdering& ordering = m_tree_solver.ordering();
+  const PeriodicBoxLengths box_lengths = options.pm_options.boundary_condition == PmBoundaryCondition::kPeriodic
+      ? effectivePeriodicBoxLengths(options.pm_options)
+      : PeriodicBoxLengths{};
+  const double cutoff_radius_comoving = options.split_policy.cutoff_radius_comoving;
+  const double cutoff_radius2_comoving = cutoff_radius_comoving * cutoff_radius_comoving;
+  if (!softening_view.source_particle_epsilon_comoving.empty() &&
+      softening_view.source_particle_epsilon_comoving.size() != pos_x_comoving.size()) {
+    throw std::invalid_argument("TreePM source softening sidecar size must match source particle count");
+  }
+  if (!softening_view.source_particle_epsilon_override_mask.empty() &&
+      softening_view.source_particle_epsilon_override_mask.size() != pos_x_comoving.size()) {
+    throw std::invalid_argument("TreePM source softening override mask size must match source particle count");
+  }
+  if (!softening_view.source_species_tag.empty() && softening_view.source_species_tag.size() != pos_x_comoving.size()) {
+    throw std::invalid_argument("TreePM source species sidecar size must match source particle count");
+  }
+  if (!softening_view.target_particle_epsilon_comoving.empty() &&
+      softening_view.target_particle_epsilon_comoving.size() != accumulator.active_particle_index.size()) {
+    throw std::invalid_argument("TreePM target softening sidecar size must match active-set size");
+  }
+  if (!softening_view.target_particle_epsilon_override_mask.empty() &&
+      softening_view.target_particle_epsilon_override_mask.size() != accumulator.active_particle_index.size()) {
+    throw std::invalid_argument("TreePM target softening override mask size must match active-set size");
+  }
+  if (!softening_view.target_species_tag.empty() &&
+      softening_view.target_species_tag.size() != accumulator.active_particle_index.size()) {
+    throw std::invalid_argument("TreePM target species sidecar size must match active-set size");
+  }
+  int tree_mpi_world_size = 1;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  int tree_mpi_world_rank = 0;
+  queryActiveMpiWorld(tree_mpi_world_size, tree_mpi_world_rank);
+#else
+  static_cast<void>(distributed_payload_communication_required);
+  static_cast<void>(tree_mpi_world_size);
+#endif
+
+  // Consume the immutable build-time representation directly. Homogeneous
+  // DMO keeps one scalar; heterogeneous source policies retain the exact lane.
+  // The residual hot path never re-enters throwing resolvers.
+  const ResolvedSourceSofteningView source_softening =
+      m_tree_solver.resolvedSourceSoftening();
+  if (!source_softening.validForSourceCount(pos_x_comoving.size())) {
+    throw std::invalid_argument(
+        "TreePM residual source softening representation does not match the tree source count");
+  }
+  const bool uniform_source_softening = source_softening.isUniform();
+  const double* source_softening_base = uniform_source_softening
+      ? &source_softening.uniform_epsilon_comoving
+      : source_softening.materialized_epsilon_comoving.data();
+  const std::size_t source_softening_stride =
+      uniform_source_softening ? 0U : 1U;
+
+  const std::uint32_t tree_max_depth = m_tree_solver.maxDepth();
+  if (tree_max_depth > kMaximumTreeDepth) {
+    throw std::logic_error("TreePM residual tree depth exceeds the builder contract");
+  }
+  const std::size_t stack_slots_per_worker =
+      1U + 7U * static_cast<std::size_t>(tree_max_depth);
+  const core::OpenMpRuntimeInfo openmp_info = core::openMpRuntimeInfo();
+  const int configured_workers =
+      std::max(1, openmp_info.configured_threads);
+  std::size_t worker_count = static_cast<std::size_t>(configured_workers);
+  if (!openmp_info.compiled) {
+    worker_count = 1U;
+  } else {
+    worker_count = std::max(
+        worker_count,
+        static_cast<std::size_t>(std::max(1, openmp_info.maximum_threads)));
+  }
+  const std::size_t required_stack_slots = core::checkedSizeMultiply(
+      worker_count, stack_slots_per_worker,
+      "TreePM residual worker stack slot count");
+  const std::size_t target_count = accumulator.active_particle_index.size();
+  const std::size_t required_block_count =
+      (target_count + k_residual_block_size - 1U) / k_residual_block_size;
+  bool leaf_staging_active = options.leaf_simd_enabled && uniform_source_softening && nodes.size() != 0U;
+  bool leaf_avx2 = false;
+  bool group_walk_active = false;
+  std::exception_ptr traversal_workspace_failure;
+  try {
+    if (!leaf_staging_active || m_worker_leaf_capacity < worker_count) {
+      m_worker_leaf_storage.reset();
+      m_worker_leaf_commitment = {};
+      m_worker_leaf_capacity = 0U;
+    }
+    if (leaf_staging_active && !m_worker_leaf_storage) {
+      try {
+        const auto bytes = core::checkedSizeMultiply(worker_count, sizeof(TreePmLeafScratch), "TreePM leaf scratch");
+        auto reservation = m_memory_governor != nullptr
+            ? m_memory_governor->reserve(core::MemoryClass::kPersistentCache, bytes, "treepm.worker_leaf_scratch")
+            : core::MemoryReservation{};
+        auto storage = std::make_unique<TreePmLeafScratch[]>(worker_count);
+        if (reservation.valid()) reservation.commit();
+        m_worker_leaf_storage = std::move(storage);
+        m_worker_leaf_capacity = worker_count;
+        m_worker_leaf_commitment = std::move(reservation);
+      } catch (const core::MemoryAdmissionError&) { leaf_staging_active = false; }
+        catch (const std::bad_alloc&) { leaf_staging_active = false; }
+    }
+    leaf_avx2 = leaf_staging_active && internal::treePmLeafAvx2Available();
+    if (!options.full_residual_lookup_enabled) {
+      m_residual_table.reset();
+      m_residual_table_commitment = {};
+    } else if (uniform_source_softening && nodes.size() != 0U) {
+      const double epsilon = combineSofteningPairEpsilonUnchecked(
+          source_softening.uniform_epsilon_comoving, source_softening.uniform_epsilon_comoving);
+      const double a = options.split_policy.split_scale_comoving;
+      const double cutoff = options.split_policy.cutoff_radius_comoving;
+      if (m_residual_table && !m_residual_table->matches(epsilon, a, cutoff)) {
+        // Release before replacement; no two tables coexist under a tight budget.
+        m_residual_table.reset();
+        m_residual_table_commitment = {};
+      }
+      if (!m_residual_table && TreePmResidualCoefficientTable::eligible(epsilon, a, cutoff)) {
+        try {
+          auto reservation = m_memory_governor != nullptr
+              ? m_memory_governor->reserve(core::MemoryClass::kPersistentCache,
+                  sizeof(TreePmResidualCoefficientTable), "treepm.full_residual_table")
+              : core::MemoryReservation{};
+          auto table = std::make_unique<const TreePmResidualCoefficientTable>(epsilon, a, cutoff);
+          if (reservation.valid()) reservation.commit();
+          m_residual_table = std::move(table);
+          m_residual_table_commitment = std::move(reservation);
+        } catch (const core::MemoryAdmissionError&) {
+          // Optional acceleration: identical analytic force law at lower memory.
+        } catch (const std::bad_alloc&) {
+        }
+      }
+    } else {
+      m_residual_table.reset();
+      m_residual_table_commitment = {};
+    }
+    if (options.gaussian_pair_lookup_enabled && !m_gaussian_table) {
+      auto reservation = m_memory_governor != nullptr
+          ? m_memory_governor->reserve(core::MemoryClass::kPersistentCache,
+              sizeof(TreePmGaussianCoefficientTable), "treepm.gaussian_pair_table")
+          : core::MemoryReservation{};
+      auto table = std::make_unique<const TreePmGaussianCoefficientTable>();
+      if (reservation.valid()) reservation.commit();
+      m_gaussian_table = std::move(table);
+      m_gaussian_table_commitment = std::move(reservation);
+    }
+    if (m_worker_stack_storage.size() < required_stack_slots) {
+      m_worker_stack_storage.resize(required_stack_slots, 0U);
+    }
+    m_worker_stack_high_water_bytes = std::max<std::uint64_t>(
+        m_worker_stack_high_water_bytes,
+        core::ownedCapacityBytesForContainer(m_worker_stack_storage));
+    if (m_worker_counter_storage.size() < worker_count) {
+      m_worker_counter_storage.resize(worker_count);
+    }
+    m_worker_counter_high_water_bytes = std::max<std::uint64_t>(
+        m_worker_counter_high_water_bytes,
+        core::ownedCapacityBytesForContainer(m_worker_counter_storage));
+    if (options.spatial_work_history_enabled) {
+      if (m_worker_spatial_counter_storage.size() < worker_count) {
+        m_worker_spatial_counter_storage.resize(worker_count);
+      }
+      std::fill(
+          m_worker_spatial_counter_storage.begin(), m_worker_spatial_counter_storage.end(),
+          ResidualSpatialWorkCounters{});
+      m_worker_spatial_counter_high_water_bytes = std::max<std::uint64_t>(
+          m_worker_spatial_counter_high_water_bytes,
+          core::ownedCapacityBytesForContainer(m_worker_spatial_counter_storage));
+    }
+    if (m_block_sum_sq_storage.size() < required_block_count) {
+      m_block_sum_sq_storage.resize(required_block_count, 0.0);
+    }
+    m_block_sum_sq_high_water_bytes = std::max<std::uint64_t>(
+        m_block_sum_sq_high_water_bytes,
+        core::ownedCapacityBytesForContainer(m_block_sum_sq_storage));
+    // Leaves address contiguous tree-order ranges, so a tree-order copy of
+    // the source lanes turns every leaf visit into a sequential read instead
+    // of a gather through sorted_particle_index. Values are copied verbatim,
+    // so pair arithmetic and summation order are unchanged.
+    const std::size_t ordered_count = ordering.sorted_particle_index.size();
+    if (nodes.size() != 0U && ordered_count != pos_x_comoving.size()) {
+      throw std::logic_error("TreePM residual tree ordering does not cover the source population");
+    }
+    m_tree_ordered_source_x_comoving.resize(ordered_count);
+    m_tree_ordered_source_y_comoving.resize(ordered_count);
+    m_tree_ordered_source_z_comoving.resize(ordered_count);
+    m_tree_ordered_source_mass_code.resize(ordered_count);
+    m_tree_order_position_by_row.resize(ordered_count);
+    const auto* order = ordering.sorted_particle_index.data();
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(ordered_count); ++i) {
+      const auto row = order[i];
+      m_tree_ordered_source_x_comoving[static_cast<std::size_t>(i)] = pos_x_comoving[row];
+      m_tree_ordered_source_y_comoving[static_cast<std::size_t>(i)] = pos_y_comoving[row];
+      m_tree_ordered_source_z_comoving[static_cast<std::size_t>(i)] = pos_z_comoving[row];
+      m_tree_ordered_source_mass_code[static_cast<std::size_t>(i)] = mass_code[row];
+      m_tree_order_position_by_row[row] = static_cast<std::uint32_t>(i);
+    }
+    // Visit local targets in tree order so consecutive targets in a block
+    // share node and leaf cache lines. Each active slot still has exactly one
+    // writer and its own unchanged walk, so per-target forces are unaffected.
+    m_target_visit_order.resize(target_count);
+    std::iota(m_target_visit_order.begin(), m_target_visit_order.end(), 0U);
+    if (nodes.size() != 0U) {
+      const auto visit_key = [&](std::uint32_t active_i) -> std::uint64_t {
+        const auto row = accumulator.active_particle_index[active_i];
+        return row < ordered_count ? m_tree_order_position_by_row[row]
+                                   : std::numeric_limits<std::uint64_t>::max();
+      };
+      std::stable_sort(m_target_visit_order.begin(), m_target_visit_order.end(),
+          [&](std::uint32_t lhs, std::uint32_t rhs) { return visit_key(lhs) < visit_key(rhs); });
+    }
+    // Group walk eligibility (see tree_pm_group_walk.hpp). The Gaussian table
+    // must cover every in-cutoff pair: t = (r_cut / 2 r_s)^2 < 64.
+    const double group_walk_t_cut = (0.25 * cutoff_radius2_comoving /
+        options.split_policy.split_scale_comoving) / options.split_policy.split_scale_comoving;
+    group_walk_active = options.group_walk_enabled && nodes.size() != 0U &&
+        options.acceptance_policy == TreePmAcceptancePolicy::kAdaptiveRelative &&
+        options.adaptive_error_estimator == TreePmAdaptiveErrorEstimator::kRelativeMonopole &&
+        uniform_source_softening && m_gaussian_table != nullptr &&
+        options.gaussian_pair_lookup_enabled && !options.leaf_simd_enabled &&
+        !options.full_residual_lookup_enabled && !options.spatial_work_history_enabled &&
+        std::isfinite(group_walk_t_cut) && group_walk_t_cut < 63.0;
+    if (group_walk_active) {
+      m_leaf_of_tree_position.assign(ordered_count, kInvalidTreeLocalIndex);
+      for (std::size_t node = 0; node < nodes.size(); ++node) {
+        if (nodes.child_count[node] != 0U) continue;
+        const std::size_t begin = nodes.particle_begin[node];
+        const std::size_t end = begin + nodes.particle_count[node];
+        for (std::size_t position = begin; position < end && position < ordered_count; ++position) {
+          m_leaf_of_tree_position[position] = static_cast<TreeLocalIndex>(node);
+        }
+      }
+      if (m_worker_group_scratch.size() < worker_count) m_worker_group_scratch.resize(worker_count);
+    }
+  } catch (...) {
+    traversal_workspace_failure = std::current_exception();
+  }
+  std::uint64_t traversal_workspace_failure_count =
+      traversal_workspace_failure ? 1U : 0U;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  if (tree_mpi_world_size > 1) {
+    std::uint64_t global_traversal_workspace_failure_count = 0U;
+    MPI_Allreduce(
+        &traversal_workspace_failure_count,
+        &global_traversal_workspace_failure_count,
+        1,
+        MPI_UINT64_T,
+        MPI_SUM,
+        MPI_COMM_WORLD);
+    traversal_workspace_failure_count =
+        global_traversal_workspace_failure_count;
+  }
+#endif
+  if (traversal_workspace_failure_count != 0U) {
+    if (traversal_workspace_failure) {
+      std::rethrow_exception(traversal_workspace_failure);
+    }
+    throw std::runtime_error(
+        "TreePM peer rank rejected residual traversal workspace preparation");
+  }
+
+  const auto* gaussian_table = options.gaussian_pair_lookup_enabled ? m_gaussian_table.get() : nullptr;
+  const double split_scale = options.split_policy.split_scale_comoving;
+  const double inverse_2a_squared = (0.25/split_scale)/split_scale;
+  const double inverse_8a_cubed = ((0.125/split_scale)/split_scale)/split_scale;
+  const bool lookup_scaling_representable = std::isnormal(inverse_2a_squared) &&
+      std::isnormal(inverse_8a_cubed);
+  const auto worker_stack = [&](std::size_t worker_slot) -> BoundedTreeStack {
+    return BoundedTreeStack{
+        .data = m_worker_stack_storage.data() + worker_slot * stack_slots_per_worker,
+        .capacity = stack_slots_per_worker,
+        .size = 0,
+    };
+  };
+  const auto current_worker_slot = [worker_count]() noexcept -> std::size_t {
+#if COSMOSIM_HAVE_OPENMP
+    const int thread_id = omp_get_thread_num();
+    if (thread_id >= 0 && static_cast<std::size_t>(thread_id) < worker_count) {
+      return static_cast<std::size_t>(thread_id);
+    }
+    return 0U;
+#else
+    static_cast<void>(worker_count);
+    return 0U;
+#endif
+  };
+
+  const ValidatedTargetSofteningView validated_target_softening{
+      .target_epsilon_comoving = softening_view.target_particle_epsilon_comoving,
+      .target_override_mask = softening_view.target_particle_epsilon_override_mask,
+      .target_species_tag = softening_view.target_species_tag,
+      .resolved_source_softening = source_softening,
+      .source_species_tag = softening_view.source_species_tag,
+      .fallback = options.tree_options.softening,
+      .species_policy_enabled = softening_view.species_policy.enabled,
+      .species_epsilon_comoving = softening_view.species_policy.epsilon_comoving_by_species,
+  };
+  {
+    std::exception_ptr softening_prevalidation_failure;
+    try {
+      for (std::size_t active_i = 0; active_i < target_count; ++active_i) {
+        const TreeLocalIndex particle_index =
+            accumulator.active_particle_index[active_i];
+        const bool has_local_source_identity =
+            particle_index < pos_x_comoving.size();
+        if (!has_local_source_identity &&
+            ((softening_view.target_particle_epsilon_comoving.empty() &&
+              !softening_view.source_particle_epsilon_comoving.empty()) ||
+             (softening_view.target_species_tag.empty() &&
+              !softening_view.source_species_tag.empty()))) {
+          throw std::invalid_argument(
+              "TreePM independent targets require target-owned softening/species sidecars when source sidecars are present");
+        }
+        const double checked_softening = targetSofteningEpsilonUnchecked(
+            active_i,
+            has_local_source_identity ? particle_index : 0U,
+            validated_target_softening);
+        if (!std::isfinite(checked_softening) || checked_softening < 0.0) {
+          throw std::invalid_argument(
+              "TreePM target softening resolution must be finite and non-negative");
+        }
+      }
+    } catch (...) {
+      softening_prevalidation_failure = std::current_exception();
+    }
+    std::uint64_t softening_failure_count =
+        softening_prevalidation_failure ? 1U : 0U;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+    if (tree_mpi_world_size > 1) {
+      std::uint64_t global_softening_failure_count = 0U;
+      MPI_Allreduce(
+          &softening_failure_count,
+          &global_softening_failure_count,
+          1,
+          MPI_UINT64_T,
+          MPI_SUM,
+          MPI_COMM_WORLD);
+      softening_failure_count = global_softening_failure_count;
+    }
+#endif
+    if (softening_failure_count != 0U) {
+      if (softening_prevalidation_failure) {
+        std::rethrow_exception(softening_prevalidation_failure);
+      }
+      throw std::runtime_error(
+          "TreePM peer rank rejected residual softening prevalidation");
+    }
+  }
+
+  // Worker-safe residual evaluator. Shared mutable state is limited to the
+  // immutable tree/source/softening lanes, the caller-owned hot counters,
+  // optional spatial scratch, and the caller-owned bounded stack. Opening MAC,
+  // 0.08 screened-quadrupole envelope, cutoff, softening combine rule, and
+  // child order follow the same deterministic contract on every worker.
+  const bool round_to_nearest = std::fegetround() == FE_TONEAREST;
+  const bool com_distance_cutoff =
+      options.acceptance_policy == TreePmAcceptancePolicy::kAdaptiveRelative &&
+      options.cutoff_node_policy == TreePmCutoffNodePolicy::kComDistance;
+  const double* const ordered_x = m_tree_ordered_source_x_comoving.data();
+  const double* const ordered_y = m_tree_ordered_source_y_comoving.data();
+  const double* const ordered_z = m_tree_ordered_source_z_comoving.data();
+  const double* const ordered_mass = m_tree_ordered_source_mass_code.data();
+  std::uint64_t incoming_evaluated_target_count = 0;
+  int observed_openmp_workers = 1;
+  auto evaluateTargetAgainstLocalTree = [&](
+                                         ResidualTraversalCounters& counters,
+                                         ResidualSpatialWorkCounters* spatial_counters,
+                                         BoundedTreeStack& stack,
+                                         double px,
+                                         double py,
+                                         double pz,
+                                         TreeLocalIndex self_index,
+                                         bool skip_self,
+                                         double target_softening_comoving,
+                                         bool previous_acceleration_available,
+                                         double previous_acceleration_magnitude_code) {
+    ++counters.targets;
+    const std::uint64_t visits_begin = spatial_counters != nullptr ? counters.visited_nodes : 0U;
+    const std::uint64_t pairs_begin = spatial_counters != nullptr ? counters.direct_pair_evaluations : 0U;
+
+    double ax = 0.0;
+    // Squared separation of the nearest distinct direct-summed source inside
+    // r_cut (encounter timestep input); +infinity when none.
+    double nearest_pair_r2 = std::numeric_limits<double>::infinity();
+    if (nodes.size() == 0) {
+      return std::array<double, 4>{0.0, 0.0, 0.0, nearest_pair_r2};
+    }
+    double ay = 0.0;
+    double az = 0.0;
+    // A uniform source representation alone does not certify target softening.
+    const auto* residual_table = uniform_source_softening &&
+        target_softening_comoving == source_softening.uniform_epsilon_comoving
+        ? m_residual_table.get() : nullptr;
+    counters.residual_lookup_targets += residual_table != nullptr;
+    counters.simd_leaf_targets += leaf_avx2;
+    const std::array<double, 3> target{px, py, pz};
+    const std::array<double, 3> lengths{box_lengths.lx, box_lengths.ly, box_lengths.lz};
+    std::array<internal::TreePmPeriodicMetric, 3> source_metric, node_metric;
+    for (std::size_t axis = 0; axis < 3U; ++axis) {
+      source_metric[axis] = internal::treePmPeriodicMetric(m_source_coordinate_bounds[2U*axis],
+          m_source_coordinate_bounds[2U*axis+1U], target[axis], lengths[axis], round_to_nearest);
+      node_metric[axis] = internal::treePmPeriodicMetric(m_node_coordinate_bounds[2U*axis],
+          m_node_coordinate_bounds[2U*axis+1U], target[axis], lengths[axis], round_to_nearest);
+    }
+    stack.clear();
+    stack.push_back(0U);
+
+    while (!stack.empty()) {
+      const TreeLocalIndex node_index = stack.back();
+      stack.pop_back();
+      ++counters.visited_nodes;
+
+      const double half_size = nodes.half_size_comoving[node_index];
+      const double node_dx = node_metric[0](nodes.center_x_comoving[node_index] - px);
+      const double node_dy = node_metric[1](nodes.center_y_comoving[node_index] - py);
+      const double node_dz = node_metric[2](nodes.center_z_comoving[node_index] - pz);
+      const internal::TreePmAabbDistances geometry(node_dx, node_dy, node_dz, half_size);
+      if (!internal::treePmSquaredDistanceWithinCutoff(
+              geometry.minimum_squared, cutoff_radius_comoving, cutoff_radius2_comoving)) {
+        ++counters.cutoff_pruned_nodes;
+        if (!skip_self) ++counters.remote_pairs_pruned_by_bounds;
+        continue;
+      }
+      const bool is_leaf = nodes.child_count[node_index] == 0;
+      // Leaves always evaluate their individual pairs: COM/MAC/containment
+      // geometry cannot affect that decision and is unnecessary there.
+      double dx = 0.0, dy = 0.0, dz = 0.0;
+      bool accept = is_leaf;
+      if (!is_leaf) {
+        const bool target_inside_node =
+            (skip_self || options.acceptance_policy == TreePmAcceptancePolicy::kAdaptiveRelative) &&
+            internal::targetInsideNodeAabbFromCenterDelta(node_dx, node_dy, node_dz, half_size);
+        // kComDistance lets a straddling node reach the MAC; it is evaluated
+        // (or skipped beyond r_cut) at its COM distance below.
+        const bool node_within_cutoff = com_distance_cutoff ||
+            internal::treePmSquaredDistanceWithinCutoff(
+                geometry.maximumSquared(half_size), cutoff_radius_comoving, cutoff_radius2_comoving);
+        if (!options.full_mac_diagnostics && (target_inside_node || !node_within_cutoff)) {
+          counters.near_node_rejections += target_inside_node;
+          counters.cutoff_containment_rejections += !node_within_cutoff;
+          ++counters.skipped_geometry_evaluations;
+          ++counters.skipped_mac_evaluations;
+          ++counters.opened_nodes;
+          pushChildrenReverseOctant(nodes, node_index, stack);
+          continue;
+        }
+        dx = node_metric[0](nodes.com_x_comoving[node_index] - px);
+        dy = node_metric[1](nodes.com_y_comoving[node_index] - py);
+        dz = node_metric[2](nodes.com_z_comoving[node_index] - pz);
+        const double r2 = dx*dx + dy*dy + dz*dz;
+        accept = internal::acceptTreePmNode(
+            internal::TreeNodeAcceptanceInput{
+                .is_leaf = false,
+                .target_inside_node = target_inside_node,
+                .half_size = half_size,
+                .com_center_offset = 0.0,
+                .node_mass_code = nodes.mass_code[node_index],
+                .r2 = r2,
+                .previous_acceleration_available = previous_acceleration_available,
+                .previous_acceleration_magnitude_code = previous_acceleration_magnitude_code,
+                .target_softening_comoving = target_softening_comoving,
+                .node_softening_min_comoving = nodes.softening_min_comoving[node_index],
+                .node_softening_max_comoving = nodes.softening_max_comoving[node_index],
+            }, node_within_cutoff, options, counters, [&] {
+              const double cx = nodes.center_x_comoving[node_index] - nodes.com_x_comoving[node_index];
+              const double cy = nodes.center_y_comoving[node_index] - nodes.com_y_comoving[node_index];
+              const double cz = nodes.center_z_comoving[node_index] - nodes.com_z_comoving[node_index];
+              return std::sqrt(cx*cx + cy*cy + cz*cz);
+            });
+        if (accept && com_distance_cutoff && r2 > cutoff_radius2_comoving) {
+          ++counters.cutoff_pruned_nodes;
+          continue;
+        }
+      }
+
+      if (accept) {
+        ++counters.accepted_nodes;
+        if (is_leaf) {
+          ++counters.accepted_leaves;
+          const TreeLocalIndex begin = nodes.particle_begin[node_index];
+          const TreeLocalIndex end = begin + nodes.particle_count[node_index];
+          if (leaf_staging_active) {
+            auto& lane = m_worker_leaf_storage[current_worker_slot()];
+            const double pair_epsilon = combineSofteningPairEpsilonUnchecked(
+                source_softening.uniform_epsilon_comoving, target_softening_comoving);
+            const double epsilon2 = pair_epsilon*pair_epsilon;
+            for (TreeLocalIndex block_begin = begin; block_begin < end;) {
+              const std::size_t count = std::min<std::size_t>(k_tree_pm_leaf_lanes, end-block_begin);
+              for (std::size_t i = 0; i < k_tree_pm_leaf_lanes; ++i) {
+                lane.valid[i] = i < count;
+                lane.dx[i] = lane.dy[i] = lane.dz[i] = lane.mass[i] = lane.coefficient[i] = 0.0;
+                lane.epsilon2[i] = 1.0; // safe inactive tails
+                if (i >= count) continue;
+                const std::size_t ordered = static_cast<std::size_t>(block_begin) + i;
+                if (skip_self && ordering.sorted_particle_index[ordered] == self_index) { lane.valid[i] = 0U; continue; }
+                lane.dx[i] = source_metric[0](ordered_x[ordered]-px);
+                lane.dy[i] = source_metric[1](ordered_y[ordered]-py);
+                lane.dz[i] = source_metric[2](ordered_z[ordered]-pz);
+                lane.mass[i] = ordered_mass[ordered]; lane.epsilon2[i] = epsilon2;
+              }
+              internal::treePmLeafGeometry(lane, leaf_avx2, gaussian_table != nullptr && residual_table == nullptr);
+              for (std::size_t i = 0; i < count; ++i) {
+                if (!lane.valid[i]) continue;
+                if (lane.r2[i] > cutoff_radius2_comoving) { ++counters.cutoff_skipped_pairs; continue; }
+                ++counters.direct_pair_evaluations;
+                nearest_pair_r2 = std::min(nearest_pair_r2, lane.r2[i]);
+                if (lane.dx[i] == 0.0 && lane.dy[i] == 0.0 && lane.dz[i] == 0.0) continue;
+                double value;
+                if (residual_table != nullptr && residual_table->evaluate(lane.r2[i], value)) {
+                  lane.coefficient[i] = value;
+                } else if (residual_table != nullptr || gaussian_table == nullptr) {
+                  lane.coefficient[i] = treePmSoftenedShortRangeInvR3Unchecked(lane.r2[i], pair_epsilon, split_scale);
+                } else {
+                  lane.coefficient[i] = lane.softened[i] - gaussian_table->longRangeInvR3(lane.r2[i], split_scale);
+                }
+              }
+              internal::treePmLeafContributions(lane, options.tree_options.gravitational_constant_code, leaf_avx2);
+              // Preserve the scalar source-order accumulation, including tails.
+              for (std::size_t i = 0; i < count; ++i) {
+                ax += lane.ax[i]; ay += lane.ay[i]; az += lane.az[i];
+              }
+              block_begin += static_cast<TreeLocalIndex>(count);
+            }
+            continue;
+          }
+          for (TreeLocalIndex sorted_i = begin; sorted_i < end; ++sorted_i) {
+            const TreeLocalIndex source_index = ordering.sorted_particle_index[sorted_i];
+            if (skip_self && source_index == self_index) {
+              continue;
+            }
+            const double sx = source_metric[0](ordered_x[sorted_i] - px);
+            const double sy = source_metric[1](ordered_y[sorted_i] - py);
+            const double sz = source_metric[2](ordered_z[sorted_i] - pz);
+            const double sr2 = sx * sx + sy * sy + sz * sz;
+            if (sr2 > cutoff_radius2_comoving) {
+              ++counters.cutoff_skipped_pairs;
+              continue;
+            }
+            nearest_pair_r2 = std::min(nearest_pair_r2, sr2);
+            // The exact coincident-pair vector is zero, including when its
+            // finite-softening radial coefficient overflows double. Never form
+            // 0*infinity. Still count the physical direct interaction.
+            if (sx == 0.0 && sy == 0.0 && sz == 0.0) {
+              ++counters.direct_pair_evaluations;
+              continue;
+            }
+            const double source_softening =
+                source_softening_base[
+                    static_cast<std::size_t>(source_index) *
+                    source_softening_stride];
+            const double pair_epsilon = combineSofteningPairEpsilonUnchecked(source_softening, target_softening_comoving);
+            // PM carries the unsoftened Gaussian long-range field.  The tree therefore
+            // evaluates the exact residual needed to recover the requested softened
+            // force, rather than multiplying a softened force by the Newtonian split.
+            double residual_inv_r3;
+            if (residual_table != nullptr && residual_table->evaluate(sr2, residual_inv_r3)) {
+              // Coefficient includes the Plummer term and Gaussian subtraction.
+            } else if (residual_table != nullptr) {
+              residual_inv_r3 = treePmSoftenedShortRangeInvR3Unchecked(sr2, pair_epsilon, split_scale);
+            } else if (gaussian_table != nullptr && sr2 > 0.0) {
+              const double gaussian_t = lookup_scaling_representable ? sr2*inverse_2a_squared : 64.0;
+              const double long_inv_r3 = gaussian_t < 64.0
+                  ? gaussian_table->dimensionlessCoefficient(gaussian_t)*inverse_8a_cubed
+                  : gaussian_table->longRangeInvR3(sr2, split_scale);
+              residual_inv_r3 = softenedInvR3Unchecked(sr2, pair_epsilon)-long_inv_r3;
+            } else {
+              residual_inv_r3 = treePmSoftenedShortRangeInvR3Unchecked(sr2, pair_epsilon, split_scale);
+            }
+            const double residual_factor = residual_inv_r3 * options.tree_options.gravitational_constant_code;
+            const double source_mass = ordered_mass[sorted_i];
+            ax += residual_factor * source_mass * sx;
+            ay += residual_factor * source_mass * sy;
+            az += residual_factor * source_mass * sz;
+            ++counters.direct_pair_evaluations;
+          }
+        } else {
+          ++counters.accepted_internal_multipoles;
+          // Same softened-residual contract as the leaf pair path, applied to accepted nodes.
+          const auto contrib =
+              (options.radial_coefficients_enabled ? monopolePlusQuadrupoleAccelPeriodic :
+                  monopolePlusQuadrupoleAccelPeriodicReference)(
+                  nodes,
+                  node_index,
+                  dx,
+                  dy,
+                  dz,
+                  target_softening_comoving,
+                  options.tree_options,
+                  options.split_policy.split_scale_comoving);
+          ax += contrib[0];
+          ay += contrib[1];
+          az += contrib[2];
+        }
+      } else {
+        ++counters.opened_nodes;
+        pushChildrenReverseOctant(nodes, node_index, stack);
+      }
+    }
+    if (spatial_counters != nullptr && skip_self) {
+      parallel::DecompositionConfig domain;
+      domain.domain_x_max_comov = box_lengths.lx;
+      domain.domain_y_max_comov = box_lengths.ly;
+      domain.domain_z_max_comov = box_lengths.lz;
+      const std::size_t bin = parallel::spatialWorkBinForSfcKey(
+          parallel::sfcKeyForPosition(px, py, pz, domain));
+      spatial_counters->spatial_work[bin] += (counters.visited_nodes - visits_begin) +
+          (counters.direct_pair_evaluations - pairs_begin);
+      ++spatial_counters->spatial_targets[bin];
+    }
+    return std::array<double, 4>{ax, ay, az, nearest_pair_r2};
+  };
+
+  // Group walk (tree_pm_group_walk.hpp). evaluate_group returns false, before
+  // any accumulation, when a group cannot use one shared interaction list;
+  // the caller then evaluates those targets with the per-target walk.
+  internal::TreePmGroupPairKernel group_kernel{};
+  internal::TreePmGroupWalkParameters group_parameters{};
+  if (group_walk_active && !lookup_scaling_representable) group_walk_active = false;
+  if (group_walk_active) {
+    const double pair_epsilon = combineSofteningPairEpsilonUnchecked(
+        source_softening.uniform_epsilon_comoving, source_softening.uniform_epsilon_comoving);
+    group_kernel = internal::TreePmGroupPairKernel{
+        .x = ordered_x, .y = ordered_y, .z = ordered_z, .mass = ordered_mass,
+        .length = {box_lengths.lx, box_lengths.ly, box_lengths.lz},
+        .epsilon2 = pair_epsilon * pair_epsilon,
+        .cutoff_radius2 = cutoff_radius2_comoving,
+        .inverse_2a_squared = inverse_2a_squared,
+        .inverse_8a_cubed = inverse_8a_cubed,
+        .table_inverse_step = 1.0 / TreePmGaussianCoefficientTable::k_step,
+        .table_t_limit = std::nextafter(64.0, 0.0),
+        .table_value = m_gaussian_table->knotValues(),
+        .table_slope = m_gaussian_table->knotSlopes(),
+        .gravitational_constant = options.tree_options.gravitational_constant_code};
+    group_parameters = internal::TreePmGroupWalkParameters{
+        .cutoff_radius2 = cutoff_radius2_comoving,
+        .relative_tolerance_over_g = options.tree_options.relative_force_tolerance /
+            options.tree_options.gravitational_constant_code,
+        .maximum_opening_angle2 = options.adaptive_maximum_opening_angle * options.adaptive_maximum_opening_angle,
+        .contain_cutoff = !com_distance_cutoff};
+  }
+  const auto evaluate_group = [&](std::size_t visit_begin, std::size_t visit_end,
+                                  ResidualTraversalCounters& counters, BoundedTreeStack& stack,
+                                  TreePmGroupWalkWorkerScratch& scratch, double& sum_sq) -> bool {
+    const double uniform_epsilon = source_softening.uniform_epsilon_comoving;
+    const std::array<double, 3> lengths{box_lengths.lx, box_lengths.ly, box_lengths.lz};
+    double minimum_acceleration = std::numeric_limits<double>::infinity();
+    std::array<double, 3> reference{}, low{}, high{};
+    for (std::size_t visit = visit_begin; visit < visit_end; ++visit) {
+      const std::size_t active_i = m_target_visit_order[visit];
+      const TreeLocalIndex row = accumulator.active_particle_index[active_i];
+      if (targetSofteningEpsilonUnchecked(active_i, row, validated_target_softening) != uniform_epsilon ||
+          accumulator.previous_acceleration_magnitude_code.empty()) {
+        return false;
+      }
+      const double previous = accumulator.previous_acceleration_magnitude_code[active_i];
+      if (!(std::isfinite(previous) &&
+            previous > options.tree_options.relative_force_acceleration_floor_code)) {
+        return false;
+      }
+      minimum_acceleration = std::min(minimum_acceleration, previous);
+      const std::array<double, 3> position{target_x(active_i), target_y(active_i), target_z(active_i)};
+      for (std::size_t axis = 0; axis < 3U; ++axis) {
+        if (!internal::treePmPeriodicMetric(m_source_coordinate_bounds[2U*axis],
+                m_source_coordinate_bounds[2U*axis+1U], position[axis], lengths[axis], round_to_nearest).bounded) {
+          return false;
+        }
+        if (visit == visit_begin) {
+          reference[axis] = position[axis];
+          continue;
+        }
+        const double delta = internal::treePmGroupNearestImage(position[axis] - reference[axis], lengths[axis]);
+        low[axis] = std::min(low[axis], delta);
+        high[axis] = std::max(high[axis], delta);
+      }
+    }
+    internal::TreePmGroupBox group;
+    for (std::size_t axis = 0; axis < 3U; ++axis) {
+      group.center[axis] = reference[axis] + 0.5 * (low[axis] + high[axis]);
+      group.half[axis] = 0.5 * (high[axis] - low[axis]);
+    }
+    internal::buildTreePmGroupInteractionList(nodes, group, minimum_acceleration, lengths,
+        group_parameters, stack, scratch, counters);
+    for (std::size_t visit = visit_begin; visit < visit_end; ++visit) {
+      const std::size_t active_i = m_target_visit_order[visit];
+      const double px = target_x(active_i), py = target_y(active_i), pz = target_z(active_i);
+      ++counters.targets;
+      double ax = 0.0, ay = 0.0, az = 0.0;
+      double nearest_pair_r2 = std::numeric_limits<double>::infinity();
+      std::uint64_t pairs = 0U;
+      for (std::size_t range = 0; range < scratch.range_begin.size(); ++range) {
+        internal::accumulateTreePmGroupPairs(group_kernel, px, py, pz,
+            scratch.range_begin[range], scratch.range_end[range], ax, ay, az, pairs,
+            nearest_pair_r2);
+      }
+      counters.direct_pair_evaluations += pairs;
+      const std::array<double, 3> target{px, py, pz};
+      std::array<internal::TreePmPeriodicMetric, 3> node_metric;
+      for (std::size_t axis = 0; axis < 3U; ++axis) {
+        node_metric[axis] = internal::treePmPeriodicMetric(m_node_coordinate_bounds[2U*axis],
+            m_node_coordinate_bounds[2U*axis+1U], target[axis], lengths[axis], round_to_nearest);
+      }
+      for (const TreeLocalIndex node : scratch.multipole_nodes) {
+        const double dx = node_metric[0](nodes.com_x_comoving[node] - px);
+        const double dy = node_metric[1](nodes.com_y_comoving[node] - py);
+        const double dz = node_metric[2](nodes.com_z_comoving[node] - pz);
+        if (com_distance_cutoff && dx*dx + dy*dy + dz*dz > cutoff_radius2_comoving) {
+          ++counters.cutoff_pruned_nodes;
+          continue;
+        }
+        const auto contrib =
+            (options.radial_coefficients_enabled ? monopolePlusQuadrupoleAccelPeriodic :
+                monopolePlusQuadrupoleAccelPeriodicReference)(
+                nodes, node, dx, dy, dz, uniform_epsilon, options.tree_options,
+                options.split_policy.split_scale_comoving);
+        ax += contrib[0];
+        ay += contrib[1];
+        az += contrib[2];
+      }
+      accumulator.addShortRangeToActiveSlot(active_i, ax, ay, az);
+      accumulator.noteNearestPairToActiveSlot(active_i, nearest_pair_r2);
+      sum_sq += ax * ax + ay * ay + az * az;
+    }
+    return true;
+  };
+
+  bool distributed_short_range = false;
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  distributed_short_range = distributed_payload_communication_required;
+#endif
+  // Integer counters and local short-range sum-of-squares are reduced after
+  // join in deterministic block order. No atomics appear in the hot node/pair
+  // loops; each active slot has a unique writer.
+  const auto merge_counters = [](ResidualTraversalCounters& dst,
+                                 const ResidualTraversalCounters& src) {
+    dst.visited_nodes += src.visited_nodes;
+    dst.accepted_nodes += src.accepted_nodes;
+    dst.opened_nodes += src.opened_nodes;
+    dst.direct_pair_evaluations += src.direct_pair_evaluations;
+    dst.cutoff_pruned_nodes += src.cutoff_pruned_nodes;
+    dst.cutoff_skipped_pairs += src.cutoff_skipped_pairs;
+    dst.remote_pairs_pruned_by_bounds += src.remote_pairs_pruned_by_bounds;
+    dst.accepted_internal_multipoles += src.accepted_internal_multipoles;
+    dst.accepted_leaves += src.accepted_leaves;
+    dst.selected_mac_rejections += src.selected_mac_rejections;
+    dst.relative_mac_rejections += src.relative_mac_rejections;
+    dst.skipped_mac_evaluations += src.skipped_mac_evaluations;
+    dst.skipped_geometry_evaluations += src.skipped_geometry_evaluations;
+    dst.maximum_angle_rejections += src.maximum_angle_rejections;
+    dst.strict_envelope_rejections += src.strict_envelope_rejections;
+    dst.softening_rejections += src.softening_rejections;
+    dst.near_node_rejections += src.near_node_rejections;
+    dst.cutoff_containment_rejections += src.cutoff_containment_rejections;
+    dst.geometric_history_fallbacks += src.geometric_history_fallbacks;
+    dst.targets += src.targets;
+    dst.residual_lookup_targets += src.residual_lookup_targets;
+    dst.simd_leaf_targets += src.simd_leaf_targets;
+    dst.elapsed_work_ms += src.elapsed_work_ms;
+    dst.block_work_ms_max = std::max(dst.block_work_ms_max, src.block_work_ms_max);
+  };
+  const auto summarize_worker = [&](const ResidualTraversalCounters& worker) {
+    if (worker.targets == 0U) return;
+    auto& summary = m_last_residual_stats.traversal_summary;
+    const double targets = static_cast<double>(worker.targets);
+    if (summary.worker_region_count == 0U) {
+      summary.worker_targets_min = targets;
+      summary.worker_work_ms_min = worker.elapsed_work_ms;
+    }
+    ++summary.worker_region_count;
+    summary.worker_targets_min = std::min(summary.worker_targets_min, targets);
+    summary.worker_targets_max = std::max(summary.worker_targets_max, targets);
+    summary.worker_visits_max = std::max(summary.worker_visits_max, static_cast<double>(worker.visited_nodes));
+    summary.worker_pairs_max = std::max(summary.worker_pairs_max, static_cast<double>(worker.direct_pair_evaluations));
+    summary.worker_multipoles_max = std::max(summary.worker_multipoles_max, static_cast<double>(worker.accepted_internal_multipoles));
+    summary.worker_work_ms_min = std::min(summary.worker_work_ms_min, worker.elapsed_work_ms);
+    summary.worker_work_ms_max = std::max(summary.worker_work_ms_max, worker.elapsed_work_ms);
+    summary.worker_work_ms_sum += worker.elapsed_work_ms;
+  };
+  if (!distributed_short_range) {
+    const std::size_t target_count = accumulator.active_particle_index.size();
+    const std::size_t block_count =
+        (target_count + k_residual_block_size - 1U) / k_residual_block_size;
+    std::fill(
+        m_worker_counter_storage.begin(), m_worker_counter_storage.end(),
+        ResidualTraversalCounters{});
+    std::fill(
+        m_block_sum_sq_storage.begin(), m_block_sum_sq_storage.end(), 0.0);
+    std::exception_ptr local_traversal_failure;
+    int region_observed_workers = 1;
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel
+    {
+#pragma omp single
+      {
+        region_observed_workers = omp_get_num_threads();
+      }
+#pragma omp for schedule(dynamic, 1)
+#endif
+    for (std::ptrdiff_t block = 0;
+         block < static_cast<std::ptrdiff_t>(block_count);
+         ++block) {
+      try {
+        const std::size_t block_begin =
+            static_cast<std::size_t>(block) * k_residual_block_size;
+        const std::size_t block_end =
+            std::min(block_begin + k_residual_block_size, target_count);
+        const std::size_t worker_slot = current_worker_slot();
+        BoundedTreeStack stack = worker_stack(worker_slot);
+        ResidualTraversalCounters& counters =
+            m_worker_counter_storage[worker_slot];
+        ResidualSpatialWorkCounters* spatial_counters = options.spatial_work_history_enabled
+            ? &m_worker_spatial_counter_storage[worker_slot] : nullptr;
+        double local_sum_sq = 0.0;
+        const auto block_work_start = std::chrono::steady_clock::now();
+        const auto evaluate_slot = [&](std::size_t active_i) {
+          const TreeLocalIndex particle_index =
+              accumulator.active_particle_index[active_i];
+          const bool has_local_source_identity =
+              particle_index < pos_x_comoving.size();
+          const double px = target_x(active_i);
+          const double py = target_y(active_i);
+          const double pz = target_z(active_i);
+          const double target_softening = targetSofteningEpsilonUnchecked(
+              active_i,
+              has_local_source_identity ? particle_index : 0U,
+              validated_target_softening);
+          const bool previous_acceleration_available =
+              !accumulator.previous_acceleration_magnitude_code.empty() &&
+              std::isfinite(accumulator.previous_acceleration_magnitude_code[active_i]);
+          const double previous_acceleration_magnitude_code = previous_acceleration_available
+              ? accumulator.previous_acceleration_magnitude_code[active_i]
+              : 0.0;
+          const auto local_accel = evaluateTargetAgainstLocalTree(
+              counters,
+              spatial_counters,
+              stack,
+              px,
+              py,
+              pz,
+              has_local_source_identity ? particle_index : 0U,
+              has_local_source_identity,
+              target_softening,
+              previous_acceleration_available,
+              previous_acceleration_magnitude_code);
+          accumulator.addShortRangeToActiveSlot(active_i, local_accel[0], local_accel[1], local_accel[2]);
+          accumulator.noteNearestPairToActiveSlot(active_i, local_accel[3]);
+          local_sum_sq +=
+              local_accel[0] * local_accel[0] + local_accel[1] * local_accel[1] +
+              local_accel[2] * local_accel[2];
+        };
+        if (!group_walk_active) {
+          for (std::size_t visit = block_begin; visit < block_end; ++visit) {
+            evaluate_slot(m_target_visit_order[visit]);
+          }
+        } else {
+          const std::size_t source_count = pos_x_comoving.size();
+          const auto leaf_of_slot = [&](std::size_t active_i) -> TreeLocalIndex {
+            const auto row = accumulator.active_particle_index[active_i];
+            return row < source_count ? m_leaf_of_tree_position[m_tree_order_position_by_row[row]]
+                                      : kInvalidTreeLocalIndex;
+          };
+          std::size_t visit = block_begin;
+          while (visit < block_end) {
+            const TreeLocalIndex leaf = leaf_of_slot(m_target_visit_order[visit]);
+            std::size_t group_end = visit + 1U;
+            if (leaf != kInvalidTreeLocalIndex) {
+              while (group_end < block_end && leaf_of_slot(m_target_visit_order[group_end]) == leaf) ++group_end;
+            }
+            if (leaf == kInvalidTreeLocalIndex ||
+                !evaluate_group(visit, group_end, counters, stack, m_worker_group_scratch[worker_slot], local_sum_sq)) {
+              for (std::size_t v = visit; v < group_end; ++v) evaluate_slot(m_target_visit_order[v]);
+            }
+            visit = group_end;
+          }
+        }
+        const double block_work_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - block_work_start).count();
+        counters.elapsed_work_ms += block_work_ms;
+        counters.block_work_ms_max = std::max(counters.block_work_ms_max, block_work_ms);
+        m_block_sum_sq_storage[static_cast<std::size_t>(block)] = local_sum_sq;
+      } catch (...) {
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp critical(tree_pm_residual_failure)
+#endif
+        {
+          if (!local_traversal_failure) {
+            local_traversal_failure = std::current_exception();
+          }
+        }
+      }
+    }
+#if COSMOSIM_HAVE_OPENMP
+    }
+#endif
+    observed_openmp_workers = std::max(observed_openmp_workers, region_observed_workers);
+    if (local_traversal_failure) {
+      std::rethrow_exception(local_traversal_failure);
+    }
+    for (const ResidualTraversalCounters& counters : m_worker_counter_storage) {
+      merge_counters(local_owned_targets, counters);
+      summarize_worker(counters);
+    }
+    for (std::size_t block = 0; block < block_count; ++block) {
+      m_last_residual_stats.local_short_range_sum_sq +=
+          m_block_sum_sq_storage[block];
+    }
+  }
+
+#if defined(COSMOSIM_ENABLE_MPI) && COSMOSIM_ENABLE_MPI
+  const parallel::PmSlabLayout& layout = m_grid.slabLayout();
+  if (distributed_short_range) {
+    const int mpi_world_size = tree_mpi_world_size;
+    const int mpi_world_rank = tree_mpi_world_rank;
+    const auto coordinate_protocol_failure = [&](std::exception_ptr local_failure,
+                                                  std::string_view phase) {
+      const std::uint64_t local_vote = local_failure ? 1U : 0U;
+      std::uint64_t failure_count = 0U;
+      MPI_Allreduce(
+          &local_vote,
+          &failure_count,
+          1,
+          MPI_UINT64_T,
+          MPI_SUM,
+          MPI_COMM_WORLD);
+      if (failure_count == 0U) {
+        return;
+      }
+      if (local_failure) {
+        std::rethrow_exception(local_failure);
+      }
+      throw std::runtime_error(
+          "TreePM peer rejected the " + std::string(phase) +
+          " protocol phase");
+    };
+
+    std::size_t max_requests_per_peer = 0U;
+    std::uint64_t exchange_sequence = 0U;
+    std::exception_ptr exchange_preflight_failure;
+    try {
+      if (mpi_world_size != layout.world_size || mpi_world_rank != layout.world_rank) {
+        throw std::invalid_argument("TreePM short-range exchange layout world metadata must match MPI_COMM_WORLD");
+      }
+      max_requests_per_peer = std::max<std::size_t>(
+          1U,
+          static_cast<std::size_t>(options.tree_exchange_batch_bytes / k_short_range_request_wire_bytes));
+      if (m_tree_exchange_sequence == std::numeric_limits<std::uint64_t>::max()) {
+        throw std::overflow_error("TreePM short-range exchange sequence exhausted");
+      }
+      exchange_sequence = m_tree_exchange_sequence + 1U;
+
+    } catch (...) {
+      exchange_preflight_failure = std::current_exception();
+    }
+    coordinate_protocol_failure(exchange_preflight_failure, "exchange preflight");
+
+    const std::array<std::uint64_t, 4> local_protocol_identity{
+        exchange_sequence, options.decomposition_epoch.value, options.force_epoch.sequence, options.tree_exchange_batch_bytes};
+    std::array<std::uint64_t, 4> min_protocol_identity{};
+    std::array<std::uint64_t, 4> max_protocol_identity{};
+    MPI_Allreduce(
+        local_protocol_identity.data(),
+        min_protocol_identity.data(),
+        static_cast<int>(local_protocol_identity.size()),
+        MPI_UINT64_T,
+        MPI_MIN,
+        MPI_COMM_WORLD);
+    MPI_Allreduce(
+        local_protocol_identity.data(),
+        max_protocol_identity.data(),
+        static_cast<int>(local_protocol_identity.size()),
+        MPI_UINT64_T,
+        MPI_MAX,
+        MPI_COMM_WORLD);
+    if (min_protocol_identity != max_protocol_identity) {
+      throw std::runtime_error("TreePM short-range ranks disagree on exchange sequence, runtime epochs, or batch policy");
+    }
+    m_tree_exchange_sequence = exchange_sequence;
+
+    // PM communication is complete at this point. Borrow the same physical
+    // backing allocation for the complete bounded short-range request/response
+    // live set. All PMR containers below have null-upstream arena storage: any
+    // capacity mistake fails rather than escaping to the ordinary heap.
+    auto tree_communication_lease =
+        m_communication_arena.begin(GravityCommunicationArena::Phase::kTreeExchange);
+    std::pmr::memory_resource* tree_resource = tree_communication_lease.resource();
+    const TreePmExchangeMemoryEstimate tree_exchange_capacity =
+        estimateTreePmExchangeMemory(TreePmExchangeMemoryInput{
+            .rank_count = static_cast<std::uint32_t>(mpi_world_size),
+            .tree_exchange_batch_bytes = options.tree_exchange_batch_bytes,
+        });
+    const std::size_t reserved_batch_targets = core::checkedIntegralNarrow<std::size_t>(
+        tree_exchange_capacity.batch_targets_per_peer,
+        "TreePM arena reserved batch target count");
+    // The complete-graph preflight is the hard physical arena contract. A
+    // sparser runtime graph may permit a larger classic-MPI round, but it may
+    // not grow beyond the capacity already admitted for this physical owner.
+    max_requests_per_peer = std::min(max_requests_per_peer, reserved_batch_targets);
+    const auto reserve_bytes = [](auto& container, std::uint64_t bytes,
+                                  std::string_view context) {
+      container.reserve(core::checkedIntegralNarrow<std::size_t>(bytes, context));
+    };
+
+    std::pmr::vector<int> send_counts(tree_resource);
+    std::pmr::vector<int> recv_counts(tree_resource);
+    std::pmr::vector<int> send_displs(tree_resource);
+    std::pmr::vector<int> recv_displs(tree_resource);
+    std::pmr::vector<int> response_send_counts(tree_resource);
+    std::pmr::vector<int> response_recv_counts(tree_resource);
+    std::pmr::vector<int> response_send_displs(tree_resource);
+    std::pmr::vector<int> response_recv_displs(tree_resource);
+    for (auto* metadata : {&send_counts, &recv_counts, &send_displs, &recv_displs,
+                           &response_send_counts, &response_recv_counts,
+                           &response_send_displs, &response_recv_displs}) {
+      metadata->resize(static_cast<std::size_t>(mpi_world_size), 0);
+    }
+
+    std::pmr::vector<std::uint8_t> send_payload(tree_resource);
+    std::pmr::vector<std::uint8_t> recv_payload(tree_resource);
+    std::pmr::vector<std::uint8_t> response_send_payload(tree_resource);
+    std::pmr::vector<std::uint8_t> response_recv_payload(tree_resource);
+    reserve_bytes(send_payload, tree_exchange_capacity.wire_send_bytes,
+                  "TreePM arena request send capacity");
+    reserve_bytes(recv_payload, tree_exchange_capacity.wire_recv_bytes,
+                  "TreePM arena request receive capacity");
+    reserve_bytes(response_send_payload, tree_exchange_capacity.wire_response_send_bytes,
+                  "TreePM arena response send capacity");
+    reserve_bytes(response_recv_payload, tree_exchange_capacity.wire_response_recv_bytes,
+                  "TreePM arena response receive capacity");
+
+    std::pmr::vector<double> remote_batch_ax(tree_resource);
+    std::pmr::vector<double> remote_batch_ay(tree_resource);
+    std::pmr::vector<double> remote_batch_az(tree_resource);
+    std::pmr::vector<double> remote_batch_nearest_r2(tree_resource);
+    std::pmr::vector<std::uint32_t> expected_response_count(tree_resource);
+    std::pmr::vector<std::uint32_t> received_response_count(tree_resource);
+    remote_batch_ax.reserve(reserved_batch_targets);
+    remote_batch_ay.reserve(reserved_batch_targets);
+    remote_batch_az.reserve(reserved_batch_targets);
+    remote_batch_nearest_r2.reserve(reserved_batch_targets);
+    expected_response_count.reserve(reserved_batch_targets);
+    received_response_count.reserve(reserved_batch_targets);
+
+    // Reused one-peer codec/validation buffers. They replace per-peer heap
+    // temporaries and keep duplicate detection exact without a node-based hash
+    // allocation: identities are sorted in scratch solely for validation.
+    std::pmr::vector<std::uint8_t> request_codec_bytes(tree_resource);
+    std::pmr::vector<std::uint8_t> response_codec_bytes(tree_resource);
+    std::pmr::vector<ShortRangeTargetRequestPacket> decoded_requests(tree_resource);
+    std::pmr::vector<ShortRangeTargetResponsePacket> decoded_responses(tree_resource);
+    std::pmr::vector<ShortRangeTargetResponsePacket> peer_responses(tree_resource);
+    std::pmr::vector<std::uint64_t> peer_target_identity_scratch(tree_resource);
+    reserve_bytes(request_codec_bytes, tree_exchange_capacity.wire_request_bytes_per_peer,
+                  "TreePM arena request codec capacity");
+    reserve_bytes(response_codec_bytes, tree_exchange_capacity.wire_response_bytes_per_peer,
+                  "TreePM arena response codec capacity");
+    decoded_requests.reserve(reserved_batch_targets);
+    decoded_responses.reserve(reserved_batch_targets);
+    peer_responses.reserve(reserved_batch_targets);
+    peer_target_identity_scratch.reserve(reserved_batch_targets);
+
+    std::pmr::vector<std::uint8_t> communicated_with_peer(tree_resource);
+    communicated_with_peer.resize(static_cast<std::size_t>(mpi_world_size), 0U);
+    std::pmr::vector<int> requested_outgoing_peers(tree_resource);
+    requested_outgoing_peers.reserve(static_cast<std::size_t>(mpi_world_size));
+
+    std::pmr::vector<int> neighbor_request_send_counts(tree_resource);
+    std::pmr::vector<int> neighbor_request_recv_counts(tree_resource);
+    std::pmr::vector<int> neighbor_request_send_displs(tree_resource);
+    std::pmr::vector<int> neighbor_request_recv_displs(tree_resource);
+    std::pmr::vector<int> neighbor_response_send_counts(tree_resource);
+    std::pmr::vector<int> neighbor_response_recv_counts(tree_resource);
+    std::pmr::vector<int> neighbor_response_send_displs(tree_resource);
+    std::pmr::vector<int> neighbor_response_recv_displs(tree_resource);
+    for (auto* metadata : {&neighbor_request_send_counts, &neighbor_request_recv_counts,
+                           &neighbor_request_send_displs, &neighbor_request_recv_displs,
+                           &neighbor_response_send_counts, &neighbor_response_recv_counts,
+                           &neighbor_response_send_displs, &neighbor_response_recv_displs}) {
+      metadata->reserve(static_cast<std::size_t>(mpi_world_size));
+    }
+
+    // Prefer the authoritative decomposition-domain leaves installed by the
+    // workflow when they are fresh for this source generation and cover every
+    // local source. A generation stamp mismatch, missing geometry, epoch
+    // mismatch, or coverage failure falls back to the conservative gravity-
+    // tree root packet and records a specific reason. This is a correctness
+    // fallback, not an equivalent capability tier.
+    std::vector<parallel::TreePseudoParticlePacket> local_top_level_domain;
+    bool local_authoritative_geometry = false;
+    TreePmDomainGeometryFallbackReason geometry_fallback_reason =
+        TreePmDomainGeometryFallbackReason::kNone;
+    std::uint64_t geometry_uncovered_source_count = 0U;
+    std::exception_ptr local_domain_failure;
+    try {
+      const bool geometry_generation_fresh =
+          options.authoritative_geometry_source_generation == options.source_generation;
+      if (geometry_generation_fresh && options.authoritative_domain_leaves.empty() &&
+          !pos_x_comoving.empty()) {
+        geometry_fallback_reason = TreePmDomainGeometryFallbackReason::kNoGeometryInstalled;
+      } else if (geometry_generation_fresh) {
+        const DomainCoverageResult coverage = authoritativeDomainCoversLocalSourcesEx(
+            options.authoritative_domain_leaves,
+            mpi_world_rank,
+            options.decomposition_epoch.value,
+            pos_x_comoving,
+            pos_y_comoving,
+            pos_z_comoving,
+            box_lengths);
+        geometry_uncovered_source_count = coverage.uncovered_source_count;
+        local_authoritative_geometry = coverage.covered;
+        if (!coverage.covered) {
+          geometry_fallback_reason = coverage.epoch_mismatch
+              ? TreePmDomainGeometryFallbackReason::kDecompositionEpochMismatch
+              : TreePmDomainGeometryFallbackReason::kSourceCoverageFailure;
+        }
+      } else {
+        geometry_fallback_reason = TreePmDomainGeometryFallbackReason::kStaleSourceGeneration;
+      }
+      if (local_authoritative_geometry) {
+        local_top_level_domain = makeAuthoritativeTopDomainPackets(
+            options.authoritative_domain_leaves,
+            mpi_world_rank,
+            options.decomposition_epoch.value,
+            options.force_epoch.sequence,
+            exchange_sequence);
+      } else {
+        local_top_level_domain.push_back(makeLocalTreePseudoParticlePacket(
+            mpi_world_rank,
+            options.decomposition_epoch.value,
+            options.force_epoch.sequence,
+            exchange_sequence,
+            m_tree_solver.nodes(),
+            pos_x_comoving.size()));
+      }
+    } catch (...) {
+      local_domain_failure = std::current_exception();
+      geometry_fallback_reason = TreePmDomainGeometryFallbackReason::kGeometryPreparationFailure;
+    }
+    coordinate_protocol_failure(local_domain_failure, "top-level domain preparation");
+
+    const int local_requires_geometry_fallback = local_authoritative_geometry ? 0 : 1;
+    int any_rank_requires_geometry_fallback = 0;
+    requireTreePmMpiSuccess(
+        MPI_Allreduce(
+            &local_requires_geometry_fallback,
+            &any_rank_requires_geometry_fallback,
+            1,
+            MPI_INT,
+            MPI_MAX,
+            MPI_COMM_WORLD),
+        "TreePM LET collective geometry-fallback agreement MPI_Allreduce");
+    if (any_rank_requires_geometry_fallback != 0 && local_authoritative_geometry) {
+      local_authoritative_geometry = false;
+      geometry_fallback_reason = TreePmDomainGeometryFallbackReason::kCollectivePeerFallback;
+      local_top_level_domain.clear();
+      local_top_level_domain.push_back(makeLocalTreePseudoParticlePacket(
+          mpi_world_rank,
+          options.decomposition_epoch.value,
+          options.force_epoch.sequence,
+          exchange_sequence,
+          m_tree_solver.nodes(),
+          pos_x_comoving.size()));
+    }
+
+    m_last_residual_stats.domain_geometry_source_generation =
+        options.authoritative_geometry_source_generation.value;
+    m_last_residual_stats.current_gravity_source_generation =
+        options.source_generation.value;
+    m_last_residual_stats.domain_geometry_fresh =
+        (options.authoritative_geometry_source_generation == options.source_generation) ? 1U : 0U;
+    m_last_residual_stats.domain_geometry_fallback_used =
+        local_authoritative_geometry ? 0U : 1U;
+    m_last_residual_stats.domain_geometry_fallback_reason =
+        static_cast<std::uint64_t>(geometry_fallback_reason);
+    m_last_residual_stats.domain_geometry_uncovered_source_count =
+        geometry_uncovered_source_count;
+
+    const std::uint64_t local_domain_geometry_fingerprint =
+        domainGeometryFingerprint(local_top_level_domain);
+    const bool local_domain_cache_match =
+        local_authoritative_geometry &&
+        m_let_domain_cache.valid &&
+        m_let_domain_cache.authoritative_geometry &&
+        m_let_domain_cache.decomposition_epoch == options.decomposition_epoch &&
+        m_let_domain_cache.world_size == mpi_world_size &&
+        m_let_domain_cache.local_geometry_fingerprint == local_domain_geometry_fingerprint;
+    int local_domain_cache_match_int = local_domain_cache_match ? 1 : 0;
+    int all_domain_cache_match = 0;
+    requireTreePmMpiSuccess(
+        MPI_Allreduce(
+            &local_domain_cache_match_int,
+            &all_domain_cache_match,
+            1,
+            MPI_INT,
+            MPI_MIN,
+            MPI_COMM_WORLD),
+        "TreePM LET domain-cache agreement MPI_Allreduce");
+
+    std::vector<parallel::TreePseudoParticlePacket> peer_pseudo_packets;
+    if (all_domain_cache_match != 0) {
+      peer_pseudo_packets = m_let_domain_cache.top_level_domain_leaves;
+      ++m_last_residual_stats.domain_cache_hit_count;
+    } else {
+      ++m_last_residual_stats.domain_cache_miss_count;
+      peer_pseudo_packets = parallel::executeBlockingTreePseudoParticleHierarchyExchange(
+          m_mpi_context, local_top_level_domain, exchange_sequence);
+      const bool authoritative_geometry = std::all_of(
+          peer_pseudo_packets.begin(),
+          peer_pseudo_packets.end(),
+          [](const parallel::TreePseudoParticlePacket& packet) {
+            return !packet.descriptor.derived_not_authoritative;
+          });
+      m_let_domain_cache.valid = authoritative_geometry;
+      m_let_domain_cache.decomposition_epoch = options.decomposition_epoch;
+      m_let_domain_cache.world_size = mpi_world_size;
+      m_let_domain_cache.local_geometry_fingerprint = local_domain_geometry_fingerprint;
+      m_let_domain_cache.geometry_fingerprint = domainGeometryFingerprint(peer_pseudo_packets);
+      m_let_domain_cache.authoritative_geometry = authoritative_geometry;
+      m_let_domain_cache.top_level_domain_leaves = peer_pseudo_packets;
+    }
+
+    std::vector<std::vector<parallel::TreePseudoParticlePacket>> peer_hierarchy_by_rank;
+    // Outer descriptors are O(rank_count); all population/batch capacity lives
+    // in the shared PMR arena.
+    std::vector<std::pmr::vector<ShortRangeTargetRequestPacket>> requests_by_peer;
+    std::vector<std::pmr::vector<std::uint8_t>> response_expected_by_peer;
+    std::vector<std::pmr::vector<std::uint8_t>> response_seen_by_peer;
+    requests_by_peer.reserve(static_cast<std::size_t>(mpi_world_size));
+    response_expected_by_peer.reserve(static_cast<std::size_t>(mpi_world_size));
+    response_seen_by_peer.reserve(static_cast<std::size_t>(mpi_world_size));
+    for (int peer = 0; peer < mpi_world_size; ++peer) {
+      requests_by_peer.emplace_back(
+          std::pmr::polymorphic_allocator<ShortRangeTargetRequestPacket>(tree_resource));
+      response_expected_by_peer.emplace_back(
+          std::pmr::polymorphic_allocator<std::uint8_t>(tree_resource));
+      response_seen_by_peer.emplace_back(
+          std::pmr::polymorphic_allocator<std::uint8_t>(tree_resource));
+      if (peer != mpi_world_rank) {
+        requests_by_peer.back().reserve(reserved_batch_targets);
+      }
+      response_expected_by_peer.back().reserve(reserved_batch_targets);
+      response_seen_by_peer.back().reserve(reserved_batch_targets);
+    }
+
+    // The domain hierarchy is a decomposition object, not a tree-build object.
+    // Reuse the already-built BVH whenever the authoritative global domain
+    // geometry fingerprint is unchanged. Derived tree-root fallback geometry is
+    // intentionally rebuilt because it follows the current local tree.
+    const std::uint64_t peer_geometry_fingerprint = domainGeometryFingerprint(peer_pseudo_packets);
+    std::unique_ptr<TopLevelDomainHierarchy> transient_domain_hierarchy;
+    TopLevelDomainHierarchy* top_level_domain_hierarchy = nullptr;
+    if (m_let_domain_cache.valid && m_let_domain_cache.authoritative_geometry &&
+        m_let_domain_hierarchy_cache != nullptr &&
+        m_let_domain_hierarchy_cache->valid &&
+        m_let_domain_hierarchy_cache->geometry_fingerprint == peer_geometry_fingerprint &&
+        m_let_domain_hierarchy_cache->hierarchy != nullptr) {
+      top_level_domain_hierarchy = m_let_domain_hierarchy_cache->hierarchy.get();
+    } else if (m_let_domain_cache.valid && m_let_domain_cache.authoritative_geometry &&
+               m_let_domain_hierarchy_cache != nullptr) {
+      m_let_domain_hierarchy_cache->hierarchy =
+          std::make_unique<TopLevelDomainHierarchy>(peer_pseudo_packets);
+      m_let_domain_hierarchy_cache->geometry_fingerprint = peer_geometry_fingerprint;
+      m_let_domain_hierarchy_cache->valid = true;
+      top_level_domain_hierarchy = m_let_domain_hierarchy_cache->hierarchy.get();
+    } else {
+      if (m_let_domain_hierarchy_cache != nullptr) {
+        m_let_domain_hierarchy_cache->valid = false;
+        m_let_domain_hierarchy_cache->hierarchy.reset();
+      }
+      transient_domain_hierarchy = std::make_unique<TopLevelDomainHierarchy>(peer_pseudo_packets);
+      top_level_domain_hierarchy = transient_domain_hierarchy.get();
+    }
+    TopLevelDomainHierarchy::QueryScratch owner_query_scratch;
+    owner_query_scratch.prepare(
+        top_level_domain_hierarchy->nodeCount(),
+        static_cast<std::size_t>(mpi_world_size));
+    SparsePeerGraph* sparse_peer_graph = nullptr;
+    std::exception_ptr peer_domain_failure;
+    const auto let_discovery_start = std::chrono::steady_clock::now();
+    try {
+      peer_hierarchy_by_rank.resize(static_cast<std::size_t>(mpi_world_size));
+      for (const parallel::TreePseudoParticlePacket& packet : peer_pseudo_packets) {
+        if (packet.descriptor.source_rank < 0 || packet.descriptor.source_rank >= mpi_world_size) {
+          throw std::runtime_error("TreePM top-level domain packet has invalid source rank");
+        }
+        auto& rank_packets = peer_hierarchy_by_rank[static_cast<std::size_t>(packet.descriptor.source_rank)];
+        rank_packets.push_back(packet);
+      }
+
+      // Route target discovery through a compact top-domain BVH. Authoritative
+      // decomposition geometry may expose several leaves for one owner; empty
+      // source ranks legitimately expose none. The fallback path contributes
+      // one derived tree-root leaf and is tracked as lower-capability geometry.
+      std::pmr::vector<std::uint8_t> peer_needed(
+          static_cast<std::size_t>(mpi_world_size), 0U,
+          std::pmr::polymorphic_allocator<std::uint8_t>(tree_resource));
+      for (std::size_t active_i = 0; active_i < accumulator.active_particle_index.size(); ++active_i) {
+        const std::span<const int> owners = top_level_domain_hierarchy->ownersWithinCutoff(
+            target_x(active_i),
+            target_y(active_i),
+            target_z(active_i),
+            cutoff_radius_comoving,
+            box_lengths,
+            mpi_world_rank,
+            owner_query_scratch);
+        for (const int peer : owners) {
+          peer_needed[static_cast<std::size_t>(peer)] = 1U;
+        }
+      }
+      for (int peer = 0; peer < mpi_world_size; ++peer) {
+        if (peer != mpi_world_rank && peer_needed[static_cast<std::size_t>(peer)] != 0U) {
+          requested_outgoing_peers.push_back(peer);
+        }
+      }
+
+      m_last_residual_stats.top_level_domain_leaf_count =
+          static_cast<std::uint64_t>(peer_pseudo_packets.size());
+      m_last_residual_stats.authoritative_domain_leaf_count =
+          static_cast<std::uint64_t>(std::count_if(
+              peer_pseudo_packets.begin(), peer_pseudo_packets.end(),
+              [](const parallel::TreePseudoParticlePacket& packet) {
+                return !packet.descriptor.derived_not_authoritative;
+              }));
+      m_last_residual_stats.domain_hierarchy_node_count =
+          static_cast<std::uint64_t>(top_level_domain_hierarchy->nodeCount());
+      m_last_residual_stats.remote_hierarchy_packets =
+          static_cast<std::uint64_t>(std::count_if(
+              peer_pseudo_packets.begin(), peer_pseudo_packets.end(),
+              [mpi_world_rank](const parallel::TreePseudoParticlePacket& packet) {
+                return packet.descriptor.source_rank != mpi_world_rank;
+              }));
+      std::fill(communicated_with_peer.begin(), communicated_with_peer.end(), 0U);
+    } catch (...) {
+      peer_domain_failure = std::current_exception();
+    }
+    coordinate_protocol_failure(peer_domain_failure, "top-level domain and sparse-peer discovery");
+    m_last_residual_stats.let_discovery_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - let_discovery_start).count();
+
+    // Graph communicators are expensive MPI objects. Reuse the cached graph while
+    // decomposition epoch and this rank's adjacency are unchanged. The all-rank
+    // agreement makes rebuild/reuse a collective decision, preventing one rank
+    // from entering graph construction while a peer reuses an old communicator.
+    const auto graph_setup_start = std::chrono::steady_clock::now();
+    auto& graph_cache = *m_sparse_peer_graph_cache;
+    const bool local_graph_cache_match =
+        graph_cache.valid &&
+        graph_cache.decomposition_epoch == options.decomposition_epoch &&
+        graph_cache.world_size == mpi_world_size &&
+        graph_cache.requested_outgoing_peers.size() == requested_outgoing_peers.size() &&
+        std::equal(
+            graph_cache.requested_outgoing_peers.begin(),
+            graph_cache.requested_outgoing_peers.end(),
+            requested_outgoing_peers.begin());
+    int local_graph_cache_match_int = local_graph_cache_match ? 1 : 0;
+    int all_graph_cache_match = 0;
+    requireTreePmMpiSuccess(
+        MPI_Allreduce(
+            &local_graph_cache_match_int,
+            &all_graph_cache_match,
+            1,
+            MPI_INT,
+            MPI_MIN,
+            MPI_COMM_WORLD),
+        "TreePM sparse graph-cache agreement MPI_Allreduce");
+    if (all_graph_cache_match == 0) {
+      ++m_last_residual_stats.graph_cache_miss_count;
+      graph_cache.graph = makeSymmetricSparsePeerGraph(
+          mpi_world_rank,
+          std::span<const int>(requested_outgoing_peers.data(), requested_outgoing_peers.size()));
+      graph_cache.valid = true;
+      graph_cache.decomposition_epoch = options.decomposition_epoch;
+      graph_cache.world_size = mpi_world_size;
+      graph_cache.requested_outgoing_peers.assign(
+          requested_outgoing_peers.begin(), requested_outgoing_peers.end());
+    } else {
+      ++m_last_residual_stats.graph_cache_hit_count;
+    }
+    sparse_peer_graph = &graph_cache.graph;
+    m_last_residual_stats.let_candidate_peer_count =
+        static_cast<std::uint64_t>(sparse_peer_graph->outgoing_peers.size());
+    m_last_residual_stats.let_graph_setup_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - graph_setup_start).count();
+
+    // The configured per-peer batch bound alone is insufficient for classic
+    // MPI collectives: counts may be individually representable while the
+    // aggregate displacement span across many sparse peers exceeds INT_MAX.
+    // Derive a topology-aware target count and agree on the global minimum so
+    // every rank executes the same number of physical exchange rounds.  The
+    // logical request stream may be arbitrarily larger than one MPI round.
+    const std::size_t local_peer_degree = std::max(
+        sparse_peer_graph->outgoing_peers.size(),
+        sparse_peer_graph->incoming_peers.size());
+    std::uint64_t local_mpi_safe_targets = 0U;
+    std::exception_ptr aggregate_round_failure;
+    try {
+      local_mpi_safe_targets = static_cast<std::uint64_t>(
+          internal::planSparseTreePmRound(
+              max_requests_per_peer,
+              local_peer_degree,
+              k_short_range_request_wire_bytes,
+              k_short_range_response_wire_bytes)
+              .targets_per_peer_per_round);
+    } catch (...) {
+      aggregate_round_failure = std::current_exception();
+    }
+    coordinate_protocol_failure(
+        aggregate_round_failure,
+        "sparse aggregate classic-MPI round planning");
+    std::uint64_t global_mpi_safe_targets = 0U;
+    requireTreePmMpiSuccess(
+        MPI_Allreduce(
+            &local_mpi_safe_targets,
+            &global_mpi_safe_targets,
+            1,
+            MPI_UINT64_T,
+            MPI_MIN,
+            MPI_COMM_WORLD),
+        "TreePM sparse aggregate-round target bound MPI_Allreduce");
+    if (global_mpi_safe_targets == 0U) {
+      throw std::overflow_error(
+          "TreePM sparse peer degree cannot fit one target request/response "
+          "round within classic MPI int displacement capacity");
+    }
+    max_requests_per_peer = std::min(
+        max_requests_per_peer,
+        core::checkedIntegralNarrow<std::size_t>(
+            global_mpi_safe_targets,
+            "TreePM sparse aggregate-round target count"));
+
+    std::uint64_t local_active_count_u64 =
+        static_cast<std::uint64_t>(accumulator.active_particle_index.size());
+    std::uint64_t global_active_count_max_u64 = 0;
+    MPI_Allreduce(
+        &local_active_count_u64,
+        &global_active_count_max_u64,
+        1,
+        MPI_UINT64_T,
+        MPI_MAX,
+        MPI_COMM_WORLD);
+    const std::size_t global_active_count_max =
+        static_cast<std::size_t>(global_active_count_max_u64);
+    for (std::size_t batch_begin = 0; batch_begin < global_active_count_max;) {
+      const std::size_t local_remaining =
+          batch_begin < accumulator.active_particle_index.size()
+          ? accumulator.active_particle_index.size() - batch_begin
+          : 0U;
+      const std::size_t batch_size = std::min(
+          max_requests_per_peer,
+          local_remaining);
+       std::uint32_t batch_token = 0U;
+       int total_send_bytes = 0;
+       const std::size_t local_block_count =
+           (batch_size + k_residual_block_size - 1U) / k_residual_block_size;
+       std::exception_ptr request_preparation_failure;
+       try {
+         if (m_block_sum_sq_storage.size() < local_block_count) {
+           m_block_sum_sq_storage.resize(local_block_count, 0.0);
+         }
+         m_block_sum_sq_high_water_bytes = std::max<std::uint64_t>(
+             m_block_sum_sq_high_water_bytes,
+             core::ownedCapacityBytesForContainer(m_block_sum_sq_storage));
+         std::fill(
+             m_block_sum_sq_storage.begin(), m_block_sum_sq_storage.end(), 0.0);
+         std::fill(
+             m_worker_counter_storage.begin(), m_worker_counter_storage.end(),
+             ResidualTraversalCounters{});
+         if (batch_begin > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) ||
+
+            batch_size > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+          throw std::overflow_error("TreePM short-range batch token or request ID exceeds packet capacity");
+        }
+        batch_token = static_cast<std::uint32_t>(batch_begin);
+
+        for (auto& peer_requests : requests_by_peer) {
+          peer_requests.clear();
+        }
+        for (int peer = 0; peer < mpi_world_size; ++peer) {
+          response_expected_by_peer[static_cast<std::size_t>(peer)].assign(batch_size, 0U);
+          response_seen_by_peer[static_cast<std::size_t>(peer)].assign(batch_size, 0U);
+          if (peer != mpi_world_rank) {
+            requests_by_peer[static_cast<std::size_t>(peer)].reserve(batch_size);
+          }
+        }
+
+        expected_response_count.assign(batch_size, 0U);
+        received_response_count.assign(batch_size, 0U);
+        for (std::size_t batch_slot = 0; batch_slot < batch_size; ++batch_slot) {
+        const TreeLocalIndex particle_index =
+            accumulator.active_particle_index[batch_begin + batch_slot];
+        const bool has_local_source_identity =
+            particle_index < pos_x_comoving.size();
+        const double px = target_x(batch_begin + batch_slot);
+        const double py = target_y(batch_begin + batch_slot);
+        const double pz = target_z(batch_begin + batch_slot);
+        const double target_softening =
+            targetSofteningEpsilonUnchecked(
+                 batch_begin + batch_slot,
+                 has_local_source_identity ? particle_index : 0U,
+                 validated_target_softening);
+        const bool previous_acceleration_available =
+            !accumulator.previous_acceleration_magnitude_code.empty() &&
+            std::isfinite(accumulator.previous_acceleration_magnitude_code[batch_begin + batch_slot]);
+        const double previous_acceleration_magnitude_code = previous_acceleration_available
+            ? accumulator.previous_acceleration_magnitude_code[batch_begin + batch_slot]
+            : 0.0;
+        const std::span<const int> target_peers = top_level_domain_hierarchy->ownersWithinCutoff(
+            px, py, pz, cutoff_radius_comoving, box_lengths, mpi_world_rank,
+            owner_query_scratch);
+        if (sparse_peer_graph->outgoing_peers.size() > target_peers.size()) {
+          m_last_residual_stats.remote_pairs_pruned_by_bounds +=
+              static_cast<std::uint64_t>(
+                  sparse_peer_graph->outgoing_peers.size() - target_peers.size());
+        }
+        for (const int peer : target_peers) {
+          requests_by_peer[static_cast<std::size_t>(peer)].push_back(ShortRangeTargetRequestPacket{
+              .wire_version = k_short_range_wire_version,
+              .origin_rank = mpi_world_rank,
+              .destination_rank = peer,
+              .flags = previous_acceleration_available ? k_short_range_flag_previous_acceleration : 0U,
+              .batch_token = batch_token,
+              .request_id = static_cast<std::uint32_t>(batch_slot),
+              .exchange_sequence = exchange_sequence,
+              .decomposition_epoch = options.decomposition_epoch.value,
+              .force_epoch = options.force_epoch.sequence,
+              .target_identity = static_cast<std::uint64_t>(batch_begin + batch_slot),
+              .target_x_comoving = px,
+              .target_y_comoving = py,
+              .target_z_comoving = pz,
+              .target_softening_epsilon_comoving = target_softening,
+              .previous_acceleration_magnitude = previous_acceleration_magnitude_code,
+          });
+          response_expected_by_peer[static_cast<std::size_t>(peer)][batch_slot] = 1U;
+          if (expected_response_count[batch_slot] == std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("TreePM short-range expected-response counter exceeds packet coverage capacity");
+          }
+          ++expected_response_count[batch_slot];
+        }
+        if (expected_response_count[batch_slot] > 0U) {
+          ++m_last_residual_stats.remote_targets_with_requests;
+        } else {
+          ++m_last_residual_stats.remote_targets_without_requests;
+        }
+        }
+
+        std::fill(send_counts.begin(), send_counts.end(), 0);
+        std::fill(recv_counts.begin(), recv_counts.end(), 0);
+        std::fill(send_displs.begin(), send_displs.end(), 0);
+        std::fill(recv_displs.begin(), recv_displs.end(), 0);
+        send_payload.clear();
+        for (int peer = 0; peer < mpi_world_size; ++peer) {
+        if (peer == mpi_world_rank) {
+          continue;
+        }
+        send_counts[static_cast<std::size_t>(peer)] = checkedMpiByteCount(
+            requests_by_peer[static_cast<std::size_t>(peer)].size(),
+            k_short_range_request_wire_bytes,
+            "TreePM short-range request payload");
+        }
+        total_send_bytes = populateMpiByteDisplacements(
+            send_counts, send_displs, "TreePM short-range request send layout");
+        send_payload.resize(static_cast<std::size_t>(total_send_bytes), 0U);
+        for (int peer = 0; peer < mpi_world_size; ++peer) {
+        if (peer == mpi_world_rank || requests_by_peer[static_cast<std::size_t>(peer)].empty()) {
+          continue;
+        }
+        encodeShortRangeRequests(
+            std::span<const ShortRangeTargetRequestPacket>(
+                requests_by_peer[static_cast<std::size_t>(peer)].data(),
+                requests_by_peer[static_cast<std::size_t>(peer)].size()),
+            request_codec_bytes);
+        std::copy(
+            request_codec_bytes.begin(),
+            request_codec_bytes.end(),
+            send_payload.begin() + send_displs[static_cast<std::size_t>(peer)]);
+        }
+      } catch (...) {
+        request_preparation_failure = std::current_exception();
+      }
+      coordinate_protocol_failure(
+          request_preparation_failure, "outbound request preparation");
+
+      // Exchange request counts only across the locality-derived graph. The
+      // graph is symmetric so source-only ranks can receive requests from
+      // target-only ranks without communicator-wide all-to-all participation.
+      neighbor_request_send_counts.assign(sparse_peer_graph->outgoing_peers.size(), 0);
+      neighbor_request_recv_counts.assign(sparse_peer_graph->incoming_peers.size(), 0);
+      for (std::size_t i = 0; i < sparse_peer_graph->outgoing_peers.size(); ++i) {
+        neighbor_request_send_counts[i] =
+            send_counts[static_cast<std::size_t>(sparse_peer_graph->outgoing_peers[i])];
+      }
+      const auto request_count_communication_start = std::chrono::steady_clock::now();
+      std::exception_ptr request_count_communication_failure;
+      try {
+        int zero_count_lane = 0;
+        requireTreePmMpiSuccess(
+            MPI_Neighbor_alltoall(
+                neighbor_request_send_counts.empty()
+                    ? &zero_count_lane
+                    : neighbor_request_send_counts.data(),
+                1,
+                MPI_INT,
+                neighbor_request_recv_counts.empty()
+                    ? &zero_count_lane
+                    : neighbor_request_recv_counts.data(),
+                1,
+                MPI_INT,
+                sparse_peer_graph->communicator),
+            "TreePM sparse request-count MPI_Neighbor_alltoall");
+      } catch (...) {
+        request_count_communication_failure = std::current_exception();
+      }
+      coordinate_protocol_failure(
+          request_count_communication_failure, "sparse request-count exchange");
+      m_last_residual_stats.let_communication_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - request_count_communication_start).count();
+      for (std::size_t i = 0; i < sparse_peer_graph->incoming_peers.size(); ++i) {
+        recv_counts[static_cast<std::size_t>(sparse_peer_graph->incoming_peers[i])] =
+            neighbor_request_recv_counts[i];
+      }
+      for (const int peer : sparse_peer_graph->outgoing_peers) {
+        if (send_counts[static_cast<std::size_t>(peer)] > 0 ||
+            recv_counts[static_cast<std::size_t>(peer)] > 0) {
+          communicated_with_peer[static_cast<std::size_t>(peer)] = 1U;
+        }
+      }
+        int total_recv_bytes = 0;
+        std::exception_ptr request_transport_preparation_failure;
+        MPI_Request request_payload_exchange = MPI_REQUEST_NULL;
+        try {
+          total_recv_bytes = populateMpiByteDisplacements(
+
+
+            recv_counts, recv_displs, "TreePM short-range request receive layout");
+        recv_payload.resize(static_cast<std::size_t>(total_recv_bytes), 0U);
+
+        neighbor_request_send_displs.assign(sparse_peer_graph->outgoing_peers.size(), 0);
+        neighbor_request_recv_displs.assign(sparse_peer_graph->incoming_peers.size(), 0);
+        for (std::size_t i = 0; i < sparse_peer_graph->outgoing_peers.size(); ++i) {
+          neighbor_request_send_displs[i] =
+              send_displs[static_cast<std::size_t>(sparse_peer_graph->outgoing_peers[i])];
+        }
+        for (std::size_t i = 0; i < sparse_peer_graph->incoming_peers.size(); ++i) {
+          neighbor_request_recv_displs[i] =
+              recv_displs[static_cast<std::size_t>(sparse_peer_graph->incoming_peers[i])];
+        }
+
+        std::uint8_t empty_request_payload = 0U;
+        const std::uint8_t* request_send_buffer =
+            send_payload.empty() ? &empty_request_payload : send_payload.data();
+        std::uint8_t* request_receive_buffer =
+            recv_payload.empty() ? &empty_request_payload : recv_payload.data();
+        int zero_count_lane = 0;
+        int zero_displacement_lane = 0;
+        requireTreePmMpiSuccess(
+            MPI_Ineighbor_alltoallv(
+                request_send_buffer,
+                neighbor_request_send_counts.empty()
+                    ? &zero_count_lane
+                    : neighbor_request_send_counts.data(),
+                neighbor_request_send_displs.empty()
+                    ? &zero_displacement_lane
+                    : neighbor_request_send_displs.data(),
+                MPI_BYTE,
+                request_receive_buffer,
+                neighbor_request_recv_counts.empty()
+                    ? &zero_count_lane
+                    : neighbor_request_recv_counts.data(),
+                neighbor_request_recv_displs.empty()
+                    ? &zero_displacement_lane
+                    : neighbor_request_recv_displs.data(),
+                MPI_BYTE,
+                sparse_peer_graph->communicator,
+                &request_payload_exchange),
+            "TreePM sparse request MPI_Ineighbor_alltoallv");
+
+         const auto overlap_local_work_start = std::chrono::steady_clock::now();
+         {
+           std::exception_ptr overlap_local_failure;
+           int region_observed_workers = 1;
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel
+           {
+#pragma omp single
+             {
+               region_observed_workers = omp_get_num_threads();
+             }
+#pragma omp for schedule(dynamic, 1)
+#endif
+           for (std::ptrdiff_t block = 0;
+                block < static_cast<std::ptrdiff_t>(local_block_count);
+                ++block) {
+             try {
+               const std::size_t block_begin =
+                   static_cast<std::size_t>(block) * k_residual_block_size;
+               const std::size_t block_end =
+                   std::min(block_begin + k_residual_block_size, batch_size);
+               const std::size_t worker_slot = current_worker_slot();
+               BoundedTreeStack stack = worker_stack(worker_slot);
+               ResidualTraversalCounters& counters =
+                   m_worker_counter_storage[worker_slot];
+               ResidualSpatialWorkCounters* spatial_counters = options.spatial_work_history_enabled
+                   ? &m_worker_spatial_counter_storage[worker_slot] : nullptr;
+               double local_sum_sq = 0.0;
+               const auto block_work_start = std::chrono::steady_clock::now();
+               for (std::size_t batch_slot = block_begin;
+                    batch_slot < block_end;
+                    ++batch_slot) {
+                 const TreeLocalIndex particle_index =
+                     accumulator.active_particle_index[batch_begin + batch_slot];
+                 const bool has_local_source_identity =
+                     particle_index < pos_x_comoving.size();
+                 const double target_softening = targetSofteningEpsilonUnchecked(
+                     batch_begin + batch_slot,
+                     has_local_source_identity ? particle_index : 0U,
+                     validated_target_softening);
+                 const bool previous_acceleration_available =
+                     !accumulator.previous_acceleration_magnitude_code.empty() &&
+                     std::isfinite(
+                         accumulator.previous_acceleration_magnitude_code[
+                             batch_begin + batch_slot]);
+                 const double previous_acceleration_magnitude_code =
+                     previous_acceleration_available
+                         ? accumulator.previous_acceleration_magnitude_code[
+                               batch_begin + batch_slot]
+                         : 0.0;
+                 const auto local_accel = evaluateTargetAgainstLocalTree(
+                     counters,
+                     spatial_counters,
+                     stack,
+                     target_x(batch_begin + batch_slot),
+                     target_y(batch_begin + batch_slot),
+                     target_z(batch_begin + batch_slot),
+                     has_local_source_identity ? particle_index : 0U,
+                     has_local_source_identity,
+                     target_softening,
+                     previous_acceleration_available,
+                     previous_acceleration_magnitude_code);
+                 accumulator.addShortRangeToActiveSlot(
+                     batch_begin + batch_slot,
+                     local_accel[0],
+                     local_accel[1],
+                     local_accel[2]);
+                 accumulator.noteNearestPairToActiveSlot(
+                     batch_begin + batch_slot, local_accel[3]);
+                 local_sum_sq +=
+                     local_accel[0] * local_accel[0] +
+                     local_accel[1] * local_accel[1] +
+                     local_accel[2] * local_accel[2];
+               }
+               const double block_work_ms = std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - block_work_start).count();
+               counters.elapsed_work_ms += block_work_ms;
+               counters.block_work_ms_max = std::max(counters.block_work_ms_max, block_work_ms);
+               m_block_sum_sq_storage[static_cast<std::size_t>(block)] =
+                   local_sum_sq;
+             } catch (...) {
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp critical(tree_pm_overlap_failure)
+#endif
+               {
+                 if (!overlap_local_failure) {
+                   overlap_local_failure = std::current_exception();
+                 }
+               }
+             }
+           }
+#if COSMOSIM_HAVE_OPENMP
+           }
+#endif
+           observed_openmp_workers = std::max(
+               observed_openmp_workers, region_observed_workers);
+           if (overlap_local_failure) {
+             std::rethrow_exception(overlap_local_failure);
+           }
+           for (const ResidualTraversalCounters& counters : m_worker_counter_storage) {
+             merge_counters(local_owned_targets, counters);
+             summarize_worker(counters);
+           }
+           for (std::size_t block = 0; block < local_block_count; ++block) {
+             m_last_residual_stats.local_short_range_sum_sq +=
+                 m_block_sum_sq_storage[block];
+           }
+         }
+         const double overlap_local_work_ms = std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - overlap_local_work_start).count();
+         m_last_residual_stats.let_overlap_local_work_ms += overlap_local_work_ms;
+         const auto request_wait_start = std::chrono::steady_clock::now();
+         requireTreePmMpiSuccess(
+             MPI_Wait(&request_payload_exchange, MPI_STATUS_IGNORE),
+             "TreePM sparse request MPI_Wait");
+         const double request_wait_ms = std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - request_wait_start).count();
+         m_last_residual_stats.let_communication_wait_ms += request_wait_ms;
+         m_last_residual_stats.let_communication_ms += request_wait_ms;
+
+      } catch (...) {
+        if (request_payload_exchange != MPI_REQUEST_NULL) {
+          MPI_Wait(&request_payload_exchange, MPI_STATUS_IGNORE);
+        }
+        request_transport_preparation_failure = std::current_exception();
+      }
+      coordinate_protocol_failure(
+          request_transport_preparation_failure,
+          "request receive/local-force preparation");
+      const double overlap_denominator_ms =
+          m_last_residual_stats.let_overlap_local_work_ms +
+          m_last_residual_stats.let_communication_wait_ms;
+      m_last_residual_stats.let_overlap_efficiency = overlap_denominator_ms > 0.0
+          ? m_last_residual_stats.let_overlap_local_work_ms / overlap_denominator_ms
+          : 0.0;
+
+      m_last_residual_stats.remote_request_batches += 1;
+      m_last_residual_stats.remote_request_packets +=
+          static_cast<std::uint64_t>(total_send_bytes / static_cast<int>(k_short_range_request_wire_bytes));
+      m_last_residual_stats.remote_request_bytes += static_cast<std::uint64_t>(total_send_bytes);
+      m_last_residual_stats.let_exported_target_count +=
+          static_cast<std::uint64_t>(total_send_bytes / static_cast<int>(k_short_range_request_wire_bytes));
+      m_last_residual_stats.let_imported_target_count +=
+          static_cast<std::uint64_t>(total_recv_bytes / static_cast<int>(k_short_range_request_wire_bytes));
+      m_last_residual_stats.let_wire_bytes_sent += static_cast<std::uint64_t>(total_send_bytes);
+      m_last_residual_stats.let_wire_bytes_received += static_cast<std::uint64_t>(total_recv_bytes);
+      m_last_residual_stats.remote_peer_participations += static_cast<std::uint64_t>(std::count_if(send_counts.begin(), send_counts.end(), [](int bytes) { return bytes > 0; }));
+      m_last_residual_stats.remote_peer_participations += static_cast<std::uint64_t>(std::count_if(recv_counts.begin(), recv_counts.end(), [](int bytes) { return bytes > 0; }));
+      {
+        std::uint64_t packet_sum = 0;
+        std::uint64_t packet_max = 0;
+        for (int peer = 0; peer < mpi_world_size; ++peer) {
+          if (peer == mpi_world_rank) {
+            continue;
+          }
+          const std::uint64_t packets = static_cast<std::uint64_t>(
+              send_counts[static_cast<std::size_t>(peer)] / static_cast<int>(k_short_range_request_wire_bytes));
+          packet_sum += packets;
+          packet_max = std::max(packet_max, packets);
+        }
+        m_last_residual_stats.remote_request_packets_max_peer =
+            std::max(m_last_residual_stats.remote_request_packets_max_peer, packet_max);
+        const double mean_packets = (mpi_world_size > 1)
+            ? static_cast<double>(packet_sum) / static_cast<double>(mpi_world_size - 1)
+            : 0.0;
+        const double imbalance = (mean_packets > 0.0) ? static_cast<double>(packet_max) / mean_packets : 0.0;
+        m_last_residual_stats.remote_request_packet_imbalance_ratio =
+            std::max(m_last_residual_stats.remote_request_packet_imbalance_ratio, imbalance);
+      }
+
+      int total_response_send_bytes = 0;
+      int total_response_recv_bytes = 0;
+      std::exception_ptr request_validation_failure;
+      // Four non-overlapping remote-phase scopes: response layout/payload
+      // sizing (protocol_validation_ms), incoming request decode/validation,
+      // pure incoming tree compute, and response encode/pack. Consensus and
+      // the response exchange stay separate after this block, so no scope
+      // double-counts and the compute timer surrounds only target force
+      // evaluation.
+      const auto remote_phase_start = std::chrono::steady_clock::now();
+      double protocol_validation_ms_batch = 0.0;
+      double incoming_decode_validation_ms_batch = 0.0;
+      double incoming_compute_ms_batch = 0.0;
+      double incoming_encode_pack_ms_batch = 0.0;
+      try {
+      std::fill(response_send_counts.begin(), response_send_counts.end(), 0);
+      std::fill(response_send_displs.begin(), response_send_displs.end(), 0);
+      std::fill(response_recv_counts.begin(), response_recv_counts.end(), 0);
+      std::fill(response_recv_displs.begin(), response_recv_displs.end(), 0);
+      for (int peer = 0; peer < mpi_world_size; ++peer) {
+        if (recv_counts[static_cast<std::size_t>(peer)] % static_cast<int>(k_short_range_request_wire_bytes) != 0) {
+          throw std::runtime_error("TreePM short-range request payload size is not request-record aligned");
+        }
+        if (send_counts[static_cast<std::size_t>(peer)] % static_cast<int>(k_short_range_request_wire_bytes) != 0) {
+          throw std::runtime_error("TreePM short-range outbound request payload size is not request-record aligned");
+        }
+        const int inbound_request_records =
+            recv_counts[static_cast<std::size_t>(peer)] / static_cast<int>(k_short_range_request_wire_bytes);
+        const int outbound_request_records =
+            send_counts[static_cast<std::size_t>(peer)] / static_cast<int>(k_short_range_request_wire_bytes);
+        response_send_counts[static_cast<std::size_t>(peer)] = checkedMpiByteCount(
+            static_cast<std::size_t>(inbound_request_records),
+            k_short_range_response_wire_bytes,
+            "TreePM short-range response send payload");
+        response_recv_counts[static_cast<std::size_t>(peer)] = checkedMpiByteCount(
+            static_cast<std::size_t>(outbound_request_records),
+            k_short_range_response_wire_bytes,
+            "TreePM short-range response receive payload");
+      }
+      total_response_send_bytes = populateMpiByteDisplacements(
+          response_send_counts, response_send_displs, "TreePM short-range response send layout");
+      total_response_recv_bytes = populateMpiByteDisplacements(
+          response_recv_counts, response_recv_displs, "TreePM short-range response receive layout");
+
+      response_send_payload.assign(static_cast<std::size_t>(total_response_send_bytes), 0U);
+      response_recv_payload.resize(static_cast<std::size_t>(total_response_recv_bytes), 0U);
+      protocol_validation_ms_batch = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - remote_phase_start).count();
+      for (int peer = 0; peer < mpi_world_size; ++peer) {
+        const int peer_recv_bytes = recv_counts[static_cast<std::size_t>(peer)];
+        if (peer_recv_bytes == 0) {
+          continue;
+        }
+        const std::span<const std::uint8_t> peer_request_bytes(
+            recv_payload.data() + recv_displs[static_cast<std::size_t>(peer)],
+            static_cast<std::size_t>(peer_recv_bytes));
+
+        // A. Request decode, identity/duplicate/finite validation, and
+        // response structure preparation (metadata only; no accelerations).
+        // Throwing validation stays on the main thread before OpenMP compute.
+        const auto decode_validation_start = std::chrono::steady_clock::now();
+        decodeShortRangeRequests(peer_request_bytes, decoded_requests);
+        peer_responses.clear();
+        peer_target_identity_scratch.clear();
+        for (const ShortRangeTargetRequestPacket& request : decoded_requests) {
+          if (request.wire_version != k_short_range_wire_version || request.origin_rank != peer ||
+              request.destination_rank != mpi_world_rank || request.exchange_sequence != exchange_sequence ||
+              request.decomposition_epoch != options.decomposition_epoch.value || request.force_epoch != options.force_epoch.sequence ||
+              request.batch_token != batch_token || request.request_id >= max_requests_per_peer ||
+              request.target_identity != static_cast<std::uint64_t>(request.batch_token) + request.request_id ||
+              (request.flags & ~k_short_range_flag_previous_acceleration) != 0U) {
+            throw std::runtime_error("TreePM short-range request protocol identity mismatch");
+          }
+          if (!std::isfinite(request.target_x_comoving) || !std::isfinite(request.target_y_comoving) ||
+              !std::isfinite(request.target_z_comoving) ||
+              !std::isfinite(request.target_softening_epsilon_comoving) ||
+              request.target_softening_epsilon_comoving < 0.0 ||
+              !std::isfinite(request.previous_acceleration_magnitude)) {
+            throw std::runtime_error("TreePM short-range request contains invalid numeric data");
+          }
+          peer_target_identity_scratch.push_back(request.target_identity);
+          peer_responses.push_back(ShortRangeTargetResponsePacket{
+              .wire_version = k_short_range_wire_version,
+              .target_owner_rank = request.origin_rank,
+              .source_rank = mpi_world_rank,
+              .flags = request.flags,
+              .batch_token = request.batch_token,
+              .request_id = request.request_id,
+              .exchange_sequence = request.exchange_sequence,
+              .decomposition_epoch = request.decomposition_epoch,
+              .force_epoch = request.force_epoch,
+              .target_identity = request.target_identity,
+          });
+        }
+        std::sort(peer_target_identity_scratch.begin(), peer_target_identity_scratch.end());
+        if (std::adjacent_find(
+                peer_target_identity_scratch.begin(),
+                peer_target_identity_scratch.end()) != peer_target_identity_scratch.end()) {
+          throw std::runtime_error(
+              "TreePM short-range request contains a duplicate target identity");
+        }
+        incoming_decode_validation_ms_batch += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - decode_validation_start).count();
+
+        // B. Pure incoming tree compute: evaluated targets only. The direct
+        // acceleration write into the already-prepared response slot is
+        // inseparable from recording the evaluation result. No decode, hash,
+        // validation, serialization, or communication lives in this scope.
+        // MPI remains main-thread only (MPI_THREAD_FUNNELED): OpenMP workers
+        // write only peer_responses[*].accel_{x,y,z}_comoving.
+        const auto incoming_compute_start = std::chrono::steady_clock::now();
+        {
+          const std::size_t incoming_count = decoded_requests.size();
+          const std::size_t incoming_block_count =
+              (incoming_count + k_residual_block_size - 1U) / k_residual_block_size;
+          std::fill(
+              m_worker_counter_storage.begin(), m_worker_counter_storage.end(),
+              ResidualTraversalCounters{});
+          std::exception_ptr incoming_compute_failure;
+          int region_observed_workers = 1;
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp parallel
+          {
+#pragma omp single
+            {
+              region_observed_workers = omp_get_num_threads();
+            }
+#pragma omp for schedule(dynamic, 1)
+#endif
+          for (std::ptrdiff_t block = 0;
+               block < static_cast<std::ptrdiff_t>(incoming_block_count);
+               ++block) {
+            try {
+              const std::size_t block_begin =
+                  static_cast<std::size_t>(block) * k_residual_block_size;
+              const std::size_t block_end =
+                  std::min(block_begin + k_residual_block_size, incoming_count);
+              const std::size_t worker_slot = current_worker_slot();
+              BoundedTreeStack stack = worker_stack(worker_slot);
+              ResidualTraversalCounters& counters =
+                  m_worker_counter_storage[worker_slot];
+              const auto block_work_start = std::chrono::steady_clock::now();
+              for (std::size_t peer_slot = block_begin;
+                   peer_slot < block_end;
+                   ++peer_slot) {
+                const ShortRangeTargetRequestPacket& request =
+                    decoded_requests[peer_slot];
+                const auto remote_accel = evaluateTargetAgainstLocalTree(
+                    counters,
+                    nullptr,
+                    stack,
+                    request.target_x_comoving,
+                    request.target_y_comoving,
+                    request.target_z_comoving,
+                    0U,
+                    false,
+                    request.target_softening_epsilon_comoving,
+                    (request.flags & k_short_range_flag_previous_acceleration) != 0U,
+                    request.previous_acceleration_magnitude);
+                peer_responses[peer_slot].accel_x_comoving = remote_accel[0];
+                peer_responses[peer_slot].accel_y_comoving = remote_accel[1];
+                peer_responses[peer_slot].accel_z_comoving = remote_accel[2];
+                peer_responses[peer_slot].nearest_pair_r2_comoving = remote_accel[3];
+              }
+              const double block_work_ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - block_work_start).count();
+              counters.elapsed_work_ms += block_work_ms;
+              counters.block_work_ms_max = std::max(counters.block_work_ms_max, block_work_ms);
+            } catch (...) {
+#if COSMOSIM_HAVE_OPENMP
+#pragma omp critical(tree_pm_incoming_failure)
+#endif
+              {
+                if (!incoming_compute_failure) {
+                  incoming_compute_failure = std::current_exception();
+                }
+              }
+            }
+          }
+#if COSMOSIM_HAVE_OPENMP
+          }
+#endif
+          observed_openmp_workers = std::max(
+              observed_openmp_workers, region_observed_workers);
+          if (incoming_compute_failure) {
+            std::rethrow_exception(incoming_compute_failure);
+          }
+          for (const ResidualTraversalCounters& counters : m_worker_counter_storage) {
+            merge_counters(incoming_remote_targets, counters);
+            summarize_worker(counters);
+          }
+          incoming_evaluated_target_count +=
+              static_cast<std::uint64_t>(incoming_count);
+        }
+        incoming_compute_ms_batch += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - incoming_compute_start).count();
+
+        // C. Response byte encoding, size check, and direct pack into the
+        // response send payload.
+        const auto encode_pack_start = std::chrono::steady_clock::now();
+        encodeShortRangeResponses(
+            std::span<const ShortRangeTargetResponsePacket>(
+                peer_responses.data(), peer_responses.size()),
+            response_codec_bytes);
+        if (response_codec_bytes.size() != static_cast<std::size_t>(response_send_counts[static_cast<std::size_t>(peer)])) {
+          throw std::runtime_error("TreePM short-range response payload size mismatch");
+        }
+        std::copy(
+            response_codec_bytes.begin(),
+            response_codec_bytes.end(),
+            response_send_payload.begin() + response_send_displs[static_cast<std::size_t>(peer)]);
+        incoming_encode_pack_ms_batch += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - encode_pack_start).count();
+      }
+      } catch (...) {
+        request_validation_failure = std::current_exception();
+      }
+      const auto consensus_start = std::chrono::steady_clock::now();
+      coordinate_protocol_failure(
+          request_validation_failure, "received request");
+      const double protocol_consensus_ms_batch = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - consensus_start).count();
+      m_last_residual_stats.protocol_validation_ms += protocol_validation_ms_batch;
+      m_last_residual_stats.incoming_request_decode_validation_ms +=
+          incoming_decode_validation_ms_batch;
+      m_last_residual_stats.incoming_remote_target_compute_ms += incoming_compute_ms_batch;
+      m_last_residual_stats.incoming_response_encode_pack_ms += incoming_encode_pack_ms_batch;
+      m_last_residual_stats.protocol_consensus_ms += protocol_consensus_ms_batch;
+      // Compatibility alias: previously the inclusive validation+compute+
+      // consensus span; now incoming-target compute only.
+      m_last_residual_stats.let_remote_traversal_ms += incoming_compute_ms_batch;
+
+      neighbor_response_send_counts.assign(sparse_peer_graph->outgoing_peers.size(), 0);
+      neighbor_response_send_displs.assign(sparse_peer_graph->outgoing_peers.size(), 0);
+      neighbor_response_recv_counts.assign(sparse_peer_graph->incoming_peers.size(), 0);
+      neighbor_response_recv_displs.assign(sparse_peer_graph->incoming_peers.size(), 0);
+      for (std::size_t i = 0; i < sparse_peer_graph->outgoing_peers.size(); ++i) {
+        const int peer = sparse_peer_graph->outgoing_peers[i];
+        neighbor_response_send_counts[i] = response_send_counts[static_cast<std::size_t>(peer)];
+        neighbor_response_send_displs[i] = response_send_displs[static_cast<std::size_t>(peer)];
+      }
+      for (std::size_t i = 0; i < sparse_peer_graph->incoming_peers.size(); ++i) {
+        const int peer = sparse_peer_graph->incoming_peers[i];
+        neighbor_response_recv_counts[i] = response_recv_counts[static_cast<std::size_t>(peer)];
+        neighbor_response_recv_displs[i] = response_recv_displs[static_cast<std::size_t>(peer)];
+      }
+      std::uint8_t empty_response_payload = 0U;
+      const std::uint8_t* response_send_buffer =
+          response_send_payload.empty() ? &empty_response_payload : response_send_payload.data();
+      std::uint8_t* response_receive_buffer =
+          response_recv_payload.empty() ? &empty_response_payload : response_recv_payload.data();
+      const auto response_communication_start = std::chrono::steady_clock::now();
+      std::exception_ptr response_communication_failure;
+      try {
+        int zero_count_lane = 0;
+        int zero_displacement_lane = 0;
+        requireTreePmMpiSuccess(
+            MPI_Neighbor_alltoallv(
+                response_send_buffer,
+                neighbor_response_send_counts.empty()
+                    ? &zero_count_lane
+                    : neighbor_response_send_counts.data(),
+                neighbor_response_send_displs.empty()
+                    ? &zero_displacement_lane
+                    : neighbor_response_send_displs.data(),
+                MPI_BYTE,
+                response_receive_buffer,
+                neighbor_response_recv_counts.empty()
+                    ? &zero_count_lane
+                    : neighbor_response_recv_counts.data(),
+                neighbor_response_recv_displs.empty()
+                    ? &zero_displacement_lane
+                    : neighbor_response_recv_displs.data(),
+                MPI_BYTE,
+                sparse_peer_graph->communicator),
+            "TreePM sparse response MPI_Neighbor_alltoallv");
+      } catch (...) {
+        response_communication_failure = std::current_exception();
+      }
+      m_last_residual_stats.response_exchange_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - response_communication_start).count();
+      coordinate_protocol_failure(
+          response_communication_failure, "sparse response exchange");
+      m_last_residual_stats.let_communication_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - response_communication_start).count();
+
+      std::exception_ptr response_validation_failure;
+      try {
+      remote_batch_ax.assign(batch_size, 0.0);
+      remote_batch_ay.assign(batch_size, 0.0);
+      remote_batch_az.assign(batch_size, 0.0);
+      remote_batch_nearest_r2.assign(batch_size, std::numeric_limits<double>::infinity());
+      m_last_residual_stats.remote_response_bytes += static_cast<std::uint64_t>(response_recv_payload.size());
+      m_last_residual_stats.let_wire_bytes_sent += static_cast<std::uint64_t>(total_response_send_bytes);
+      m_last_residual_stats.let_wire_bytes_received += static_cast<std::uint64_t>(total_response_recv_bytes);
+      const std::uint64_t let_wire_buffer_bytes =
+          static_cast<std::uint64_t>(send_payload.capacity()) +
+          static_cast<std::uint64_t>(recv_payload.capacity()) +
+          static_cast<std::uint64_t>(response_send_payload.capacity()) +
+          static_cast<std::uint64_t>(response_recv_payload.capacity());
+      // Known arena-backed live set beyond the four wire buffers. Capacities
+      // are read from the actual PMR vectors; the one-peer codec/decoded
+      // buffers and neighbor metadata are retained for reuse within this lease
+      // and therefore count simultaneously. Small outer vector descriptors for
+      // per-peer PMR lanes remain O(rank_count) ordinary control metadata and
+      // do not own their population-scale payload.
+      std::uint64_t let_structured_request_bytes = 0U;
+      for (const auto& peer_requests : requests_by_peer) {
+        let_structured_request_bytes +=
+            static_cast<std::uint64_t>(peer_requests.capacity()) *
+            static_cast<std::uint64_t>(sizeof(ShortRangeTargetRequestPacket));
+      }
+      std::uint64_t let_response_mask_bytes = 0U;
+      for (const auto& mask : response_expected_by_peer) {
+        let_response_mask_bytes += static_cast<std::uint64_t>(mask.capacity());
+      }
+      for (const auto& mask : response_seen_by_peer) {
+        let_response_mask_bytes += static_cast<std::uint64_t>(mask.capacity());
+      }
+      const std::uint64_t let_response_count_bytes =
+          static_cast<std::uint64_t>(
+              expected_response_count.capacity() + received_response_count.capacity()) *
+          static_cast<std::uint64_t>(sizeof(std::uint32_t));
+      const std::uint64_t let_remote_accumulator_bytes =
+          static_cast<std::uint64_t>(
+              remote_batch_ax.capacity() + remote_batch_ay.capacity() +
+              remote_batch_az.capacity() + remote_batch_nearest_r2.capacity()) *
+          static_cast<std::uint64_t>(sizeof(double));
+      const std::uint64_t let_rank_metadata_bytes =
+          static_cast<std::uint64_t>(
+              send_counts.capacity() + recv_counts.capacity() +
+              send_displs.capacity() + recv_displs.capacity() +
+              response_send_counts.capacity() + response_recv_counts.capacity() +
+              response_send_displs.capacity() + response_recv_displs.capacity() +
+              neighbor_request_send_counts.capacity() +
+              neighbor_request_recv_counts.capacity() +
+              neighbor_request_send_displs.capacity() +
+              neighbor_request_recv_displs.capacity() +
+              neighbor_response_send_counts.capacity() +
+              neighbor_response_recv_counts.capacity() +
+              neighbor_response_send_displs.capacity() +
+              neighbor_response_recv_displs.capacity() +
+              requested_outgoing_peers.capacity()) *
+              static_cast<std::uint64_t>(sizeof(int)) +
+          static_cast<std::uint64_t>(communicated_with_peer.capacity());
+      const std::uint64_t let_transient_codec_bytes =
+          static_cast<std::uint64_t>(request_codec_bytes.capacity()) +
+          static_cast<std::uint64_t>(response_codec_bytes.capacity()) +
+          static_cast<std::uint64_t>(decoded_requests.capacity()) *
+              static_cast<std::uint64_t>(sizeof(ShortRangeTargetRequestPacket)) +
+          static_cast<std::uint64_t>(decoded_responses.capacity()) *
+              static_cast<std::uint64_t>(sizeof(ShortRangeTargetResponsePacket)) +
+          static_cast<std::uint64_t>(peer_responses.capacity()) *
+              static_cast<std::uint64_t>(sizeof(ShortRangeTargetResponsePacket)) +
+          static_cast<std::uint64_t>(peer_target_identity_scratch.capacity()) *
+              static_cast<std::uint64_t>(sizeof(std::uint64_t));
+      std::uint64_t let_known_workspace_bytes = let_wire_buffer_bytes;
+      let_known_workspace_bytes += let_structured_request_bytes;
+      let_known_workspace_bytes += let_response_mask_bytes;
+      let_known_workspace_bytes += let_response_count_bytes;
+      let_known_workspace_bytes += let_remote_accumulator_bytes;
+      let_known_workspace_bytes += let_rank_metadata_bytes;
+      let_known_workspace_bytes += let_transient_codec_bytes;
+      tree_communication_lease.recordLogicalHighWater(let_known_workspace_bytes);
+      m_tree_exchange_logical_high_water_bytes = std::max(
+          m_tree_exchange_logical_high_water_bytes, let_known_workspace_bytes);
+      m_last_residual_stats.let_wire_buffer_high_water_bytes =
+          std::max(m_last_residual_stats.let_wire_buffer_high_water_bytes, let_wire_buffer_bytes);
+      // Compatibility alias: wire-buffer high-water only.
+      m_last_residual_stats.let_high_water_bytes =
+          m_last_residual_stats.let_wire_buffer_high_water_bytes;
+      m_last_residual_stats.let_known_workspace_high_water_bytes =
+          std::max(m_last_residual_stats.let_known_workspace_high_water_bytes,
+                   let_known_workspace_bytes);
+      {
+        std::uint64_t response_max = 0;
+        for (int peer = 0; peer < mpi_world_size; ++peer) {
+          if (peer == mpi_world_rank) {
+            continue;
+          }
+          const std::uint64_t packets = static_cast<std::uint64_t>(
+              response_recv_counts[static_cast<std::size_t>(peer)] /
+              static_cast<int>(k_short_range_response_wire_bytes));
+          response_max = std::max(response_max, packets);
+        }
+        m_last_residual_stats.remote_response_packets_max_peer =
+            std::max(m_last_residual_stats.remote_response_packets_max_peer, response_max);
+      }
+      for (int peer = 0; peer < mpi_world_size; ++peer) {
+        if (peer == mpi_world_rank) {
+          continue;
+        }
+        const int expected_bytes = response_recv_counts[static_cast<std::size_t>(peer)];
+        if (expected_bytes == 0) {
+          continue;
+        }
+        const std::span<const std::uint8_t> peer_response_bytes(
+            response_recv_payload.data() + response_recv_displs[static_cast<std::size_t>(peer)],
+            static_cast<std::size_t>(expected_bytes));
+        decodeShortRangeResponses(peer_response_bytes, decoded_responses);
+        for (const ShortRangeTargetResponsePacket& response : decoded_responses) {
+          const std::uint32_t expected_flags =
+              response.request_id < batch_size &&
+                  !accumulator.previous_acceleration_magnitude_code.empty() &&
+                  std::isfinite(accumulator.previous_acceleration_magnitude_code[batch_begin + response.request_id])
+              ? k_short_range_flag_previous_acceleration
+              : 0U;
+          if (response.wire_version != k_short_range_wire_version || response.target_owner_rank != mpi_world_rank ||
+              response.source_rank != peer || response.flags != expected_flags || response.batch_token != batch_token ||
+              response.request_id >= batch_size || response.exchange_sequence != exchange_sequence ||
+              response.decomposition_epoch != options.decomposition_epoch.value || response.force_epoch != options.force_epoch.sequence ||
+              response.target_identity != static_cast<std::uint64_t>(batch_begin + response.request_id)) {
+            throw std::runtime_error("TreePM short-range response protocol identity mismatch");
+          }
+          if (response_expected_by_peer[static_cast<std::size_t>(peer)][response.request_id] == 0U) {
+            throw std::runtime_error("TreePM short-range response was not requested from its source peer");
+          }
+          if (response_seen_by_peer[static_cast<std::size_t>(peer)][response.request_id] != 0U) {
+            throw std::runtime_error("TreePM short-range response duplicates a peer/request identity");
+          }
+          if (!std::isfinite(response.accel_x_comoving) || !std::isfinite(response.accel_y_comoving) ||
+              !std::isfinite(response.accel_z_comoving)) {
+            throw std::runtime_error("TreePM short-range response contains non-finite acceleration");
+          }
+          if (std::isnan(response.nearest_pair_r2_comoving) || response.nearest_pair_r2_comoving < 0.0) {
+            throw std::runtime_error("TreePM short-range response carries an invalid nearest-pair separation");
+          }
+          response_seen_by_peer[static_cast<std::size_t>(peer)][response.request_id] = 1U;
+          remote_batch_ax[response.request_id] += response.accel_x_comoving;
+          remote_batch_ay[response.request_id] += response.accel_y_comoving;
+          remote_batch_az[response.request_id] += response.accel_z_comoving;
+          remote_batch_nearest_r2[response.request_id] = std::min(
+              remote_batch_nearest_r2[response.request_id], response.nearest_pair_r2_comoving);
+          if (received_response_count[response.request_id] == std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("TreePM short-range received-response counter overflow");
+          }
+          ++received_response_count[response.request_id];
+          ++m_last_residual_stats.remote_response_packets;
+        }
+      }
+
+      for (int peer = 0; peer < mpi_world_size; ++peer) {
+        if (peer == mpi_world_rank) {
+          continue;
+        }
+        for (std::size_t batch_slot = 0; batch_slot < batch_size; ++batch_slot) {
+          if (response_expected_by_peer[static_cast<std::size_t>(peer)][batch_slot] !=
+              response_seen_by_peer[static_cast<std::size_t>(peer)][batch_slot]) {
+            throw std::runtime_error(
+                "TreePM short-range response missing for expected peer/request identity: peer=" +
+                std::to_string(peer) + ", batch=" + std::to_string(batch_token) +
+                ", request=" + std::to_string(batch_slot));
+          }
+        }
+      }
+
+      for (std::size_t batch_slot = 0; batch_slot < batch_size; ++batch_slot) {
+        if (received_response_count[batch_slot] != expected_response_count[batch_slot]) {
+          throw std::runtime_error(
+              "TreePM short-range response coverage mismatch for batch token " + std::to_string(batch_token) +
+              ", slot=" + std::to_string(batch_slot) +
+              ": expected=" + std::to_string(expected_response_count[batch_slot]) +
+              ", received=" + std::to_string(received_response_count[batch_slot]));
+        }
+        if (received_response_count[batch_slot] == 0U) {
+          continue;
+        }
+        accumulator.addShortRangeToActiveSlot(
+            batch_begin + batch_slot,
+            remote_batch_ax[batch_slot],
+            remote_batch_ay[batch_slot],
+            remote_batch_az[batch_slot]);
+        accumulator.noteNearestPairToActiveSlot(
+            batch_begin + batch_slot, remote_batch_nearest_r2[batch_slot]);
+        m_last_residual_stats.remote_short_range_sum_sq +=
+            remote_batch_ax[batch_slot] * remote_batch_ax[batch_slot] +
+            remote_batch_ay[batch_slot] * remote_batch_ay[batch_slot] +
+            remote_batch_az[batch_slot] * remote_batch_az[batch_slot];
+      }
+      } catch (...) {
+        response_validation_failure = std::current_exception();
+      }
+      coordinate_protocol_failure(
+          response_validation_failure, "received response");
+      batch_begin += max_requests_per_peer;
+    }
+    m_last_residual_stats.communicating_peer_count = static_cast<std::uint64_t>(std::count(
+        communicated_with_peer.begin(), communicated_with_peer.end(), static_cast<std::uint8_t>(1U)));
+  }
+#else
+  if (m_grid.slabLayout().world_size > 1) {
+    throw std::invalid_argument("TreePM short-range distributed exchange requires COSMOSIM_ENABLE_MPI=ON");
+  }
+#endif
+
+  if (options.spatial_work_history_enabled) {
+    std::array<std::uint64_t, parallel::k_spatial_work_bin_count> work{};
+    std::array<std::uint64_t, parallel::k_spatial_work_bin_count> targets{};
+    // Spatial scratch accumulates owned-target integer work across all local
+    // batches. Reduce once in fixed worker/bin order, after every worker joins.
+    for (const ResidualSpatialWorkCounters& counters : m_worker_spatial_counter_storage) {
+      for (std::size_t bin = 0; bin < parallel::k_spatial_work_bin_count; ++bin) {
+        work[bin] += counters.spatial_work[bin];
+        targets[bin] += counters.spatial_targets[bin];
+      }
+    }
+#if COSMOSIM_ENABLE_MPI
+    if (tree_mpi_world_size > 1) {
+      requireTreePmMpiSuccess(
+          MPI_Allreduce(MPI_IN_PLACE, work.data(), static_cast<int>(work.size()),
+              MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD), "TreePM spatial work reduction");
+      requireTreePmMpiSuccess(
+          MPI_Allreduce(MPI_IN_PLACE, targets.data(), static_cast<int>(targets.size()),
+              MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD), "TreePM spatial target reduction");
+    }
+#endif
+    // Fixed half-life of one force solve; deterministic integer measurements
+    // are merged before this floating update, independent of worker schedule.
+    for (std::size_t bin = 0; bin < work.size(); ++bin) {
+      m_spatial_work_history[bin] = 0.5 * m_spatial_work_history[bin] +
+          0.5 * static_cast<double>(work[bin]);
+      m_spatial_target_history[bin] = 0.5 * m_spatial_target_history[bin] +
+          0.5 * static_cast<double>(targets[bin]);
+      m_last_residual_stats.traversal_summary.spatial_work_per_target[bin] =
+          m_spatial_target_history[bin] > 0.0
+          ? m_spatial_work_history[bin] / m_spatial_target_history[bin] : 0.0;
+    }
+    ++m_spatial_work_history_solves;
+    m_last_residual_stats.traversal_summary.spatial_work_history_solves = m_spatial_work_history_solves;
+  }
+  m_last_residual_stats.traversal_summary.local_traversal = local_owned_targets;
+  m_last_residual_stats.traversal_summary.incoming_traversal = incoming_remote_targets;
+  if (tree_profile != nullptr) {
+    tree_profile->visited_nodes +=
+        local_owned_targets.visited_nodes + incoming_remote_targets.visited_nodes;
+    tree_profile->accepted_nodes +=
+        local_owned_targets.accepted_nodes + incoming_remote_targets.accepted_nodes;
+    tree_profile->accepted_internal_multipoles += local_owned_targets.accepted_internal_multipoles + incoming_remote_targets.accepted_internal_multipoles;
+    tree_profile->accepted_leaves += local_owned_targets.accepted_leaves + incoming_remote_targets.accepted_leaves;
+    tree_profile->selected_mac_rejections += local_owned_targets.selected_mac_rejections + incoming_remote_targets.selected_mac_rejections;
+    tree_profile->skipped_mac_evaluations += local_owned_targets.skipped_mac_evaluations + incoming_remote_targets.skipped_mac_evaluations;
+    tree_profile->relative_mac_rejections += local_owned_targets.relative_mac_rejections + incoming_remote_targets.relative_mac_rejections;
+    tree_profile->maximum_angle_rejections += local_owned_targets.maximum_angle_rejections + incoming_remote_targets.maximum_angle_rejections;
+    tree_profile->strict_envelope_rejections += local_owned_targets.strict_envelope_rejections + incoming_remote_targets.strict_envelope_rejections;
+    tree_profile->softening_rejections += local_owned_targets.softening_rejections + incoming_remote_targets.softening_rejections;
+    tree_profile->near_node_rejections += local_owned_targets.near_node_rejections + incoming_remote_targets.near_node_rejections;
+    tree_profile->cutoff_containment_rejections += local_owned_targets.cutoff_containment_rejections + incoming_remote_targets.cutoff_containment_rejections;
+    tree_profile->geometric_history_fallbacks += local_owned_targets.geometric_history_fallbacks + incoming_remote_targets.geometric_history_fallbacks;
+    tree_profile->opened_nodes +=
+        local_owned_targets.opened_nodes + incoming_remote_targets.opened_nodes;
+    tree_profile->particle_particle_interactions +=
+        local_owned_targets.direct_pair_evaluations +
+        incoming_remote_targets.direct_pair_evaluations;
+    tree_profile->traversal_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - traversal_start).count();
+    tree_profile->traversed_target_count +=
+        static_cast<std::uint64_t>(accumulator.active_particle_index.size());
+    if (tree_profile->traversed_target_count > 0U) {
+      tree_profile->average_interactions_per_target =
+          static_cast<double>(tree_profile->particle_particle_interactions) /
+          static_cast<double>(tree_profile->traversed_target_count);
+    }
+  }
+  m_last_residual_stats.pruned_nodes =
+      local_owned_targets.cutoff_pruned_nodes + incoming_remote_targets.cutoff_pruned_nodes;
+  m_last_residual_stats.pair_skips_cutoff =
+      local_owned_targets.cutoff_skipped_pairs + incoming_remote_targets.cutoff_skipped_pairs;
+  m_last_residual_stats.local_pair_evaluations = local_owned_targets.direct_pair_evaluations;
+  m_last_residual_stats.incoming_remote_pair_evaluations =
+      incoming_remote_targets.direct_pair_evaluations;
+  m_last_residual_stats.pair_evaluations =
+      m_last_residual_stats.local_pair_evaluations +
+      m_last_residual_stats.incoming_remote_pair_evaluations;
+  // Evaluator-side remote cutoff prunes were previously mutated on shared
+  // coordinator stats inside the traversal; they now arrive via the counters
+  // bundles and are merged here after join. Request-path peer-bound prunes
+  // already wrote m_last_residual_stats on the main thread.
+  m_last_residual_stats.remote_pairs_pruned_by_bounds +=
+      local_owned_targets.remote_pairs_pruned_by_bounds +
+      incoming_remote_targets.remote_pairs_pruned_by_bounds;
+  m_last_residual_stats.incoming_remote_target_evaluations = incoming_evaluated_target_count;
+  m_last_residual_stats.openmp_observed_workers =
+      static_cast<std::uint64_t>(std::max(1, observed_openmp_workers));
+}
+
+TreePmDiagnostics computeTreePmDiagnostics(const TreePmSplitPolicy& split_policy) {
+  validateTreePmSplitPolicy(split_policy);
+
+  TreePmDiagnostics diagnostics;
+  diagnostics.mesh_spacing_comoving = split_policy.mesh_spacing_comoving;
+  diagnostics.asmth_cells = split_policy.asmth_cells;
+  diagnostics.rcut_cells = split_policy.rcut_cells;
+  diagnostics.split_scale_comoving = split_policy.split_scale_comoving;
+  diagnostics.cutoff_radius_comoving = split_policy.cutoff_radius_comoving;
+  diagnostics.short_range_factor_at_split =
+      treePmGaussianShortRangeForceFactorUnchecked(split_policy.split_scale_comoving, split_policy.split_scale_comoving);
+  diagnostics.long_range_factor_at_split =
+      treePmGaussianLongRangeForceFactorUnchecked(split_policy.split_scale_comoving, split_policy.split_scale_comoving);
+  diagnostics.short_range_factor_at_cutoff =
+      treePmGaussianShortRangeForceFactorUnchecked(split_policy.cutoff_radius_comoving, split_policy.split_scale_comoving);
+  diagnostics.long_range_factor_at_cutoff =
+      treePmGaussianLongRangeForceFactorUnchecked(split_policy.cutoff_radius_comoving, split_policy.split_scale_comoving);
+  diagnostics.composition_error_at_split = std::abs(
+      diagnostics.short_range_factor_at_split + diagnostics.long_range_factor_at_split - 1.0);
+
+  const double radii[] = {
+      0.25 * split_policy.split_scale_comoving,
+      0.5 * split_policy.split_scale_comoving,
+      split_policy.split_scale_comoving,
+      2.0 * split_policy.split_scale_comoving,
+      4.0 * split_policy.split_scale_comoving,
+  };
+  for (const double radius_comoving : radii) {
+    const double composed = treePmGaussianShortRangeForceFactorUnchecked(radius_comoving, split_policy.split_scale_comoving) +
+        treePmGaussianLongRangeForceFactorUnchecked(radius_comoving, split_policy.split_scale_comoving);
+    diagnostics.max_relative_composition_error = std::max(
+        diagnostics.max_relative_composition_error,
+        std::abs(composed - 1.0) / std::max(1.0, std::abs(composed)));
+  }
+
+  return diagnostics;
+}
+
+}  // namespace cosmosim::gravity

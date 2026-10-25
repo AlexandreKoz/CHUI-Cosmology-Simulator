@@ -1,0 +1,165 @@
+#pragma once
+
+#include <cstdint>
+#include <span>
+#include <string_view>
+#include <vector>
+
+#include "cosmosim/core/config.hpp"
+#include "cosmosim/core/constants.hpp"
+#include "cosmosim/core/simulation_state.hpp"
+#include "cosmosim/core/time_integration.hpp"
+
+namespace cosmosim::physics {
+
+class ParticleIdPrecommit;
+
+struct BlackHoleAgnConfig {
+  bool enabled = false;
+  double seed_halo_mass_threshold_code = 1.0e3;
+  double seed_mass_code = 1.0;
+  std::uint32_t seed_max_per_cell = 1;
+  double alpha_bondi = 1.0;
+  bool use_eddington_cap = true;
+  double epsilon_r = 0.1;
+  double epsilon_f = 0.05;
+  double feedback_coupling_efficiency = 1.0;
+  double duty_cycle_active_edd_ratio_threshold = 0.01;
+  double proton_mass_si = 1.67262192369e-27;
+  double thomson_cross_section_si = 6.6524587321e-29;
+  double newton_g_si = core::constants::k_newton_g_si;
+  double speed_of_light_si = core::constants::k_speed_of_light_si;
+  double proton_mass_code = 1.67262192369e-27;
+  double thomson_cross_section_code = 6.6524587321e-29;
+  double newton_g_code = core::constants::k_newton_g_si;
+  double speed_of_light_code = core::constants::k_speed_of_light_si;
+  std::uint32_t metadata_schema_version = 1;
+};
+
+struct BlackHoleSeedCandidate {
+  std::uint32_t cell_index = 0;
+  double host_halo_mass_code = 0.0;
+  std::uint32_t owning_rank = 0;
+};
+
+struct BlackHoleRates {
+  double mdot_bondi_code = 0.0;
+  double mdot_edd_code = 0.0;
+  double mdot_acc_code = 0.0;
+  double eddington_ratio = 0.0;
+  double feedback_power_code = 0.0;
+};
+
+
+struct BlackHoleAgnAccretionView {
+  // Empty means every local BH row is active. This avoids materializing a
+  // 0..N_BH-1 index vector for the common all-active source step.
+  std::span<const std::uint32_t> active_black_hole_indices;
+  std::span<const std::uint32_t> particle_index;
+  std::span<const std::uint32_t> host_cell_index;
+  std::span<double> subgrid_mass_code;
+  std::span<double> accretion_rate_code;
+  std::span<double> feedback_energy_code;
+  std::span<double> eddington_ratio;
+  std::span<double> cumulative_accreted_mass_code;
+  std::span<double> cumulative_feedback_energy_code;
+  std::span<double> duty_cycle_active_time_code;
+  std::span<double> duty_cycle_total_time_code;
+  std::span<double> gas_mass_code;
+  std::span<double> gas_density_code;
+  std::span<double> gas_metal_mass_code;
+  std::span<const double> gas_sound_speed_code;
+  std::span<const double> gas_velocity_x_peculiar;
+  std::span<const double> gas_velocity_y_peculiar;
+  std::span<const double> gas_velocity_z_peculiar;
+  std::span<double> gas_internal_energy_code;
+  std::span<double> particle_mass_code;
+  std::span<double> particle_velocity_x_peculiar;
+  std::span<double> particle_velocity_y_peculiar;
+  std::span<double> particle_velocity_z_peculiar;
+};
+
+struct BlackHoleAgnCounters {
+  std::uint64_t scanned_bh = 0;
+  std::uint64_t active_bh = 0;
+  std::uint64_t seed_candidates = 0;
+  std::uint64_t seeded_bh = 0;
+  double integrated_accreted_mass_code = 0.0;
+  double gas_mass_removed_code = 0.0;
+  double metal_mass_transferred_code = 0.0;
+  double seeded_mass_code = 0.0;
+  double integrated_feedback_energy_code = 0.0;
+  double deposited_feedback_energy_code = 0.0;
+  double integrated_duty_cycle_active_time_code = 0.0;
+  double integrated_duty_cycle_total_time_code = 0.0;
+};
+
+struct BlackHoleAgnStepReport {
+  BlackHoleAgnCounters counters;
+  std::vector<std::uint32_t> seeded_cell_indices;
+  std::vector<std::uint64_t> seeded_particle_ids;
+};
+
+class BlackHoleAgnModel {
+ public:
+  explicit BlackHoleAgnModel(BlackHoleAgnConfig config);
+
+  [[nodiscard]] const BlackHoleAgnConfig& config() const noexcept;
+  [[nodiscard]] bool isSeedEligible(
+      const core::SimulationState& state,
+      const BlackHoleSeedCandidate& candidate) const;
+  [[nodiscard]] BlackHoleRates computeAccretionRates(
+      double bh_mass_code,
+      double gas_density_code,
+      double sound_speed_code,
+      double relative_velocity_code) const;
+
+  [[nodiscard]] BlackHoleAgnCounters applyAccretionFromView(
+      BlackHoleAgnAccretionView view,
+      double dt_code,
+      double scale_factor = 1.0,
+      bool density_is_comoving = false) const;
+
+  [[nodiscard]] BlackHoleAgnStepReport apply(
+      core::SimulationState& state,
+      std::span<const BlackHoleSeedCandidate> seed_candidates,
+      double dt_code,
+      double scale_factor,
+      bool density_is_comoving,
+      std::uint64_t step_index,
+      ParticleIdPrecommit* id_precommit = nullptr) const;
+
+  // Compatibility overload for isolated/non-cosmological direct callers.
+  [[nodiscard]] BlackHoleAgnStepReport apply(
+      core::SimulationState& state,
+      std::span<const BlackHoleSeedCandidate> seed_candidates,
+      double dt_code,
+      std::uint64_t step_index) const;
+
+  [[nodiscard]] core::ModuleSidecarBlock buildMetadataSidecar(const BlackHoleAgnCounters& counters) const;
+
+ private:
+  BlackHoleAgnConfig m_config;
+};
+
+[[nodiscard]] BlackHoleAgnConfig makeBlackHoleAgnConfig(const core::PhysicsConfig& physics_config);
+
+class BlackHoleAgnCallback final : public core::IntegrationCallback {
+ public:
+  explicit BlackHoleAgnCallback(BlackHoleAgnModel model);
+
+  [[nodiscard]] std::string_view callbackName() const override;
+  [[nodiscard]] std::span<const core::IntegrationStage> integrationStages() const override;
+  [[nodiscard]] std::span<const core::StageContract> stageContracts() const override;
+  void onStage(core::StepContext& context) override;
+
+  void setSeedCandidates(std::span<const BlackHoleSeedCandidate> seed_candidates);
+  [[nodiscard]] const BlackHoleAgnStepReport& lastStepReport() const noexcept;
+
+ private:
+  BlackHoleAgnModel m_model;
+  std::vector<BlackHoleSeedCandidate> m_seed_candidates;
+  BlackHoleAgnStepReport m_last_step_report;
+};
+
+}  // namespace cosmosim::physics

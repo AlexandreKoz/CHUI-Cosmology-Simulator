@@ -1,0 +1,556 @@
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "cosmosim/cosmosim.hpp"
+#include "cosmosim/workflows/runtime_module_registry.hpp"
+#include "cosmosim/io/restart_checkpoint.hpp"
+#include "cosmosim/parallel/distributed_memory.hpp"
+
+#if COSMOSIM_ENABLE_MPI
+#include <mpi.h>
+#include "../support/mpi_test_workspace.hpp"
+#endif
+
+namespace {
+
+[[nodiscard]] std::uint64_t xorRangeOneToN(std::uint64_t n) {
+  switch (n & 3ULL) {
+    case 0ULL: return n;
+    case 1ULL: return 1ULL;
+    case 2ULL: return n + 1ULL;
+    default: return 0ULL;
+  }
+}
+
+std::vector<cosmosim::core::TimeBinSchedulerIdentityRecord> schedulerSeedForRank(int world_rank) {
+  std::vector<cosmosim::core::TimeBinSchedulerIdentityRecord> records;
+  records.reserve(42U);
+  for (std::uint64_t particle_id = 1ULL; particle_id <= 42ULL; ++particle_id) {
+    records.push_back(cosmosim::core::TimeBinSchedulerIdentityRecord{
+        .element_id = particle_id,
+        .bin_index = 0U,
+        .next_activation_tick = 0ULL,
+        .pending_bin_index = cosmosim::core::HierarchicalTimeBinScheduler::k_unset_pending_bin,
+    });
+  }
+  return records;
+}
+
+std::string buildConfigText(
+    int cadence_steps,
+    int mpi_ranks_expected,
+    std::string_view run_name = "reference_workflow_distributed_treepm_mpi",
+    bool write_restarts = false,
+    int snapshot_interval_steps = 1,
+    bool rebalance_enabled = true) {
+  std::stringstream stream;
+  stream << "schema_version = 1\n\n";
+  stream << "[mode]\n";
+  stream << "mode = zoom_in\n";
+  stream << "ic_file = generated\n";
+  stream << "zoom_high_res_region = false\n\n";
+  stream << "[numerics]\n";
+  stream << "time_begin_code = 0.01\n";
+  stream << "time_end_code = 0.0102\n";
+  stream << "max_global_steps = 2\n";
+  stream << "hierarchical_max_rung = 0\n";
+  stream << "treepm_pm_grid = 16\n";
+  stream << "treepm_asmth_cells = 1.5\n";
+  stream << "treepm_rcut_cells = 4.5\n";
+  stream << "treepm_update_cadence_steps = " << cadence_steps << "\n";
+  stream << "treepm_tree_exchange_batch_bytes = 256\n\n";
+  stream << "[physics]\n";
+  stream << "enable_cooling = false\n";
+  stream << "enable_star_formation = false\n";
+  stream << "enable_feedback = false\n";
+  stream << "enable_stellar_evolution = false\n\n";
+  stream << "[output]\n";
+  stream << "run_name = " << run_name << "\n";
+  stream << "output_directory = integration_outputs\n";
+  stream << "output_stem = snapshot\n";
+  stream << "restart_stem = restart\n";
+  stream << "snapshot_interval_steps = " << snapshot_interval_steps << "\n";
+  stream << "write_restarts = " << (write_restarts ? "true" : "false") << "\n\n";
+  stream << "[parallel]\n";
+  stream << "mpi_ranks_expected = " << mpi_ranks_expected << "\n";
+  stream << "omp_threads = 1\n";
+  stream << "gpu_devices = 0\n";
+  stream << "decomposition_runtime_rebalance_enabled = " << (rebalance_enabled ? "true" : "false") << "\n";
+  return stream.str();
+}
+
+}  // namespace
+
+int main() {
+#if COSMOSIM_ENABLE_MPI
+  MPI_Init(nullptr, nullptr);
+  int world_size = 1;
+  int world_rank = 0;
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+  if (world_size != 2) {
+    MPI_Finalize();
+    return 0;
+  }
+
+  const std::string config_text = buildConfigText(/*cadence_steps=*/1, world_size);
+  const cosmosim::core::FrozenConfig frozen =
+      cosmosim::core::loadFrozenConfigFromString(config_text, "test_reference_workflow_distributed_treepm_mpi");
+  cosmosim::workflows::ReferenceWorkflowRunner runner(frozen);
+  cosmosim::workflows::ReferenceWorkflowOptions options;
+  options.write_outputs = false;
+  options.register_runtime_modules = [&](cosmosim::workflows::RuntimeModuleRegistry& registry) {
+    using namespace cosmosim::workflows;
+    std::uint64_t grants=0U;
+    for (const auto& module : registry.descriptors()) for (const auto& task : module.stage_tasks) {
+      if (task.task_id != "time.drift_particles") continue;
+      for (const auto access : task.resources) {
+        if ((access.resource == RuntimeResourceKey::kParticlePosition || access.resource == RuntimeResourceKey::kParticleVelocity) &&
+            access.mode == RuntimeResourceAccessMode::kReadWrite) ++grants;
+        if (access.resource == RuntimeResourceKey::kMigrationOwnership && access.mode == RuntimeResourceAccessMode::kRead) ++grants;
+      }
+    }
+    std::uint64_t minimum=0U,maximum=0U;
+    MPI_Allreduce(&grants,&minimum,1,MPI_UINT64_T,MPI_MIN,MPI_COMM_WORLD);
+    MPI_Allreduce(&grants,&maximum,1,MPI_UINT64_T,MPI_MAX,MPI_COMM_WORLD);
+    if (minimum != 3U || maximum != 3U) throw std::runtime_error("reference drift grants differ across ranks");
+  };
+  options.initial_particle_scheduler_identity_records = schedulerSeedForRank(world_rank);
+  const cosmosim::workflows::ReferenceWorkflowReport report = runner.run(options);
+
+  assert(report.completed_steps == 2);
+  assert(report.world_size == world_size);
+  assert(report.world_rank == world_rank);
+  assert(report.global_particle_count == 42ULL);
+  assert(report.global_cell_count == 6ULL);
+  assert(report.global_particle_id_sum == (42ULL * 43ULL) / 2ULL);
+  assert(report.global_particle_id_xor == xorRangeOneToN(42ULL));
+  assert(report.local_particle_ids_unique);
+  assert(report.global_particle_partition_identity_match);
+  assert(report.treepm_update_cadence_steps == 1);
+  assert(report.treepm_long_range_refresh_count == 5);
+  assert(report.treepm_long_range_reuse_count == 0);
+  assert(report.treepm_cadence_records.size() == 5U);
+  const std::vector<std::uint64_t> expected_field_versions{1ULL, 2ULL, 3ULL, 4ULL, 5ULL};
+  const std::vector<std::uint64_t> expected_field_built_steps{0ULL, 0ULL, 0ULL, 1ULL, 1ULL};
+  const std::vector<bool> expected_refresh_flags{true, true, true, true, true};
+  const std::vector<std::string> expected_stage_names{
+      "gravity_kick_pre", "force_refresh", "gravity_kick_post",
+      "force_refresh", "gravity_kick_post"};
+  const std::vector<std::string> expected_refresh_reasons{
+      "initial_force_bootstrap", "scheduled_force_refresh_stage",
+      "source_mutation_force_refresh", "scheduled_force_refresh_stage",
+      "source_mutation_force_refresh"};
+  for (std::size_t i = 0; i < report.treepm_cadence_records.size(); ++i) {
+    const auto& record = report.treepm_cadence_records[i];
+    assert(record.gravity_kick_opportunity == i + 1U);
+    assert(record.stage_name == expected_stage_names[i]);
+    assert(record.field_version == expected_field_versions[i]);
+    assert(record.field_built_step_index == expected_field_built_steps[i]);
+    assert(record.refreshed_long_range_field == expected_refresh_flags[i]);
+    assert(record.pm_refresh_reason == expected_refresh_reasons[i]);
+    assert(record.field_age_in_kick_opportunities == 0U);
+    assert(record.active_particles_kicked + record.inactive_particles_skipped == report.local_particle_count);
+  }
+  assert(frozen.config.parallel.decomposition_runtime_rebalance_enabled);
+
+
+  std::vector<std::uint64_t> gathered_opportunity(report.treepm_cadence_records.size(), 0ULL);
+  std::vector<std::uint64_t> gathered_field_version(report.treepm_cadence_records.size(), 0ULL);
+  std::vector<std::uint64_t> gathered_last_refresh_opportunity(report.treepm_cadence_records.size(), 0ULL);
+  std::vector<std::uint64_t> gathered_refresh_flag(report.treepm_cadence_records.size(), 0ULL);
+  for (std::size_t i = 0; i < report.treepm_cadence_records.size(); ++i) {
+    gathered_opportunity[i] = report.treepm_cadence_records[i].gravity_kick_opportunity;
+    gathered_field_version[i] = report.treepm_cadence_records[i].field_version;
+    gathered_last_refresh_opportunity[i] = report.treepm_cadence_records[i].last_refresh_opportunity;
+    gathered_refresh_flag[i] = report.treepm_cadence_records[i].refreshed_long_range_field ? 1ULL : 0ULL;
+  }
+
+  std::vector<std::uint64_t> reduced_opportunity(gathered_opportunity.size(), 0ULL);
+  std::vector<std::uint64_t> reduced_field_version(gathered_field_version.size(), 0ULL);
+  std::vector<std::uint64_t> reduced_last_refresh_opportunity(gathered_last_refresh_opportunity.size(), 0ULL);
+  std::vector<std::uint64_t> reduced_refresh_flag(gathered_refresh_flag.size(), 0ULL);
+  MPI_Allreduce(
+      gathered_opportunity.data(),
+      reduced_opportunity.data(),
+      static_cast<int>(gathered_opportunity.size()),
+      MPI_UINT64_T,
+      MPI_SUM,
+      MPI_COMM_WORLD);
+  MPI_Allreduce(
+      gathered_field_version.data(),
+      reduced_field_version.data(),
+      static_cast<int>(gathered_field_version.size()),
+      MPI_UINT64_T,
+      MPI_SUM,
+      MPI_COMM_WORLD);
+  MPI_Allreduce(
+      gathered_last_refresh_opportunity.data(),
+      reduced_last_refresh_opportunity.data(),
+      static_cast<int>(gathered_last_refresh_opportunity.size()),
+      MPI_UINT64_T,
+      MPI_SUM,
+      MPI_COMM_WORLD);
+  MPI_Allreduce(
+      gathered_refresh_flag.data(),
+      reduced_refresh_flag.data(),
+      static_cast<int>(gathered_refresh_flag.size()),
+      MPI_UINT64_T,
+      MPI_SUM,
+      MPI_COMM_WORLD);
+
+  for (std::size_t i = 0; i < report.treepm_cadence_records.size(); ++i) {
+    assert(reduced_opportunity[i] == gathered_opportunity[i] * static_cast<std::uint64_t>(world_size));
+    assert(reduced_field_version[i] == gathered_field_version[i] * static_cast<std::uint64_t>(world_size));
+    assert(
+        reduced_last_refresh_opportunity[i] ==
+        gathered_last_refresh_opportunity[i] * static_cast<std::uint64_t>(world_size));
+    assert(reduced_refresh_flag[i] == gathered_refresh_flag[i] * static_cast<std::uint64_t>(world_size));
+  }
+
+  std::vector<std::uint64_t> local_active_by_boundary(report.treepm_cadence_records.size(), 0ULL);
+  for (std::size_t i = 0; i < report.treepm_cadence_records.size(); ++i) {
+    local_active_by_boundary[i] = report.treepm_cadence_records[i].active_particles_kicked;
+  }
+  std::vector<std::uint64_t> active_by_rank_and_boundary(
+      static_cast<std::size_t>(world_size) * local_active_by_boundary.size(), 0ULL);
+  MPI_Allgather(
+      local_active_by_boundary.data(),
+      static_cast<int>(local_active_by_boundary.size()),
+      MPI_UINT64_T,
+      active_by_rank_and_boundary.data(),
+      static_cast<int>(local_active_by_boundary.size()),
+      MPI_UINT64_T,
+      MPI_COMM_WORLD);
+  // Production workflow time integration is intentionally rung-0-only until
+  // per-particle KDK epochs exist. Both nonempty ownership ranks must therefore
+  // contribute active work at every rank-coordinated force boundary. Empty-
+  // target collective behavior is covered by the dedicated PM/TreePM fixtures,
+  // not manufactured through a mixed-bin production schedule.
+  for (std::size_t boundary = 0; boundary < local_active_by_boundary.size(); ++boundary) {
+    const std::uint64_t rank_zero_active = active_by_rank_and_boundary[boundary];
+    const std::uint64_t rank_one_active =
+        active_by_rank_and_boundary[local_active_by_boundary.size() + boundary];
+    assert(rank_zero_active > 0ULL);
+    assert(rank_one_active > 0ULL);
+  }
+
+  cosmosim::parallel::DistributedRestartState invalid_restart_state;
+  invalid_restart_state.world_size = world_size;
+  invalid_restart_state.pm_grid_nx = 16;
+  invalid_restart_state.pm_grid_ny = 16;
+  invalid_restart_state.pm_grid_nz = 16;
+  invalid_restart_state.pm_decomposition_mode = "slab";
+  invalid_restart_state.pm_update_cadence_steps = 0;
+  invalid_restart_state.gravity_kick_opportunity = 1;
+  invalid_restart_state.last_long_range_refresh_opportunity = 2;
+  invalid_restart_state.long_range_field_version = 0;
+  invalid_restart_state.pm_slab_begin_x_by_rank.resize(static_cast<std::size_t>(world_size), 0);
+  invalid_restart_state.pm_slab_end_x_by_rank.resize(static_cast<std::size_t>(world_size), 0);
+  for (int rank = 0; rank < world_size; ++rank) {
+    const auto slab = cosmosim::parallel::pmOwnedXRangeForRank(16, world_size, rank);
+    invalid_restart_state.pm_slab_begin_x_by_rank[static_cast<std::size_t>(rank)] = slab.begin_x;
+    invalid_restart_state.pm_slab_end_x_by_rank[static_cast<std::size_t>(rank)] = slab.end_x;
+  }
+  const cosmosim::parallel::MpiContext runtime_context(
+      /*is_enabled=*/world_size > 1,
+      world_size,
+      world_rank);
+  const auto compatibility = cosmosim::parallel::evaluateDistributedRestartCompatibility(
+      invalid_restart_state,
+      cosmosim::parallel::buildDistributedExecutionTopology(
+          /*global_nx=*/16,
+          /*global_ny=*/16,
+          /*global_nz=*/16,
+          runtime_context,
+          /*mpi_ranks_expected=*/world_size,
+          /*configured_gpu_devices=*/0,
+          /*cuda_runtime_available=*/false,
+          /*visible_device_count=*/0,
+          /*pm_decomposition_mode=*/"slab"));
+  assert(!compatibility.compatible());
+  assert(!compatibility.pm_cadence_steps_match);
+  assert(!compatibility.gravity_kick_state_match);
+  assert(!compatibility.long_range_field_state_match);
+
+  const std::uint64_t local_digest = report.final_state_digest;
+  std::vector<std::uint64_t> gathered_digest(static_cast<std::size_t>(world_size), 0ULL);
+  MPI_Allgather(&local_digest, 1, MPI_UINT64_T, gathered_digest.data(), 1, MPI_UINT64_T, MPI_COMM_WORLD);
+  for (const std::uint64_t digest : gathered_digest) {
+    assert(digest != 0ULL);
+  }
+
+  const std::uint64_t local_particle_count = report.local_particle_count;
+  std::vector<std::uint64_t> gathered_particle_count(static_cast<std::size_t>(world_size), 0ULL);
+  MPI_Allgather(&local_particle_count, 1, MPI_UINT64_T, gathered_particle_count.data(), 1, MPI_UINT64_T, MPI_COMM_WORLD);
+  std::uint64_t reduced_particle_count = 0ULL;
+  MPI_Allreduce(&local_particle_count, &reduced_particle_count, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+  assert(reduced_particle_count == report.global_particle_count);
+  bool all_ranks_hold_full_state = true;
+  for (const std::uint64_t count : gathered_particle_count) {
+    all_ranks_hold_full_state = all_ranks_hold_full_state && (count == report.global_particle_count);
+  }
+  assert(!all_ranks_hold_full_state);
+
+  const std::uint64_t local_cell_count = report.local_cell_count;
+  std::uint64_t reduced_cell_count = 0ULL;
+  MPI_Allreduce(&local_cell_count, &reduced_cell_count, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+  assert(reduced_cell_count == report.global_cell_count);
+
+  const std::uint64_t local_id_sum = report.local_particle_id_sum;
+  std::uint64_t reduced_id_sum = 0ULL;
+  MPI_Allreduce(&local_id_sum, &reduced_id_sum, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+  assert(reduced_id_sum == report.global_particle_id_sum);
+
+  const std::uint64_t local_id_xor = report.local_particle_id_xor;
+  std::uint64_t reduced_id_xor = 0ULL;
+  MPI_Allreduce(&local_id_xor, &reduced_id_xor, 1, MPI_UINT64_T, MPI_BXOR, MPI_COMM_WORLD);
+  assert(reduced_id_xor == report.global_particle_id_xor);
+
+  const cosmosim::parallel::LocalOwnershipIdentitySummary reduced_identity{
+      .local_owned_count = reduced_particle_count,
+      .local_particle_id_sum = reduced_id_sum,
+      .local_particle_id_xor = reduced_id_xor,
+      .local_particle_ids_unique = report.local_particle_ids_unique,
+  };
+  assert(cosmosim::parallel::partitionIdentityMatchesGeneratedSet(
+      reduced_identity,
+      /*expected_global_count=*/42ULL,
+      /*expected_particle_id_sum=*/(42ULL * 43ULL) / 2ULL,
+      /*expected_particle_id_xor=*/xorRangeOneToN(42ULL)));
+
+  // P2 geometry lifecycle on the required two-rank TreePM run: published
+  // top-domain routing geometry must never take a fallback path for covered
+  // sources, and the P1 residual pair identity must hold solve by solve with
+  // a nonzero incoming remote contribution under distributed execution.
+  {
+    std::ifstream events_file(report.operational_report_json_path);
+    assert(events_file.good());
+    std::stringstream events_buffer;
+    events_buffer << events_file.rdbuf();
+    const std::string treepm_events = events_buffer.str();
+    assert(treepm_events.find("\"event_kind\": \"gravity.treepm_let\"") != std::string::npos);
+    assert(treepm_events.find("\"domain_geometry_fallback_used\": \"false\"") != std::string::npos);
+    assert(treepm_events.find("\"domain_geometry_fallback_reason\": \"none\"") != std::string::npos);
+    assert(treepm_events.find("\"domain_geometry_uncovered_source_count\": \"0\"") != std::string::npos);
+
+    auto extractPayloadValues = [](const std::string& text, std::string_view key) {
+      std::vector<std::string> values;
+      const std::string needle = "\"" + std::string(key) + "\": \"";
+      std::size_t pos = 0U;
+      while ((pos = text.find(needle, pos)) != std::string::npos) {
+        const std::size_t begin = pos + needle.size();
+        const std::size_t end = text.find('"', begin);
+        if (end == std::string::npos) {
+          break;
+        }
+        values.push_back(text.substr(begin, end - begin));
+        pos = end + 1U;
+      }
+      return values;
+    };
+    const std::vector<std::string> totals =
+        extractPayloadValues(treepm_events, "total_pair_evaluations");
+    const std::vector<std::string> locals =
+        extractPayloadValues(treepm_events, "local_pair_evaluations");
+    const std::vector<std::string> remotes =
+        extractPayloadValues(treepm_events, "remote_pair_evaluations");
+    assert(totals.size() == 5U);
+    assert(locals.size() == totals.size());
+    assert(remotes.size() == totals.size());
+    std::uint64_t incoming_remote_pairs = 0ULL;
+    for (std::size_t i = 0U; i < totals.size(); ++i) {
+      assert(std::stoull(totals[i]) ==
+             std::stoull(locals[i]) + std::stoull(remotes[i]));
+      incoming_remote_pairs += std::stoull(remotes[i]);
+    }
+    assert(incoming_remote_pairs > 0ULL);
+  }
+
+  // P5 startup planner admission: with world_size > 1 the compact startup
+  // planner's transient live set is the first governed admission, so a
+  // 1-byte process budget must reject collectively with the production owner
+  // tag before any planner population is allocated.
+  {
+    std::string budget_config =
+        buildConfigText(/*cadence_steps=*/1, world_size,
+                        "treepm_mpi_startup_planner_budget_reject");
+    budget_config += "process_memory_budget_bytes = 1\n";
+    const cosmosim::core::FrozenConfig budget_frozen =
+        cosmosim::core::loadFrozenConfigFromString(
+            budget_config, "test_reference_workflow_treepm_mpi_startup_budget");
+    cosmosim::workflows::ReferenceWorkflowRunner budget_runner(budget_frozen);
+    cosmosim::workflows::ReferenceWorkflowOptions budget_options;
+    budget_options.write_outputs = false;
+    budget_options.initial_particle_scheduler_identity_records =
+        schedulerSeedForRank(world_rank);
+    bool rejected = false;
+    try {
+      (void)budget_runner.run(budget_options);
+    } catch (const std::runtime_error& ex) {
+      const std::string_view message(ex.what());
+      rejected =
+          message.find("memory reservation rejected") != std::string_view::npos &&
+          message.find("hard_limit_bytes=1") != std::string_view::npos &&
+          message.find("owner=parallel.decomposition.startup_planner") !=
+              std::string_view::npos;
+    }
+    assert(rejected);
+  }
+
+#if COSMOSIM_ENABLE_HDF5
+  {
+    auto workspace = cosmosim::test_support::createMpiSharedWorkspace(
+        "cosmosim_treepm_mpi_restart_continuation");
+    const std::filesystem::path& root = workspace.root();
+    const std::string direct_config_text = buildConfigText(
+        /*cadence_steps=*/1,
+        world_size,
+        "treepm_mpi_direct_continuation",
+        /*write_restarts=*/true,
+        /*snapshot_interval_steps=*/1,
+        /*rebalance_enabled=*/false);
+    const cosmosim::core::FrozenConfig direct_frozen =
+        cosmosim::core::loadFrozenConfigFromString(
+            direct_config_text,
+            "test_reference_workflow_distributed_treepm_mpi_direct");
+    cosmosim::workflows::ReferenceWorkflowRunner direct_runner(direct_frozen);
+    cosmosim::workflows::ReferenceWorkflowOptions direct_options;
+    direct_options.write_outputs = true;
+    direct_options.max_steps_override = 2;
+    // Output-writing scenarios must share one output root across ranks:
+    // snapshot_layout=auto resolves to a collective single-file MPI write in
+    // Parallel-HDF5 builds, which requires every rank to open the same
+    // collective snapshot path. Per-rank roots would give each rank a
+    // different path (rank N's shared snapshot directory is only created by
+    // rank 0), and the mismatched MPI_File_open collectives deadlock inside
+    // OpenMPI ompio. Restart files remain per-rank via the rankNNN-suffixed
+    // run directory.
+    const cosmosim::workflows::ReferenceWorkflowReport direct_report =
+        direct_runner.run(root / "direct", direct_options);
+    assert(direct_report.restart_roundtrip_executed);
+    assert(direct_report.restart_roundtrip_ok);
+
+    const std::string restart_config_text = buildConfigText(
+        /*cadence_steps=*/1,
+        world_size,
+        "treepm_mpi_restart_continuation",
+        /*write_restarts=*/true,
+        /*snapshot_interval_steps=*/1,
+        /*rebalance_enabled=*/false);
+    const cosmosim::core::FrozenConfig restart_frozen =
+        cosmosim::core::loadFrozenConfigFromString(
+            restart_config_text,
+            "test_reference_workflow_distributed_treepm_mpi_restart");
+    cosmosim::workflows::ReferenceWorkflowRunner restart_runner(restart_frozen);
+    cosmosim::workflows::ReferenceWorkflowOptions first_options;
+    first_options.write_outputs = true;
+    first_options.max_steps_override = 1;
+    const cosmosim::workflows::ReferenceWorkflowReport first_report =
+        restart_runner.run(root / "first", first_options);
+    assert(first_report.restart_roundtrip_executed);
+    assert(first_report.restart_roundtrip_ok);
+    assert(!first_report.restart_path.empty());
+    if (world_size > 1) {
+      assert(first_report.restart_path.filename().string().find("_rank") != std::string::npos);
+    }
+
+    const cosmosim::io::RestartReadResult first_restart =
+        cosmosim::io::readRestartCheckpointHdf5(first_report.restart_path);
+    assert(first_restart.distributed_gravity_state.world_size == world_size);
+    assert(first_restart.distributed_gravity_state.pm_slab_begin_x_by_rank.size() ==
+           static_cast<std::size_t>(world_size));
+    const cosmosim::parallel::PmSlabRange local_slab =
+        cosmosim::parallel::pmOwnedXRangeForRank(16, world_size, world_rank);
+    assert(first_restart.distributed_gravity_state.pm_slab_begin_x_by_rank[world_rank] == local_slab.begin_x);
+    assert(first_restart.distributed_gravity_state.pm_slab_end_x_by_rank[world_rank] == local_slab.end_x);
+
+    // A2 regression: feed the production restart path deliberately rank-local
+    // PM-validity evidence. Rank 1 requests an initial PM repair while rank 0
+    // still considers the checkpoint field valid. The MPI-aware time
+    // coordinator must turn that evidence into one shared directive before
+    // GravityRuntime reaches any branch-dependent TreePM collective.
+    cosmosim::io::RestartReadResult rank_local_pm_validity_restart = first_restart;
+    if (world_rank == 1) {
+      rank_local_pm_validity_restart.integrator_state.pm_long_range_field_valid = false;
+    }
+    cosmosim::workflows::ReferenceWorkflowOptions cadence_consensus_options;
+    cadence_consensus_options.write_outputs = false;
+    cadence_consensus_options.restart_state_override = &rank_local_pm_validity_restart;
+    cadence_consensus_options.max_steps_override = 1;
+    const cosmosim::workflows::ReferenceWorkflowReport cadence_consensus_report =
+        restart_runner.run(root / "rank_local_pm_validity_consensus", cadence_consensus_options);
+    assert(cadence_consensus_report.completed_steps == 1U);
+    assert(!cadence_consensus_report.treepm_cadence_records.empty());
+    const auto& consensus_record = cadence_consensus_report.treepm_cadence_records.front();
+    assert(consensus_record.stage_name == "gravity_kick_pre");
+    assert(consensus_record.pm_refresh_reason == "initial_force_bootstrap");
+    assert(consensus_record.refreshed_long_range_field);
+
+    const std::uint64_t local_consensus_values[] = {
+        consensus_record.gravity_kick_opportunity,
+        consensus_record.field_version,
+        consensus_record.last_refresh_opportunity,
+        consensus_record.refreshed_long_range_field ? 1ULL : 0ULL,
+    };
+    std::uint64_t reduced_consensus_values[4] = {};
+    MPI_Allreduce(
+        local_consensus_values,
+        reduced_consensus_values,
+        4,
+        MPI_UINT64_T,
+        MPI_SUM,
+        MPI_COMM_WORLD);
+    for (std::size_t i = 0U; i < 4U; ++i) {
+      assert(
+          reduced_consensus_values[i] ==
+          local_consensus_values[i] * static_cast<std::uint64_t>(world_size));
+    }
+
+    cosmosim::workflows::ReferenceWorkflowOptions resumed_options;
+    resumed_options.write_outputs = true;
+    resumed_options.restart_state_override = &first_restart;
+    resumed_options.max_steps_override = 1;
+    const cosmosim::workflows::ReferenceWorkflowReport resumed_report =
+        restart_runner.run(root / "resumed", resumed_options);
+    assert(resumed_report.restart_roundtrip_executed);
+    assert(resumed_report.restart_roundtrip_ok);
+    assert(resumed_report.completed_steps == 1U);
+    assert(resumed_report.global_particle_count == direct_report.global_particle_count);
+    assert(resumed_report.global_particle_id_sum == direct_report.global_particle_id_sum);
+    assert(resumed_report.global_particle_id_xor == direct_report.global_particle_id_xor);
+    assert(resumed_report.final_state_digest == direct_report.final_state_digest);
+
+    cosmosim::io::RestartReadResult mismatched_world_restart = first_restart;
+    mismatched_world_restart.distributed_gravity_state.world_size = world_size + 1;
+    bool rank_count_resume_threw = false;
+    try {
+      cosmosim::workflows::ReferenceWorkflowOptions bad_options;
+      bad_options.write_outputs = false;
+      bad_options.restart_state_override = &mismatched_world_restart;
+      bad_options.max_steps_override = 1;
+      (void)restart_runner.run(root / "bad_rank_count", bad_options);
+    } catch (const std::runtime_error& ex) {
+      const std::string message = ex.what();
+      rank_count_resume_threw =
+          message.find("restart topology validation failed") != std::string::npos &&
+          message.find("world_size mismatch") != std::string::npos;
+    }
+    assert(rank_count_resume_threw);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+  }
+#endif
+
+  MPI_Finalize();
+#endif
+  return 0;
+}

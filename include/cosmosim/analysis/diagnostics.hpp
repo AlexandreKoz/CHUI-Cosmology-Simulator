@@ -1,0 +1,393 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "cosmosim/core/config.hpp"
+#include "cosmosim/core/memory_accounting.hpp"
+#include "cosmosim/core/memory_governor.hpp"
+#include "cosmosim/core/time_integration.hpp"
+
+namespace cosmosim::parallel { class MpiContext; }
+
+namespace cosmosim::analysis {
+
+enum class DiagnosticClass : std::uint8_t {
+  kRunHealth = 0,
+  kScienceLight = 1,
+  kScienceHeavy = 2,
+};
+
+enum class DiagnosticTier : std::uint8_t {
+  kInfrastructureHealth = 0,
+  kValidatedScience = 1,
+  kReferenceScience = 2,
+  kProvisionalScience = 3,
+};
+
+// Scientific validation maturity is deliberately separate from computational
+// implementation maturity. A scalable algorithm may still await publication-grade
+// science validation without being mislabeled as a reference implementation.
+enum class DiagnosticMaturity : std::uint8_t {
+  kProduction = 0,
+  kValidated = 1,
+  kProvisional = 2,
+};
+
+enum class DiagnosticImplementationMaturity : std::uint8_t {
+  kProductionScalable = 0,
+  kReference = 1,
+};
+
+enum class DiagnosticScalability : std::uint8_t {
+  kCheap = 0,
+  kModerate = 1,
+  kHeavyReference = 2,
+  kScalableFft = 3,
+};
+
+struct DiagnosticRecord {
+  std::string name;
+  DiagnosticTier tier = DiagnosticTier::kInfrastructureHealth;
+  DiagnosticImplementationMaturity implementation_maturity =
+      DiagnosticImplementationMaturity::kProductionScalable;
+  // This field is scientific validation maturity; the serialized schema exposes
+  // the same value explicitly as scientific_maturity.
+  DiagnosticMaturity maturity = DiagnosticMaturity::kProduction;
+  DiagnosticScalability scalability = DiagnosticScalability::kCheap;
+  bool executed = false;
+  std::string policy_note;
+};
+
+struct PowerSpectrumBin {
+  double k_center_code = 0.0;
+  double power_code_volume = 0.0;
+  std::uint64_t mode_count = 0;
+};
+
+enum class PowerSpectrumMassAssignment : std::uint8_t {
+  kNearestGridPoint = 0,
+  kCloudInCell = 1,
+};
+
+enum class PowerSpectrumWindowCorrection : std::uint8_t {
+  kNone = 0,
+  kDeconvolveAssignmentWindow = 1,
+};
+
+enum class PowerSpectrumShotNoisePolicy : std::uint8_t {
+  kReportWithoutSubtraction = 0,
+  kSubtractPoisson = 1,
+};
+
+struct PowerSpectrumEstimateOptions {
+  std::size_t mesh_n = 0;
+  std::size_t bin_count = 0;
+  PowerSpectrumMassAssignment mass_assignment = PowerSpectrumMassAssignment::kCloudInCell;
+  PowerSpectrumWindowCorrection window_correction =
+      PowerSpectrumWindowCorrection::kDeconvolveAssignmentWindow;
+  PowerSpectrumShotNoisePolicy shot_noise_policy =
+      PowerSpectrumShotNoisePolicy::kReportWithoutSubtraction;
+};
+
+struct PowerSpectrumEstimateBin {
+  std::size_t bin_index = 0;
+  double k_lower_code = 0.0;
+  double k_upper_code = 0.0;
+  double k_center_code = 0.0;
+  double power_code_volume = 0.0;
+  std::uint64_t mode_count = 0;
+  bool empty = true;
+};
+
+struct PowerSpectrumEstimate {
+  PowerSpectrumEstimateOptions options;
+  double box_size_code = 0.0;
+  double k_fundamental_code = 0.0;
+  double k_axis_nyquist_code = 0.0;
+  double poisson_shot_noise_code_volume = 0.0;
+  std::vector<PowerSpectrumEstimateBin> bins;
+};
+
+[[nodiscard]] std::string_view powerSpectrumMassAssignmentLabel(
+    PowerSpectrumMassAssignment assignment) noexcept;
+[[nodiscard]] std::string_view powerSpectrumWindowCorrectionLabel(
+    PowerSpectrumWindowCorrection correction) noexcept;
+[[nodiscard]] std::string_view powerSpectrumShotNoisePolicyLabel(
+    PowerSpectrumShotNoisePolicy policy) noexcept;
+[[nodiscard]] std::string_view powerSpectrumKUnits() noexcept;
+[[nodiscard]] std::string_view powerSpectrumPowerUnits() noexcept;
+[[nodiscard]] std::string_view powerSpectrumFourierNormalization() noexcept;
+
+// Physical allocation model for the production complex-to-complex estimator.
+// The opaque FFTW planner is covered separately by the configured external
+// runtime reserve. No scientific precision or estimator policy is changed.
+struct PowerSpectrumMemoryEstimate {
+  std::uint64_t mesh_coexistence_bytes = 0U;
+  std::uint64_t owned_peak_bytes = 0U;
+  std::uint64_t external_runtime_bytes = 0U;
+};
+
+[[nodiscard]] PowerSpectrumMemoryEstimate estimatePowerSpectrumMemory(
+    std::size_t mesh_n, std::size_t bin_count, std::size_t thread_count);
+
+struct StarFormationHistoryBin {
+  double scale_factor_center = 0.0;
+  double formed_mass_code = 0.0;
+};
+
+struct AngularMomentumBudget {
+  std::array<double, 3> total_l_code{};
+  std::array<double, 3> gas_l_code{};
+  std::array<double, 3> star_l_code{};
+  std::array<double, 3> dark_matter_l_code{};
+  std::array<double, 3> black_hole_l_code{};
+};
+
+struct RunHealthCounters {
+  std::uint64_t particle_count = 0;
+  std::uint64_t cell_count = 0;
+  std::uint64_t star_count = 0;
+  bool ownership_invariants_ok = false;
+  bool unique_particle_ids_ok = false;
+  bool gravity_softening_sidecar_size_ok = false;
+  std::uint64_t non_finite_particles = 0;
+  std::uint64_t non_finite_cells = 0;
+  std::uint64_t non_finite_gravity_softening = 0;
+  std::uint64_t non_positive_particle_mass = 0;
+  // These remain zero in a local bundle. Distributed reduction fills them so
+  // a global false invariant still identifies how many ranks violated it.
+  std::uint64_t ownership_invariants_failed_ranks = 0;
+  std::uint64_t unique_particle_ids_failed_ranks = 0;
+  std::uint64_t gravity_softening_sidecar_size_failed_ranks = 0;
+};
+
+struct MetalBudgetDiagnostics {
+  double gas_metal_mass_code = 0.0;
+  double stellar_birth_metal_mass_code = 0.0;
+  double stellar_locked_metal_mass_code = 0.0;
+  double cumulative_newly_synthesized_metal_mass_code = 0.0;
+  double cumulative_returned_metal_mass_code = 0.0;
+  double cumulative_deposited_metal_mass_code = 0.0;
+  double unresolved_carried_metal_mass_code = 0.0;
+  double enrichment_deposition_residual_code = 0.0;
+  double minimum_gas_metallicity = 0.0;
+  double maximum_gas_metallicity = 0.0;
+  double mass_weighted_mean_gas_metallicity = 0.0;
+  double metal_free_gas_mass_fraction = 0.0;
+  std::uint64_t invalid_gas_states = 0;
+};
+
+[[nodiscard]] MetalBudgetDiagnostics computeMetalBudgetDiagnostics(
+    const core::SimulationState& state);
+
+[[nodiscard]] double globalMetalAuditResidualCode(
+    const MetalBudgetDiagnostics& diagnostics,
+    double initial_total_metal_mass_code,
+    double escaped_metal_mass_code = 0.0) noexcept;
+
+
+struct ParticleDiagnosticsView {
+  std::span<const double> position_x_comoving;
+  std::span<const double> position_y_comoving;
+  std::span<const double> position_z_comoving;
+  std::span<const double> velocity_x_peculiar;
+  std::span<const double> velocity_y_peculiar;
+  std::span<const double> velocity_z_peculiar;
+  std::span<const double> mass_code;
+  std::span<const std::uint32_t> species_tag;
+  bool homogeneous_dmo_species = false;
+  std::span<const double> gravity_softening_comoving;
+};
+
+struct GasDiagnosticsView {
+  std::span<const double> center_x_comoving;
+  std::span<const double> center_y_comoving;
+  std::span<const double> center_z_comoving;
+  std::span<const double> mass_code;
+  std::span<const double> density_code;
+};
+
+struct StarFormationHistoryView {
+  std::span<const double> formation_scale_factor;
+  std::span<const double> birth_mass_code;
+};
+
+struct DiagnosticsStateView {
+  ParticleDiagnosticsView particles;
+  GasDiagnosticsView gas_cells;
+  StarFormationHistoryView stars;
+  std::uint64_t particle_count = 0;
+  std::uint64_t cell_count = 0;
+  std::uint64_t star_count = 0;
+  bool ownership_invariants_ok = false;
+  bool unique_particle_ids_ok = false;
+};
+
+[[nodiscard]] DiagnosticsStateView buildDiagnosticsStateView(
+    const core::SimulationState& state,
+    core::OwnershipValidationWorkspace* scratch = nullptr);
+
+struct DiagnosticsBundle {
+  std::uint64_t step_index = 0;
+  double scale_factor = 1.0;
+  DiagnosticClass diagnostic_class = DiagnosticClass::kRunHealth;
+  core::AnalysisConfig::DiagnosticsExecutionPolicy diagnostics_execution_policy =
+      core::AnalysisConfig::DiagnosticsExecutionPolicy::kRunHealthAndLightScience;
+  RunHealthCounters health;
+  std::vector<DiagnosticRecord> records;
+  std::vector<PowerSpectrumBin> power_spectrum;
+  std::vector<StarFormationHistoryBin> star_formation_history;
+  AngularMomentumBudget angular_momentum;
+  std::vector<double> xy_slice_density_code;
+  // Local sample counts are retained only until an MPI global slice average
+  // is formed; they are not serialized as a science product.
+  std::vector<std::uint64_t> xy_slice_sample_count;
+  std::vector<double> xy_projection_density_code;
+  std::size_t quicklook_grid_n = 0;
+  bool globally_reduced = false;
+  int contributing_rank_count = 1;
+  std::string quicklook_projection_csv_path;
+  core::MemoryReport memory_report;
+};
+
+
+// Convert rank-local diagnostics into one communicator-global bundle. Counts
+// and grid fields are reduced with their mathematically correct operations;
+// angular-momentum vectors are summed component-wise before norms are formed.
+// Distributed power spectrum is deliberately marked unavailable until a true
+// global density/FFT contract is provided; rank-local spectra are never averaged.
+void reduceDiagnosticsBundleAcrossRanks(
+    DiagnosticsBundle& bundle,
+    const parallel::MpiContext& mpi_context);
+
+struct DiagnosticsTiming {
+  double cumulative_run_health_ms = 0.0;
+  double cumulative_light_ms = 0.0;
+  double cumulative_heavy_ms = 0.0;
+  std::uint64_t run_health_calls = 0;
+  std::uint64_t light_calls = 0;
+  std::uint64_t heavy_calls = 0;
+};
+
+class DiagnosticsEngine {
+ public:
+  explicit DiagnosticsEngine(core::SimulationConfig config,
+                             core::MemoryGovernor* memory_governor = nullptr);
+
+  // A checked upper budget for the owned diagnostic arrays. The estimate is
+  // state-dependent for science-light products and is not a claim about an
+  // unbounded external allocator. The caller supplies the live-state counts.
+  [[nodiscard]] std::uint64_t estimateBundleIncrementalBytes(
+      DiagnosticClass diagnostic_class, const core::SimulationState& state) const;
+
+  [[nodiscard]] RunHealthCounters computeRunHealth(const DiagnosticsStateView& view) const;
+  [[nodiscard]] RunHealthCounters computeRunHealth(const core::SimulationState& state) const;
+
+  // Production convenience wrapper. The estimator uses an O(N^3 log N) FFT backend;
+  // the direct DFT remains available explicitly as a small-mesh numerical oracle.
+  [[nodiscard]] std::vector<PowerSpectrumBin> computePowerSpectrum(
+      const ParticleDiagnosticsView& particles,
+      std::size_t mesh_n,
+      std::size_t bin_count) const;
+  [[nodiscard]] std::vector<PowerSpectrumBin> computePowerSpectrum(
+      const core::SimulationState& state,
+      std::size_t mesh_n,
+      std::size_t bin_count) const;
+
+  // Production FFT-backed estimator with explicit assignment/window/noise policy.
+  [[nodiscard]] PowerSpectrumEstimate computePowerSpectrumEstimate(
+      const ParticleDiagnosticsView& particles,
+      const PowerSpectrumEstimateOptions& options) const;
+  [[nodiscard]] PowerSpectrumEstimate computePowerSpectrumEstimate(
+      const core::SimulationState& state,
+      const PowerSpectrumEstimateOptions& options) const;
+
+  // Deterministic O(N^6) direct-DFT reference oracle for validation-scale meshes.
+  [[nodiscard]] PowerSpectrumEstimate computePowerSpectrumEstimateReferenceDirectDft(
+      const ParticleDiagnosticsView& particles,
+      const PowerSpectrumEstimateOptions& options) const;
+  [[nodiscard]] PowerSpectrumEstimate computePowerSpectrumEstimateReferenceDirectDft(
+      const core::SimulationState& state,
+      const PowerSpectrumEstimateOptions& options) const;
+
+  [[nodiscard]] std::vector<StarFormationHistoryBin> computeStarFormationHistory(
+      const StarFormationHistoryView& stars,
+      std::size_t bin_count) const;
+  [[nodiscard]] std::vector<StarFormationHistoryBin> computeStarFormationHistory(
+      const core::SimulationState& state,
+      std::size_t bin_count) const;
+
+  [[nodiscard]] AngularMomentumBudget computeAngularMomentumBudget(
+      const ParticleDiagnosticsView& particles) const;
+  [[nodiscard]] AngularMomentumBudget computeAngularMomentumBudget(
+      const core::SimulationState& state) const;
+
+  [[nodiscard]] std::vector<double> computeGasXySliceDensity(
+      const GasDiagnosticsView& gas_cells,
+      std::size_t grid_n) const;
+  [[nodiscard]] std::vector<double> computeGasXySliceDensity(
+      const core::SimulationState& state,
+      std::size_t grid_n) const;
+
+  [[nodiscard]] std::vector<double> computeGasXyProjectionDensity(
+      const GasDiagnosticsView& gas_cells,
+      std::size_t grid_n) const;
+  [[nodiscard]] std::vector<double> computeGasXyProjectionDensity(
+      const core::SimulationState& state,
+      std::size_t grid_n) const;
+
+  [[nodiscard]] DiagnosticsBundle generateBundle(
+      const core::SimulationState& state,
+      std::uint64_t step_index,
+      double scale_factor,
+      DiagnosticClass diagnostic_class,
+      const core::TransientStepWorkspace* workspace = nullptr,
+      core::MemoryReservation* enclosing_reservation = nullptr,
+      bool allow_power_spectrum = true) const;
+
+  void writeBundle(const DiagnosticsBundle& bundle) const;
+  void enforceRetentionPolicy() const;
+
+ private:
+  [[nodiscard]] PowerSpectrumEstimate computePowerSpectrumEstimateImpl(
+      const ParticleDiagnosticsView& particles,
+      const PowerSpectrumEstimateOptions& options,
+      const core::MemoryReservation* enclosing_reservation) const;
+  [[nodiscard]] std::vector<PowerSpectrumBin> computePowerSpectrumImpl(
+      const ParticleDiagnosticsView& particles, std::size_t mesh_n,
+      std::size_t bin_count,
+      const core::MemoryReservation* enclosing_reservation) const;
+  core::MemoryGovernor* m_memory_governor = nullptr;
+  [[nodiscard]] std::filesystem::path diagnosticsOutputDirectory() const;
+  [[nodiscard]] std::filesystem::path bundlePath(const DiagnosticsBundle& bundle) const;
+  [[nodiscard]] std::filesystem::path quicklookPath(const DiagnosticsBundle& bundle) const;
+
+  core::SimulationConfig m_config;
+};
+
+class DiagnosticsCallback final : public core::IntegrationCallback {
+ public:
+  explicit DiagnosticsCallback(core::SimulationConfig config);
+
+  [[nodiscard]] std::string_view callbackName() const override;
+  [[nodiscard]] std::span<const core::IntegrationStage> integrationStages() const override;
+  [[nodiscard]] std::span<const core::StageContract> stageContracts() const override;
+  void onStage(core::StepContext& context) override;
+
+  [[nodiscard]] const DiagnosticsTiming& timing() const noexcept;
+
+ private:
+  void runDiagnostics(core::StepContext& context, DiagnosticClass diagnostic_class);
+
+  DiagnosticsEngine m_engine;
+  core::SimulationConfig m_config;
+  DiagnosticsTiming m_timing;
+};
+
+}  // namespace cosmosim::analysis

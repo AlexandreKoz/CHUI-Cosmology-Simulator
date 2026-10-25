@@ -1,0 +1,99 @@
+# TreePM Phase 2 distributed contract (frozen scaffold)
+
+## Scope and non-goals
+
+This document freezes what **Phase 2** means in this repository for distributed gravity infrastructure.
+
+- In scope: ownership semantics, decomposition terminology, message contract, config/documentation/build surface.
+- Out of scope in this stage: introducing new physics behavior beyond the existing TreePM split contract.
+
+Phase 1 remains the numerical baseline. A one-rank run through future distributed code paths must stay numerically consistent with the current Phase 1 single-rank TreePM contract unless an explicit bug-fix ADR states otherwise.
+
+## Phase 2 ownership model
+
+### 1) PM mesh ownership (target contract)
+
+- PM mesh ownership is distributed by **x-slabs**.
+- For a global mesh with `N = numerics.treepm_pm_grid` and `R = world_size`, slab owner rank `r` owns a contiguous x-index interval `[x_begin_r, x_end_r)`.
+- Decomposition mode is configured by `numerics.treepm_pm_decomposition_mode`:
+  - `slab` is the validated baseline path.
+  - `pencil` enables FFTW-MPI transposed spectral ownership (`TRANSPOSED_OUT/IN`) while retaining slab real-space ownership.
+- Empty slabs are allowed when `R > N`; ownership remains deterministic from rank order.
+
+### 2) Particle owner vs slab owner
+
+- A particle has exactly one **particle-owner rank** at any time.
+- PM density assignment and force interpolation require transient communication between particle owners and slab owners.
+- Particle ownership is not redefined by PM slab ownership.
+
+### 3) Distributed FFT path (targeted sequence)
+
+For each PM refresh event in Phase 2 runtime:
+
+1. Particle owners export assignment contributions to slab owners.
+2. Slab owners assemble local density slabs.
+3. Slab owners perform distributed FFT/Poisson/gradient/inverse FFT with periodic zero-mode policy unchanged from Phase 1:
+   - the historical Phase 2 notation was `∇²φ = 4π G a² (ρ - ρ̄)`;
+   - the current normalization bug-fix ADR supersedes that notation with
+     `∇²Psi = 4π G_code (rho_com - mean(rho_com))`, `A = -grad(Psi)`;
+   - PM and tree return the same scale-free `A`; collisionless KDK or the gas
+     conservative source applies the cosmological `A/a²` response;
+   - `φ_{k=0}=0`, `a_{k=0}=0`
+4. Slab owners send needed force samples/interpolants back to particle owners for active particles.
+
+This sequence is implemented in the current runtime path; the document remains the contract anchor for ownership and ordering.
+
+## Tree export/import contract (implemented)
+
+- Short-range tree work is particle-owner-centric.
+- Remote source data are exchanged in explicit batches, bounded by:
+  - `numerics.treepm_tree_exchange_batch_bytes` (must be `> 0`)
+- Exchange contract:
+  - target-owner rank exports compact active-target request batches to each peer, capped by the configured byte limit,
+  - request export eligibility is geometry-only: a peer is queried only when the active target is within `r_cut`
+    of that peer's periodic source-support bounds (with wrap-aware tight intervals to avoid boundary over-export),
+  - peer ranks evaluate each request target against local tree/source data with the current short-range kernel, MAC, and cutoff semantics,
+  - peers return partial acceleration responses keyed by batch/request IDs,
+  - target-owner rank validates per-peer request/response coverage (duplicate/missing detection) and accumulates returned partials.
+- Export/import does not imply ownership transfer.
+
+### Runtime diagnostics for distributed short-range exchange
+
+`TreePmDiagnostics` includes distributed short-range observability counters for repair validation:
+
+- request/response packet and byte counts,
+- request batch count and peer participation count,
+- per-batch max-per-peer packet pressure + packet-imbalance ratio,
+- targets that required remote requests vs targets fully served locally,
+- request peer-pair culls from periodic source-support geometry bounds.
+
+These counters are observability-only and do not alter force composition or ownership semantics.
+
+## Active-set and migration timing
+
+- Active-set restriction remains authoritative: force accumulation only mutates active slots on owner rank.
+- Ownership migration is an explicit phase boundary operation (not mid-kick).
+- The historical Phase 2 cadence semantics came from Phase 1. Current
+  production validation supersedes that permissive setting and requires
+  `treepm_update_cadence_steps = 1`; lower-level reuse is explicit and
+  fail-closed.
+
+## Restart continuity expectations
+
+- No snapshot/restart schema drift is introduced by this contract freeze.
+- Continuation artifacts must preserve normalized config/provenance consistency across ranks.
+- Future distributed restart extensions require explicit schema versioning, compatibility behavior, docs updates, and tests in the same patch.
+
+## Determinism limits (honest scope)
+
+- Deterministic behavior is required where practical (normalized config, ownership maps, rank-ordered control flow).
+- Bitwise identity across heterogeneous MPI networks/collectives is **not** promised by this document.
+- Pseudo-multi-rank tests do not prove completion of distributed TreePM physics or communication correctness.
+
+## Why slab first
+
+`slab` is frozen as the first PM decomposition mode because it is the smallest auditable extension from the current single-rank cubic-mesh contract:
+
+- straightforward contiguous ownership mapping,
+- clear owner responsibilities per x-interval,
+- minimal moving parts while preserving a path to later pencil decomposition and accelerator-aware remaps.

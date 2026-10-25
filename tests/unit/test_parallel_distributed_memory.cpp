@@ -1,0 +1,2705 @@
+#include <cassert>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <optional>
+#include <algorithm>
+#include <array>
+#include <span>
+#include "../../src/parallel/internal/memory_constrained_sfc.hpp"
+
+#include "cosmosim/core/memory_governor.hpp"
+#include "cosmosim/core/simulation_state.hpp"
+#include "cosmosim/parallel/distributed_memory.hpp"
+#include "../../src/workflows/internal/runtime_decomposition_source_storage.hpp"
+
+namespace {
+
+using cosmosim::parallel::internal::SfcCutPoint;
+using cosmosim::parallel::internal::lessSfcPoint;
+using cosmosim::parallel::internal::repairMemoryConstrainedSfcCuts;
+bool feasibleMemoryPartition(const std::vector<std::uint64_t>& v, int begin,int ranks,std::uint64_t cap){
+ if(begin==(int)v.size())return true;
+ if(ranks==0)return false;
+ std::uint64_t sum=0;
+ for(int i=begin;i<(int)v.size();++i){sum+=v[i];if(sum>cap)break;if(feasibleMemoryPartition(v,i+1,ranks-1,cap))return true;}
+ return false;
+}
+void testExactDistributedCutRepairSynthetic(){
+ std::uint64_t cases=0;
+ for(int encoded=0;encoded<4096;++encoded){
+  int x=encoded;std::vector<std::uint64_t> v(6);
+  for(auto&b:v){b=x%4;x/=4;}
+  std::vector<SfcCutPoint> points;
+  for(std::uint64_t i=0;i<6;++i)points.push_back({i+1,i+1});
+  std::vector<std::uint64_t> prefix(7,0);
+  for(int i=0;i<6;++i)prefix[i+1]=prefix[i]+v[i];
+  auto globalPrefix=[&](SfcCutPoint p){auto it=std::upper_bound(points.begin(),points.end(),p,lessSfcPoint);return prefix[it-points.begin()];};
+  auto first=[&](std::uint64_t target){auto it=std::lower_bound(prefix.begin()+1,prefix.end(),target);if(it==prefix.end())throw std::logic_error("missing target");return points[it-prefix.begin()-1];};
+  auto neighbor=[&](SfcCutPoint p,bool pred)->std::optional<SfcCutPoint>{auto it=std::lower_bound(points.begin(),points.end(),p,lessSfcPoint);if(pred){if(it==points.begin())return{};return *std::prev(it);}if(it==points.end())return{};return *it;};
+  for(int ranks=2;ranks<=4;++ranks)for(std::uint64_t cap=1;cap<=7;++cap){
+   std::vector<SfcCutPoint> proposed(ranks-1,points.front());
+   bool found=false;
+   try{
+    std::vector<SfcCutPoint> mandatory(ranks-1);
+    std::vector<SfcCutPoint> repaired; repaired.reserve(ranks-1);
+    auto cuts=repairMemoryConstrainedSfcCuts(proposed,cap,prefix.back(),points.front(),points.back(),globalPrefix,first,neighbor,mandatory,repaired);
+    std::vector<std::uint64_t> totals(ranks,0);
+    for(int i=0;i<6;++i){auto it=std::lower_bound(cuts.begin(),cuts.end(),points[i],lessSfcPoint);totals[it-cuts.begin()]+=v[i];}
+    for(auto b:totals)if(b>cap)throw std::logic_error("unsafe result");
+    found=true;
+   }catch(const std::runtime_error&){found=false;}
+   if(found!=feasibleMemoryPartition(v,0,ranks,cap)){
+    assert(false && "exact SFC repair feasibility mismatch");
+   }
+   ++cases;
+  }
+ }
+ assert(cases == 86016U);
+}
+
+
+void testBoundedMpiTransferPlannerSyntheticLimits() {
+  namespace parallel = cosmosim::parallel;
+
+  const auto empty = parallel::planBoundedMpiTransferRounds({}, 7U, 7U);
+  assert(empty.logical_total_count == 0U);
+  assert(empty.rounds.empty());
+
+  const std::vector<std::size_t> all_zero{0U, 0U, 0U};
+  const auto zero_plan = parallel::planBoundedMpiTransferRounds(all_zero, 7U, 6U);
+  assert(zero_plan.logical_total_count == 0U);
+  assert(zero_plan.rounds.empty());
+
+  const std::vector<std::size_t> exact_limit{7U};
+  const auto exact_plan = parallel::planBoundedMpiTransferRounds(exact_limit, 7U, 7U);
+  assert(exact_plan.rounds.size() == 1U);
+  assert(exact_plan.rounds.front().counts.front() == 7);
+  assert(exact_plan.rounds.front().displacements.front() == 0);
+  assert(exact_plan.rounds.front().logical_offsets.front() == 0U);
+
+  const std::vector<std::size_t> limit_plus_one{8U};
+  const auto split_plan = parallel::planBoundedMpiTransferRounds(limit_plus_one, 7U, 7U);
+  assert(split_plan.rounds.size() == 2U);
+  assert(split_plan.rounds[0].counts[0] == 7);
+  assert(split_plan.rounds[1].counts[0] == 1);
+  assert(split_plan.rounds[1].logical_offsets[0] == 7U);
+
+  // The M2A.1 AMR cell protocol uses classic MPI byte counts internally but
+  // plans bounded rounds. Exercise a logical transfer that is larger than
+  // INT_MAX without allocating the corresponding multi-GiB payload.
+  const std::size_t record_bytes = sizeof(parallel::AmrPatchCellPayloadRecord);
+  const std::size_t records_over_classic_mpi_limit =
+      static_cast<std::size_t>(std::numeric_limits<int>::max()) / record_bytes + 1U;
+  const std::size_t logical_bytes_over_classic_mpi_limit =
+      cosmosim::core::checkedSizeMultiply(
+          records_over_classic_mpi_limit, record_bytes,
+          "directed AMR logical payload beyond classic MPI count");
+  const std::size_t transport_round_bytes = 16U * 1024U * 1024U;
+  const auto large_amr_plan = parallel::planBoundedMpiTransferRounds(
+      std::vector<std::size_t>{logical_bytes_over_classic_mpi_limit},
+      static_cast<std::size_t>(std::numeric_limits<int>::max()),
+      transport_round_bytes);
+  assert(large_amr_plan.rounds.size() > 1U);
+  std::size_t planned_bytes = 0U;
+  for (const auto& round : large_amr_plan.rounds) {
+    assert(round.round_count <= transport_round_bytes);
+    assert(round.counts.size() == 1U);
+    assert(round.counts[0] >= 0);
+    assert(static_cast<std::size_t>(round.counts[0]) <= transport_round_bytes);
+    planned_bytes = cosmosim::core::checkedSizeAdd(
+        planned_bytes, static_cast<std::size_t>(round.counts[0]),
+        "directed AMR planned byte coverage");
+  }
+  assert(planned_bytes == logical_bytes_over_classic_mpi_limit);
+
+  // Exercise the exact production planner used by the streamed directed-AMR
+  // patch-cell transport, not merely the generic byte planner. The logical
+  // payload exceeds classic MPI_INT bytes, but every physical record round
+  // must remain bounded by the configured transport window.
+  const auto production_amr_rounds =
+      parallel::planDirectedAmrPatchCellTransferRounds(
+          static_cast<std::uint64_t>(records_over_classic_mpi_limit),
+          transport_round_bytes);
+  assert(production_amr_rounds.size() > 1U);
+  std::uint64_t planned_records = 0U;
+  const std::size_t max_records_per_round = transport_round_bytes / record_bytes;
+  for (const std::size_t records : production_amr_rounds) {
+    assert(records > 0U);
+    assert(records <= max_records_per_round);
+    const std::size_t bytes = cosmosim::core::checkedSizeMultiply(
+        records, record_bytes, "production directed AMR round bytes");
+    assert(bytes <= transport_round_bytes);
+    assert(bytes <= static_cast<std::size_t>(std::numeric_limits<int>::max()));
+    planned_records += static_cast<std::uint64_t>(records);
+  }
+  assert(planned_records == records_over_classic_mpi_limit);
+
+  // A much larger logical transfer still uses the same physical per-round
+  // ceiling. This is the non-MPI regression for logical-size/physical-workspace
+  // separation; the MPI integration test exercises the actual Sendrecv path.
+  const std::uint64_t much_larger_logical_records =
+      static_cast<std::uint64_t>(max_records_per_round) * 17U + 3U;
+  const auto bounded_rounds = parallel::planDirectedAmrPatchCellTransferRounds(
+      much_larger_logical_records, transport_round_bytes);
+  assert(bounded_rounds.size() == 18U);
+  for (const std::size_t records : bounded_rounds) {
+    assert(records <= max_records_per_round);
+  }
+
+  // M2A.4 regression: memory pressure may reduce the transport window to one
+  // record. Production planning must remain constant-space even when the
+  // logical interface contains tens of millions of records rather than
+  // materializing one size_t per round.
+  constexpr std::uint64_t huge_logical_record_count = 100'000'000U;
+  const auto constant_space_plan = parallel::planDirectedAmrPatchCellTransfer(
+      huge_logical_record_count, record_bytes);
+  assert(constant_space_plan.logical_record_count == huge_logical_record_count);
+  assert(constant_space_plan.records_per_round == 1U);
+  assert(constant_space_plan.round_count == huge_logical_record_count);
+
+  bool rejected_unbounded_metadata = false;
+  try {
+    (void)parallel::planDirectedAmrPatchCellTransferRounds(65'537U, record_bytes);
+  } catch (const std::length_error&) {
+    rejected_unbounded_metadata = true;
+  }
+  assert(rejected_unbounded_metadata);
+
+  // Each peer is individually representable under the synthetic MPI limit,
+  // while the aggregate is not. The planner must split the logical exchange
+  // without dropping or duplicating any logical element.
+  const std::vector<std::size_t> aggregate_over_limit{4U, 4U};
+  const auto aggregate_plan =
+      parallel::planBoundedMpiTransferRounds(aggregate_over_limit, 7U, 6U);
+  assert(aggregate_plan.logical_total_count == 8U);
+  assert(aggregate_plan.rounds.size() == 2U);
+  std::vector<std::vector<unsigned>> coverage(2);
+  for (std::size_t peer = 0; peer < coverage.size(); ++peer) {
+    coverage[peer].assign(aggregate_over_limit[peer], 0U);
+  }
+  for (const auto& round : aggregate_plan.rounds) {
+    assert(round.round_count <= 6U);
+    for (std::size_t peer = 0; peer < round.counts.size(); ++peer) {
+      assert(round.counts[peer] >= 0 && round.counts[peer] <= 7);
+      assert(round.displacements[peer] >= 0 && round.displacements[peer] <= 7);
+      const std::size_t count = static_cast<std::size_t>(round.counts[peer]);
+      const std::size_t begin = round.logical_offsets[peer];
+      for (std::size_t i = 0; i < count; ++i) {
+        assert(begin + i < coverage[peer].size());
+        ++coverage[peer][begin + i];
+      }
+    }
+  }
+  for (std::size_t peer = 0; peer < coverage.size(); ++peer) {
+    for (const unsigned visits : coverage[peer]) {
+      assert(visits == 1U);
+    }
+    const auto& last_round = aggregate_plan.rounds.back();
+    assert(last_round.logical_offsets[peer] +
+               static_cast<std::size_t>(last_round.counts[peer]) ==
+           aggregate_over_limit[peer]);
+  }
+
+  const std::vector<std::size_t> asymmetric{0U, 1U, 9U};
+  const auto asymmetric_plan =
+      parallel::planBoundedMpiTransferRounds(asymmetric, 7U, 6U);
+  assert(asymmetric_plan.logical_displacements ==
+         std::vector<std::size_t>({0U, 0U, 1U}));
+  assert(asymmetric_plan.logical_total_count == 10U);
+  assert(!asymmetric_plan.rounds.empty());
+  for (const auto& round : asymmetric_plan.rounds) {
+    assert(round.round_count <= 6U);
+    for (const int count : round.counts) {
+      assert(count >= 0 && count <= 7);
+    }
+    for (const int displacement : round.displacements) {
+      assert(displacement >= 0 && displacement <= 7);
+    }
+  }
+
+  bool prefix_overflow_threw = false;
+  try {
+    const std::vector<std::size_t> overflow_counts{
+        std::numeric_limits<std::size_t>::max(), 1U};
+    (void)parallel::planBoundedMpiTransferRounds(overflow_counts, 7U, 7U);
+  } catch (const std::overflow_error&) {
+    prefix_overflow_threw = true;
+  }
+  assert(prefix_overflow_threw);
+
+  bool multiplication_overflow_threw = false;
+  try {
+    (void)cosmosim::core::checkedSizeMultiply(
+        std::numeric_limits<std::size_t>::max(), 2U,
+        "bounded MPI planner test multiplication");
+  } catch (const std::overflow_error&) {
+    multiplication_overflow_threw = true;
+  }
+  assert(multiplication_overflow_threw);
+}
+
+void testDirectedAmrBoundaryRequestPlannerSelectsOnlySharedFaces() {
+  namespace parallel = cosmosim::parallel;
+  const parallel::AmrPatchPayloadRecord local{
+      .patch_id = 101U,
+      .owner_rank = 0,
+      .cell_count = 64U,
+      .origin_x_comoving = 0.0,
+      .origin_y_comoving = 0.0,
+      .origin_z_comoving = 0.0,
+      .extent_x_comoving = 1.0,
+      .extent_y_comoving = 1.0,
+      .extent_z_comoving = 1.0,
+      .cell_dim_x = 4U,
+      .cell_dim_y = 4U,
+      .cell_dim_z = 4U};
+  const parallel::AmrPatchPayloadRecord x_neighbor{
+      .patch_id = 202U,
+      .owner_rank = 1,
+      .cell_count = 64U,
+      .origin_x_comoving = 1.0,
+      .origin_y_comoving = 0.0,
+      .origin_z_comoving = 0.0,
+      .extent_x_comoving = 1.0,
+      .extent_y_comoving = 1.0,
+      .extent_z_comoving = 1.0,
+      .cell_dim_x = 4U,
+      .cell_dim_y = 4U,
+      .cell_dim_z = 4U};
+  const auto local_requests =
+      parallel::planDirectedAmrPatchBoundaryCellRequests(
+          std::span<const parallel::AmrPatchPayloadRecord>(&local, 1U),
+          std::span<const parallel::AmrPatchPayloadRecord>(&x_neighbor, 1U));
+  assert(local_requests.size() == 1U);
+  assert(local_requests[0].patch_id == local.patch_id);
+  assert((local_requests[0].boundary_face_mask &
+          static_cast<std::uint8_t>(parallel::AmrPatchBoundaryFace::kXUpper)) != 0U);
+  assert((local_requests[0].boundary_face_mask &
+          static_cast<std::uint8_t>(parallel::AmrPatchBoundaryFace::kXLower)) == 0U);
+  assert(local_requests[0].boundary_face_depths[1] == 1U);
+
+  const auto reverse_requests =
+      parallel::planDirectedAmrPatchBoundaryCellRequests(
+          std::span<const parallel::AmrPatchPayloadRecord>(&x_neighbor, 1U),
+          std::span<const parallel::AmrPatchPayloadRecord>(&local, 1U));
+  assert(reverse_requests.size() == 1U);
+  assert((reverse_requests[0].boundary_face_mask &
+          static_cast<std::uint8_t>(parallel::AmrPatchBoundaryFace::kXLower)) != 0U);
+  assert(reverse_requests[0].boundary_face_depths[0] == 1U);
+
+  auto edge_only = x_neighbor;
+  edge_only.patch_id = 303U;
+  edge_only.origin_y_comoving = 1.0;
+  const auto edge_requests =
+      parallel::planDirectedAmrPatchBoundaryCellRequests(
+          std::span<const parallel::AmrPatchPayloadRecord>(&local, 1U),
+          std::span<const parallel::AmrPatchPayloadRecord>(&edge_only, 1U));
+  assert(edge_requests.empty());
+
+  // Fine source -> coarse target needs enough source layers to cover one
+  // coarse ghost-cell width. Keep the face area fixed while changing the
+  // source-patch depth to prove the request remains surface/depth scaled.
+  parallel::AmrPatchPayloadRecord coarse = local;
+  coarse.patch_id = 404U;
+  coarse.owner_rank = 1;
+  coarse.cell_count = 8U;
+  coarse.cell_dim_x = 2U;
+  coarse.cell_dim_y = 2U;
+  coarse.cell_dim_z = 2U;
+  coarse.level = 0U;
+
+  parallel::AmrPatchPayloadRecord fine_shallow{
+      .patch_id = 505U,
+      .owner_rank = 0,
+      .level = 1U,
+      .cell_count = 4U * 64U * 64U,
+      .origin_x_comoving = 1.0,
+      .origin_y_comoving = 0.0,
+      .origin_z_comoving = 0.0,
+      .extent_x_comoving = 1.0,
+      .extent_y_comoving = 1.0,
+      .extent_z_comoving = 1.0,
+      .cell_dim_x = 4U,
+      .cell_dim_y = 64U,
+      .cell_dim_z = 64U};
+  const auto fine_requests = parallel::planDirectedAmrPatchBoundaryCellRequests(
+      std::span<const parallel::AmrPatchPayloadRecord>(&fine_shallow, 1U),
+      std::span<const parallel::AmrPatchPayloadRecord>(&coarse, 1U));
+  assert(fine_requests.size() == 1U);
+  assert((fine_requests[0].boundary_face_mask &
+          static_cast<std::uint8_t>(parallel::AmrPatchBoundaryFace::kXLower)) != 0U);
+  assert(fine_requests[0].boundary_face_depths[0] == 2U);
+  const std::size_t shallow_count = parallel::directedAmrPatchBoundaryCellCount(
+      fine_shallow, fine_requests[0]);
+  assert(shallow_count == 2U * 64U * 64U);
+
+  parallel::AmrPatchPayloadRecord fine_deep = fine_shallow;
+  fine_deep.patch_id = 506U;
+  fine_deep.cell_dim_x = 128U;
+  fine_deep.cell_count = 128U * 64U * 64U;
+  fine_deep.extent_x_comoving = 32.0;  // preserves the 0.25 source-cell width
+  const auto deep_requests = parallel::planDirectedAmrPatchBoundaryCellRequests(
+      std::span<const parallel::AmrPatchPayloadRecord>(&fine_deep, 1U),
+      std::span<const parallel::AmrPatchPayloadRecord>(&coarse, 1U));
+  assert(deep_requests.size() == 1U);
+  assert(deep_requests[0].boundary_face_depths[0] == 2U);
+  const std::size_t deep_count = parallel::directedAmrPatchBoundaryCellCount(
+      fine_deep, deep_requests[0]);
+  assert(deep_count == shallow_count);
+
+  const auto coarse_requests = parallel::planDirectedAmrPatchBoundaryCellRequests(
+      std::span<const parallel::AmrPatchPayloadRecord>(&coarse, 1U),
+      std::span<const parallel::AmrPatchPayloadRecord>(&fine_shallow, 1U));
+  assert(coarse_requests.size() == 1U);
+  assert(coarse_requests[0].boundary_face_depths[1] == 1U);
+}
+
+void testGhostPackUnpackRoundTrip() {
+  cosmosim::parallel::GhostExchangeBufferSoA source;
+  source.entity_id = {101, 202, 303, 404};
+  source.density_code = {1.0, 2.0, 3.0, 4.0};
+  source.velocity_x_code = {10.0, 20.0, 30.0, 40.0};
+  source.pressure_code = {100.0, 200.0, 300.0, 400.0};
+
+  const std::vector<std::uint32_t> packed_indices = {1, 3};
+
+  cosmosim::parallel::GhostExchangeBuffer buffer;
+  buffer.packFrom(source, packed_indices);
+  assert(buffer.byteSize() > 0);
+
+  cosmosim::parallel::GhostExchangeBufferSoA destination;
+  buffer.unpackAppendTo(destination);
+
+  assert(destination.entity_id.size() == 2);
+  assert(destination.entity_id[0] == 202);
+  assert(destination.entity_id[1] == 404);
+  assert(std::abs(destination.density_code[0] - 2.0) < 1.0e-12);
+  assert(std::abs(destination.velocity_x_code[1] - 40.0) < 1.0e-12);
+  assert(std::abs(destination.pressure_code[1] - 400.0) < 1.0e-12);
+  assert(destination.position_x_comoving.empty());
+  assert(destination.mass_code.empty());
+  assert(destination.velocity_y_code.empty());
+  assert(destination.internal_energy_code.empty());
+}
+
+void testGhostOptionalLaneAbsenceSurvivesWireAndCommit() {
+  const cosmosim::parallel::GhostLayerEpoch epoch{
+      .decomposition_epoch = 4U,
+      .ghost_sync_epoch = 6U,
+      .particle_index_generation = 5U,
+  };
+  cosmosim::parallel::GhostExchangeBufferSoA source;
+  source.epoch = epoch;
+  source.entity_id = {42U};
+  source.position_x_comoving = {0.1};
+  source.position_y_comoving = {0.2};
+  source.position_z_comoving = {0.3};
+  source.mass_code = {2.5};
+  source.velocity_x_code = {1.0};
+  source.velocity_y_code = {2.0};
+  source.velocity_z_code = {3.0};
+  assert(source.hasGravityPayload());
+  assert(!source.hasHydroPayload());
+
+  cosmosim::parallel::GhostExchangeBuffer wire;
+  const std::vector<std::uint32_t> row{0U};
+  wire.packFrom(source, row);
+
+  cosmosim::parallel::BlockingGhostExchangeResult result;
+  result.received_ghosts.epoch = epoch;
+  wire.unpackAppendTo(result.received_ghosts);
+  assert(result.received_ghosts.hasGravityPayload());
+  assert(!result.received_ghosts.hasHydroPayload());
+  assert(result.received_ghosts.density_code.empty());
+  assert(result.received_ghosts.pressure_code.empty());
+  assert(result.received_ghosts.internal_energy_code.empty());
+
+  cosmosim::parallel::GhostExchangeBufferSoA storage;
+  storage.epoch = epoch;
+  storage.entity_id = {42U};
+  storage.position_x_comoving = {0.0};
+  storage.position_y_comoving = {0.0};
+  storage.position_z_comoving = {0.0};
+  storage.mass_code = {0.0};
+  storage.velocity_x_code = {0.0};
+  storage.velocity_y_code = {0.0};
+  storage.velocity_z_code = {0.0};
+  const std::vector<cosmosim::parallel::LocalGhostDescriptor> descriptors{
+      {.residency = cosmosim::parallel::LocalIndexResidency::kGhost,
+       .owning_rank = 1,
+       .particle_id = 42U,
+       .epoch = epoch},
+  };
+  const std::vector<int> neighbors{1};
+  const std::vector<std::vector<std::uint32_t>> sends{{}};
+  const std::vector<std::vector<std::uint32_t>> recvs{{0U}};
+  const auto plan = cosmosim::parallel::buildExplicitGhostExchangePlan(
+      0,
+      neighbors,
+      sends,
+      recvs,
+      cosmosim::parallel::ghostRefreshPayloadRecordBytes(),
+      epoch);
+  const auto report = cosmosim::parallel::commitBlockingGhostRefreshResult(
+      storage, descriptors, plan, result, epoch);
+  assert(report.updated_ghost_slots == 1U);
+  assert(storage.position_x_comoving[0] == 0.1);
+  assert(storage.mass_code[0] == 2.5);
+  assert(storage.velocity_z_code[0] == 3.0);
+  assert(storage.density_code.empty());
+  assert(storage.pressure_code.empty());
+  assert(storage.internal_energy_code.empty());
+  assert(!storage.hasHydroPayload());
+}
+
+void testMortonDecompositionInvariants() {
+  std::vector<cosmosim::parallel::DecompositionItem> items(16);
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    items[i].entity_id = static_cast<std::uint64_t>(i);
+    items[i].x_comov = static_cast<double>(i % 4) / 4.0;
+    items[i].y_comov = static_cast<double>((i / 4) % 2) / 2.0;
+    items[i].z_comov = static_cast<double>(i % 3) / 3.0;
+    items[i].work_units = 1.0 + static_cast<double>(i % 5);
+    items[i].memory_bytes = 128U + static_cast<std::uint64_t>(i * 8);
+    items[i].kind = (i % 2 == 0) ? cosmosim::parallel::DecompositionEntityKind::kParticle
+                                 : cosmosim::parallel::DecompositionEntityKind::kAmrPatch;
+  }
+
+  cosmosim::parallel::DecompositionConfig config;
+  config.world_size = 3;
+  config.owned_particle_weight = 1.0;
+  config.work_weight = 1.0;
+  config.memory_weight = 1.0 / 1024.0;
+
+  const cosmosim::parallel::DecompositionPlan plan =
+      cosmosim::parallel::buildMortonSfcDecomposition(items, config);
+
+  assert(plan.owning_rank_by_item.size() == items.size());
+  assert(plan.sorted_indices.size() == items.size());
+  assert(plan.ranges_by_rank.size() == 3);
+  for (const int rank : plan.owning_rank_by_item) {
+    assert(rank >= 0 && rank < config.world_size);
+  }
+
+  for (std::size_t rank = 0; rank < plan.ranges_by_rank.size(); ++rank) {
+    const auto range = plan.ranges_by_rank[rank];
+    assert(range.begin_sorted <= range.end_sorted);
+    assert(range.end_sorted <= items.size());
+    for (std::size_t s = range.begin_sorted; s < range.end_sorted; ++s) {
+      assert(plan.owning_rank_by_item[plan.sorted_indices[s]] == static_cast<int>(rank));
+    }
+  }
+
+  assert(plan.metrics.weighted_imbalance_ratio >= 1.0);
+  assert(plan.metrics.memory_imbalance_ratio >= 1.0);
+  assert(plan.metrics.total_memory_bytes > 0);
+  std::uint64_t counted_particles = 0;
+  for (const auto value : plan.metrics.owned_particles_by_rank) {
+    counted_particles += value;
+  }
+  assert(counted_particles == 8);
+}
+
+
+void testMortonDecompositionKeepsOneItemPerRankWhenPossible() {
+  std::vector<cosmosim::parallel::DecompositionItem> items(4);
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    items[i].entity_id = static_cast<std::uint64_t>(i + 1U);
+    items[i].kind = cosmosim::parallel::DecompositionEntityKind::kParticle;
+    items[i].x_comov = static_cast<double>(i) / 4.0;
+    items[i].work_units = 1.0;
+    items[i].memory_bytes = 128;
+  }
+
+  cosmosim::parallel::DecompositionConfig config;
+  config.world_size = 4;
+  config.owned_particle_weight = 1.0;
+  config.work_weight = 1.0;
+
+  const auto plan = cosmosim::parallel::buildMortonSfcDecomposition(items, config);
+  assert(plan.ranges_by_rank.size() == 4);
+  for (std::size_t rank = 0; rank < 4; ++rank) {
+    assert(plan.ranges_by_rank[rank].end_sorted - plan.ranges_by_rank[rank].begin_sorted == 1U);
+    assert(plan.metrics.owned_particles_by_rank[rank] == 1U);
+    assert(plan.metrics.weighted_load_by_rank[rank] > 0.0);
+  }
+}
+
+void testGravityAwareDecompositionTracksInteractionCost() {
+  std::vector<cosmosim::parallel::DecompositionItem> items(8);
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    items[i].entity_id = static_cast<std::uint64_t>(i + 1);
+    items[i].kind = cosmosim::parallel::DecompositionEntityKind::kParticle;
+    items[i].x_comov = static_cast<double>(i) / 8.0;
+    items[i].y_comov = 0.0;
+    items[i].z_comov = 0.0;
+    items[i].memory_bytes = 256;
+    items[i].active_target_count_recent = (i < 4) ? 1 : 40;
+    items[i].remote_tree_interactions_recent = (i < 4) ? 1 : 50;
+  }
+
+  cosmosim::parallel::DecompositionConfig baseline_config;
+  baseline_config.world_size = 2;
+  baseline_config.owned_particle_weight = 1.0;
+  const auto baseline = cosmosim::parallel::buildMortonSfcDecomposition(items, baseline_config);
+
+  cosmosim::parallel::DecompositionConfig gravity_config;
+  gravity_config.world_size = 2;
+  gravity_config.owned_particle_weight = 1.0;
+  gravity_config.active_target_weight = 2.0;
+  gravity_config.remote_tree_interaction_weight = 3.0;
+  gravity_config.memory_weight = 1.0 / 4096.0;
+
+  const auto plan = cosmosim::parallel::buildMortonSfcDecomposition(items, gravity_config);
+  assert(plan.metrics.active_targets_by_rank.size() == 2);
+  assert(plan.metrics.remote_tree_interactions_by_rank.size() == 2);
+  assert(plan.metrics.active_targets_by_rank[0] != plan.metrics.active_targets_by_rank[1]);
+  assert(plan.metrics.remote_tree_interactions_by_rank[0] !=
+         plan.metrics.remote_tree_interactions_by_rank[1]);
+  assert(plan.owning_rank_by_item != baseline.owning_rank_by_item);
+  std::uint64_t total_active_targets = 0;
+  std::uint64_t total_remote_interactions = 0;
+  for (const auto value : plan.metrics.active_targets_by_rank) {
+    total_active_targets += value;
+  }
+  for (const auto value : plan.metrics.remote_tree_interactions_by_rank) {
+    total_remote_interactions += value;
+  }
+  assert(total_active_targets == (4U * 1U + 4U * 40U));
+  assert(total_remote_interactions == (4U * 1U + 4U * 50U));
+}
+
+void testClusteredGravityAwareDecompositionImprovesWeightedImbalance() {
+  std::vector<cosmosim::parallel::DecompositionItem> items(96);
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    const bool clustered = (i % 3U) != 0U;
+    const double center = clustered ? 0.92 : 0.18;
+    items[i].entity_id = static_cast<std::uint64_t>(1000U + i);
+    items[i].kind = cosmosim::parallel::DecompositionEntityKind::kParticle;
+    items[i].x_comov = std::fmod(center + 0.03 * std::sin(0.23 * static_cast<double>(i + 1U)), 1.0);
+    if (items[i].x_comov < 0.0) {
+      items[i].x_comov += 1.0;
+    }
+    items[i].y_comov = std::fmod(center + 0.025 * std::cos(0.29 * static_cast<double>(i + 3U)), 1.0);
+    if (items[i].y_comov < 0.0) {
+      items[i].y_comov += 1.0;
+    }
+    items[i].z_comov = std::fmod(center + 0.019 * std::sin(0.31 * static_cast<double>(i + 5U)), 1.0);
+    if (items[i].z_comov < 0.0) {
+      items[i].z_comov += 1.0;
+    }
+    items[i].active_target_count_recent = clustered ? 44U : 2U;
+    items[i].remote_tree_interactions_recent = clustered ? 57U : 1U;
+    items[i].work_units = clustered ? 2.0 : 1.0;
+    items[i].memory_bytes = clustered ? 288U : 192U;
+  }
+
+  cosmosim::parallel::DecompositionConfig baseline_config;
+  baseline_config.world_size = 4;
+  baseline_config.owned_particle_weight = 1.0;
+  baseline_config.work_weight = 1.0;
+  const auto baseline = cosmosim::parallel::buildMortonSfcDecomposition(items, baseline_config);
+
+  cosmosim::parallel::DecompositionConfig gravity_config;
+  gravity_config.world_size = 4;
+  gravity_config.owned_particle_weight = 1.0;
+  gravity_config.active_target_weight = 2.0;
+  gravity_config.remote_tree_interaction_weight = 1.5;
+  gravity_config.work_weight = 1.0;
+  gravity_config.memory_weight = 1.0 / 4096.0;
+  const auto gravity_plan = cosmosim::parallel::buildMortonSfcDecomposition(items, gravity_config);
+
+  assert(gravity_plan.metrics.weighted_imbalance_ratio < 1.6);
+  assert(gravity_plan.owning_rank_by_item != baseline.owning_rank_by_item);
+}
+
+
+void testExplicitComponentWorkModelAndDiagnostics() {
+  std::vector<cosmosim::parallel::DecompositionItem> items(6);
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    items[i].entity_id = 500 + i;
+    items[i].kind = cosmosim::parallel::DecompositionEntityKind::kParticle;
+    items[i].x_comov = static_cast<double>(i) / 6.0;
+    items[i].y_comov = 0.1;
+    items[i].z_comov = 0.2;
+    items[i].work_components = cosmosim::parallel::DecompositionWorkComponents{
+        .particle_count_cost = 1.0,
+        .gas_cell_cost = (i >= 3) ? 8.0 : 0.0,
+        .tree_interaction_cost = (i >= 3) ? 64.0 : 4.0,
+        .pm_mesh_cost = (i % 2 == 0) ? 5.0 : 2.0,
+        .amr_patch_cost = (i == 5) ? 12.0 : 0.0,
+        .active_fraction_cost = (i >= 3) ? 6.0 : 1.0,
+        .memory_pressure_cost = (i >= 3) ? 2048.0 : 512.0,
+        .gpu_occupancy_cost = 0.0,
+        .generic_work_cost = 1.0,
+        .has_explicit_components = true,
+    };
+  }
+
+  cosmosim::parallel::DecompositionConfig config;
+  config.world_size = 2;
+  config.owned_particle_weight = 0.0;
+  config.work_weight = 0.0;
+  config.memory_weight = 0.0;
+  config.component_weights = cosmosim::parallel::DecompositionWeightCoefficients{
+      .particle_count = 1.0,
+      .gas_cell = 1.5,
+      .tree_interaction = 1.0,
+      .pm_mesh = 0.25,
+      .amr_patch = 2.0,
+      .active_fraction = 2.0,
+      .memory_pressure = 1.0 / 1024.0,
+      .gpu_occupancy = 0.0,
+      .generic_work = 0.5,
+  };
+  const auto plan = cosmosim::parallel::buildMortonSfcDecomposition(items, config);
+  assert(plan.metrics.gas_cell_cost_by_rank.size() == 2);
+  assert(plan.metrics.tree_interaction_cost_by_rank.size() == 2);
+  assert(plan.metrics.pm_mesh_cost_by_rank.size() == 2);
+  double total_tree = 0.0;
+  double total_gas = 0.0;
+  double total_pm = 0.0;
+  for (std::size_t rank = 0; rank < 2; ++rank) {
+    total_tree += plan.metrics.tree_interaction_cost_by_rank[rank];
+    total_gas += plan.metrics.gas_cell_cost_by_rank[rank];
+    total_pm += plan.metrics.pm_mesh_cost_by_rank[rank];
+  }
+  assert(std::abs(total_tree - (3.0 * 4.0 + 3.0 * 64.0)) < 1.0e-12);
+  assert(std::abs(total_gas - 24.0) < 1.0e-12);
+  assert(std::abs(total_pm - 21.0) < 1.0e-12);
+  assert(plan.metrics.weighted_imbalance_ratio >= 1.0);
+}
+
+
+void testExplicitBlockingGhostExchangePlanRequiresOwnedSendAndGhostReceive() {
+  const cosmosim::parallel::GhostLayerEpoch epoch{
+      .decomposition_epoch = 2,
+      .ghost_sync_epoch = 3,
+      .particle_index_generation = 4,
+  };
+  const std::vector<cosmosim::parallel::LocalGhostDescriptor> descriptors{
+      cosmosim::parallel::LocalGhostDescriptor{
+          .residency = cosmosim::parallel::LocalIndexResidency::kOwned,
+          .owning_rank = 0,
+          .particle_id = 10,
+          .epoch = epoch,
+      },
+      cosmosim::parallel::LocalGhostDescriptor{
+          .residency = cosmosim::parallel::LocalIndexResidency::kGhost,
+          .owning_rank = 1,
+          .particle_id = 20,
+          .epoch = epoch,
+      },
+  };
+  const std::vector<int> neighbors{1};
+  const std::vector<std::vector<std::uint32_t>> send{{0}};
+  const std::vector<std::vector<std::uint32_t>> recv{{1}};
+  const auto plan = cosmosim::parallel::buildExplicitGhostExchangePlan(
+      0,
+      neighbors,
+      send,
+      recv,
+      cosmosim::parallel::ghostRefreshPayloadRecordBytes(),
+      epoch);
+  cosmosim::parallel::validateBlockingGhostExchangeContracts(plan, descriptors, 0, epoch);
+  assert(plan.send_bytes == cosmosim::parallel::ghostRefreshPayloadRecordBytes());
+  assert(plan.recv_bytes == cosmosim::parallel::ghostRefreshPayloadRecordBytes());
+
+  cosmosim::parallel::GhostExchangeBufferSoA source;
+  source.epoch = epoch;
+  source.entity_id = {10};
+  source.density_code = {1.0};
+  source.velocity_x_code = {2.0};
+  source.pressure_code = {3.0};
+
+  bool threw = false;
+  try {
+    const cosmosim::parallel::MpiContext serial_context(false, 1, 0);
+    (void)cosmosim::parallel::executeBlockingGhostRefreshExchange(
+        serial_context, plan, descriptors, source, epoch);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testRestartMetadataLargeAndMalformedCounts() {
+  cosmosim::parallel::DistributedRestartState state;
+  state.schema_version = 2;
+  state.world_size = 3;
+  state.pm_grid_nx = 12;
+  state.pm_grid_ny = 12;
+  state.pm_grid_nz = 12;
+  state.pm_slab_begin_x_by_rank = {0, 4, 8};
+  state.pm_slab_end_x_by_rank = {4, 8, 12};
+  state.owning_rank_by_item.resize(4096U);
+  for (std::size_t i = 0; i < state.owning_rank_by_item.size(); ++i) {
+    state.owning_rank_by_item[i] = static_cast<int>(i % 3U);
+  }
+  const std::string encoded = state.serialize();
+  assert(state.serializedSizeBytes() == encoded.size());
+  std::ostringstream streamed;
+  state.serializeTo(streamed);
+  assert(streamed.str() == encoded);
+  cosmosim::parallel::DistributedRestartState empty_state = state;
+  empty_state.owning_rank_by_item.clear();
+  const std::string empty_encoded = empty_state.serialize();
+  assert(empty_state.serializedSizeBytes() == empty_encoded.size());
+  std::ostringstream empty_stream;
+  empty_state.serializeTo(empty_stream);
+  assert(empty_stream.str() == empty_encoded);
+  const auto restored = cosmosim::parallel::DistributedRestartState::deserialize(encoded);
+  assert(restored.owning_rank_by_item == state.owning_rank_by_item);
+  assert(restored.pm_slab_begin_x_by_rank == state.pm_slab_begin_x_by_rank);
+  assert(restored.pm_slab_end_x_by_rank == state.pm_slab_end_x_by_rank);
+  assert(restored.serialize() == encoded);
+  for (const std::string malformed : {
+      std::string("item_count=18446744073709551615\n"),
+      std::string("pm_slab_rank_count=18446744073709551615\n")}) {
+    bool rejected = false;
+    try { (void)cosmosim::parallel::DistributedRestartState::deserialize(malformed); }
+    catch (const std::length_error&) { rejected = true; }
+    assert(rejected);
+  }
+}
+
+void testRestartStateRoundTrip() {
+  cosmosim::parallel::DistributedRestartState in;
+  in.schema_version = 2;
+  in.decomposition_epoch = 7;
+  in.world_size = 2;
+  in.pm_grid_nx = 16;
+  in.pm_grid_ny = 16;
+  in.pm_grid_nz = 16;
+  in.pm_decomposition_mode = "slab";
+  in.gravity_kick_opportunity = 5;
+  in.pm_update_cadence_steps = 2;
+  in.long_range_field_version = 3;
+  in.last_long_range_refresh_opportunity = 4;
+  in.long_range_field_built_step_index = 12;
+  in.long_range_field_built_scale_factor = 0.4;
+  in.long_range_restart_policy = "deterministic_rebuild";
+  in.owning_rank_by_item = {0, 1, 1, 0};
+  in.pm_slab_begin_x_by_rank = {0, 8};
+  in.pm_slab_end_x_by_rank = {8, 16};
+
+  const std::string encoded = in.serialize();
+  const auto out = cosmosim::parallel::DistributedRestartState::deserialize(encoded);
+
+  assert(out.schema_version == in.schema_version);
+  assert(out.decomposition_epoch == in.decomposition_epoch);
+  assert(out.world_size == in.world_size);
+  assert(out.pm_grid_nx == in.pm_grid_nx);
+  assert(out.pm_grid_ny == in.pm_grid_ny);
+  assert(out.pm_grid_nz == in.pm_grid_nz);
+  assert(out.gravity_kick_opportunity == in.gravity_kick_opportunity);
+  assert(out.long_range_field_version == in.long_range_field_version);
+  assert(out.owning_rank_by_item == in.owning_rank_by_item);
+  assert(out.pm_slab_begin_x_by_rank == in.pm_slab_begin_x_by_rank);
+  assert(out.pm_slab_end_x_by_rank == in.pm_slab_end_x_by_rank);
+
+  bool bad_owner_threw = false;
+  try {
+    (void)cosmosim::parallel::DistributedRestartState::deserialize(
+        "schema_version=2\ndecomposition_epoch=7\nworld_size=2\npm_grid_nx=8\npm_grid_ny=8\npm_grid_nz=8\n"
+        "pm_decomposition_mode=slab\ngravity_kick_opportunity=0\npm_update_cadence_steps=1\n"
+        "long_range_field_version=0\nlast_long_range_refresh_opportunity=0\n"
+        "long_range_field_built_step_index=0\nlong_range_field_built_scale_factor=1\n"
+        "long_range_restart_policy=deterministic_rebuild\nitem_count=1\nrank[0]=2\n"
+        "pm_slab_rank_count=2\npm_slab_begin_x[0]=0\npm_slab_end_x[0]=4\npm_slab_begin_x[1]=4\npm_slab_end_x[1]=8\n");
+  } catch (const std::invalid_argument&) {
+    bad_owner_threw = true;
+  }
+  assert(bad_owner_threw);
+}
+
+void testExplicitOwnedVsGhostContracts() {
+  const std::vector<cosmosim::parallel::LocalGhostDescriptor> descriptors = {
+      {.residency = cosmosim::parallel::LocalIndexResidency::kOwned, .owning_rank = 0},
+      {.residency = cosmosim::parallel::LocalIndexResidency::kGhost, .owning_rank = 1},
+      {.residency = cosmosim::parallel::LocalIndexResidency::kOwned, .owning_rank = 0},
+      {.residency = cosmosim::parallel::LocalIndexResidency::kGhost, .owning_rank = 2},
+  };
+
+  const auto plan = cosmosim::parallel::buildGhostExchangePlan(0, descriptors, sizeof(double) * 3 + sizeof(std::uint64_t));
+  assert(plan.neighbor_ranks.size() == 2);
+  assert(plan.neighbor_ranks[0] == 1);
+  assert(plan.neighbor_ranks[1] == 2);
+  assert(plan.recv_local_indices_by_neighbor[0].size() == 1);
+  assert(plan.recv_local_indices_by_neighbor[0][0] == 1);
+  assert(plan.recv_local_indices_by_neighbor[1].size() == 1);
+  assert(plan.recv_local_indices_by_neighbor[1][0] == 3);
+  assert(plan.send_local_indices_by_neighbor[0].empty());
+  assert(plan.send_local_indices_by_neighbor[1].empty());
+  assert(plan.outbound_transfers.size() == 2);
+  assert(plan.inbound_transfers.size() == 2);
+  assert(plan.outbound_transfers[0].role == cosmosim::parallel::GhostTransferRole::kOutboundSend);
+  assert(plan.inbound_transfers[0].role == cosmosim::parallel::GhostTransferRole::kInboundReceive);
+  assert(plan.outbound_transfers[0].intent ==
+         cosmosim::parallel::GhostTransferIntent::kGhostRefreshRequest);
+  assert(plan.inbound_transfers[0].intent ==
+         cosmosim::parallel::GhostTransferIntent::kGhostRefreshReceiveStaging);
+  assert(plan.outbound_transfers[0].expected_post_transfer_residency ==
+         cosmosim::parallel::LocalIndexResidency::kGhost);
+  assert(plan.inbound_transfers[0].expected_post_transfer_residency ==
+         cosmosim::parallel::LocalIndexResidency::kGhost);
+  assert(plan.outbound_transfers[0].neighbor_slot == 0);
+  assert(plan.inbound_transfers[1].neighbor_slot == 1);
+  assert(plan.outbound_transfers[0].peer_rank == 1);
+  assert(plan.inbound_transfers[1].peer_rank == 2);
+  assert(plan.outbound_transfers[1].local_indices == plan.send_local_indices_by_neighbor[1]);
+  assert(plan.inbound_transfers[1].local_indices == plan.recv_local_indices_by_neighbor[1]);
+  assert(plan.send_bytes == 0);
+  assert(plan.recv_bytes == 2 * (sizeof(double) * 3 + sizeof(std::uint64_t)));
+  cosmosim::parallel::validateGhostExchangePlan(plan);
+}
+
+
+void testOwnershipDescriptorsAndGhostEpochContracts() {
+  cosmosim::parallel::validateOwnershipDescriptor(cosmosim::parallel::OwnershipDescriptor{
+      .kind = cosmosim::parallel::ExchangeObjectKind::kLocalParticle,
+      .object_id = 1,
+      .owner_rank = 0,
+      .local_rank = 0,
+      .is_authoritative = true,
+      .is_mutable = true,
+  });
+
+  bool mutable_ghost_threw = false;
+  try {
+    cosmosim::parallel::validateOwnershipDescriptor(cosmosim::parallel::OwnershipDescriptor{
+        .kind = cosmosim::parallel::ExchangeObjectKind::kImportedGhostParticle,
+        .object_id = 2,
+        .owner_rank = 1,
+        .local_rank = 0,
+        .is_authoritative = false,
+        .is_mutable = true,
+    });
+  } catch (const std::invalid_argument&) {
+    mutable_ghost_threw = true;
+  }
+  assert(mutable_ghost_threw);
+
+  cosmosim::parallel::GhostExchangeBufferSoA ghosts;
+  ghosts.epoch = {.decomposition_epoch = 4, .ghost_sync_epoch = 9, .particle_index_generation = 11};
+  ghosts.entity_id = {10, 20};
+  ghosts.density_code = {1.0, 2.0};
+  ghosts.velocity_x_code = {0.5, 0.75};
+  ghosts.pressure_code = {3.0, 4.0};
+  const auto view = cosmosim::parallel::makeReadOnlyGhostExchangeView(ghosts);
+  cosmosim::parallel::requireFreshGhostExchangeView(view, ghosts.epoch);
+  bool stale_threw = false;
+  try {
+    cosmosim::parallel::requireFreshGhostExchangeView(
+        view,
+        {.decomposition_epoch = 5, .ghost_sync_epoch = 9, .particle_index_generation = 11});
+  } catch (const std::invalid_argument&) {
+    stale_threw = true;
+  }
+  assert(stale_threw);
+}
+
+void testExchangeObjectDescriptorValidation() {
+  const auto layout = cosmosim::parallel::makePmSlabLayout(12, 8, 4, 3, 1);
+  const auto descriptor = layout.ownershipDescriptor(/*decomposition_epoch=*/7);
+  assert(descriptor.owner_rank == 1);
+  assert(descriptor.begin_x == 4);
+  assert(descriptor.end_x == 8);
+  cosmosim::parallel::validateTreePseudoParticleDescriptor({
+      .pseudo_particle_id = 42,
+      .source_rank = 2,
+      .decomposition_epoch = 7,
+      .derived_not_authoritative = true,
+  });
+  cosmosim::parallel::validateHydroGhostCellDescriptor({
+      .gas_cell_id = 99,
+      .owner_rank = 1,
+      .consumer_rank = 0,
+      .hydro_sync_epoch = 3,
+      .decomposition_epoch = 4,
+      .boundary_state_only = true,
+  });
+  cosmosim::parallel::validateHydroGhostCellRequest({
+      .descriptor = {.gas_cell_id = 99,
+                     .owner_rank = 1,
+                     .consumer_rank = 0,
+                     .hydro_sync_epoch = 3,
+                     .decomposition_epoch = 4,
+                     .boundary_state_only = true},
+      .face_key = 123,
+      .axis = 0,
+      .side = 1,
+  });
+  cosmosim::parallel::validateHydroGhostCellPayloadRecord({
+      .descriptor = {.gas_cell_id = 99,
+                     .owner_rank = 1,
+                     .consumer_rank = 0,
+                     .hydro_sync_epoch = 3,
+                     .decomposition_epoch = 4,
+                     .boundary_state_only = true},
+      .face_key = 123,
+      .mass_density_comoving = 1.0,
+      .momentum_density_x_comoving = 0.1,
+      .momentum_density_y_comoving = 0.0,
+      .momentum_density_z_comoving = 0.0,
+      .total_energy_density_comoving = 2.5,
+  });
+  bool stale_payload_rejected = false;
+  try {
+    cosmosim::parallel::validateHydroGhostCellPayloadRecord({
+        .descriptor = {.gas_cell_id = 0,
+                       .owner_rank = 1,
+                       .consumer_rank = 0,
+                       .hydro_sync_epoch = 3,
+                       .decomposition_epoch = 4,
+                       .boundary_state_only = true},
+        .face_key = 123,
+        .mass_density_comoving = 1.0,
+        .total_energy_density_comoving = 2.5,
+    });
+  } catch (const std::invalid_argument&) {
+    stale_payload_rejected = true;
+  }
+  assert(stale_payload_rejected);
+  cosmosim::parallel::validateAmrPatchExchangeDescriptor({
+      .patch_id = 77,
+      .owner_rank = 1,
+      .peer_rank = 0,
+      .decomposition_epoch = 7,
+      .metadata_only = true,
+  });
+}
+
+void testGhostExchangeBufferRejectsOwnershipMigrationIntent() {
+  cosmosim::parallel::GhostExchangeBufferSoA source;
+  source.entity_id = {11, 12};
+  source.density_code = {1.0, 2.0};
+  source.velocity_x_code = {3.0, 4.0};
+  source.pressure_code = {5.0, 6.0};
+
+  cosmosim::parallel::GhostTransferDescriptor ghost_descriptor;
+  ghost_descriptor.role = cosmosim::parallel::GhostTransferRole::kOutboundSend;
+  ghost_descriptor.intent = cosmosim::parallel::GhostTransferIntent::kGhostRefreshRequest;
+  ghost_descriptor.peer_rank = 1;
+  ghost_descriptor.expected_post_transfer_residency = cosmosim::parallel::LocalIndexResidency::kGhost;
+  ghost_descriptor.local_indices = {0, 1};
+
+  cosmosim::parallel::GhostExchangeBuffer buffer;
+  buffer.packFrom(ghost_descriptor, source, ghost_descriptor.local_indices);
+  assert(buffer.byteSize() == sizeof(std::uint64_t) + sizeof(std::uint16_t) +
+      2U * cosmosim::parallel::ghostRefreshPayloadRecordBytes());
+
+  cosmosim::parallel::GhostExchangeBufferSoA destination;
+  buffer.unpackAppendTo(ghost_descriptor, destination);
+  assert(destination.entity_id == source.entity_id);
+
+  ghost_descriptor.intent = cosmosim::parallel::GhostTransferIntent::kOwnershipMigrationSend;
+  bool migration_pack_threw = false;
+  try {
+    buffer.packFrom(ghost_descriptor, source, ghost_descriptor.local_indices);
+  } catch (const std::invalid_argument&) {
+    migration_pack_threw = true;
+  }
+  assert(migration_pack_threw);
+
+  bool migration_unpack_threw = false;
+  try {
+    buffer.unpackAppendTo(ghost_descriptor, destination);
+  } catch (const std::invalid_argument&) {
+    migration_unpack_threw = true;
+  }
+  assert(migration_unpack_threw);
+}
+
+void testRestartStateRejectsMissingOrDuplicateOwnershipEntries() {
+  {
+    bool threw = false;
+    try {
+      (void)cosmosim::parallel::DistributedRestartState::deserialize(
+          "schema_version=1\ndecomposition_epoch=7\nworld_size=2\nitem_count=3\nrank[0]=1\n");
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+
+  {
+    bool threw = false;
+    try {
+      (void)cosmosim::parallel::DistributedRestartState::deserialize(
+          "schema_version=1\ndecomposition_epoch=7\nworld_size=2\nitem_count=2\nrank[0]=1\nrank[0]=0\nrank[1]=1\n");
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+
+  {
+    bool threw = false;
+    try {
+      (void)cosmosim::parallel::DistributedRestartState::deserialize(
+          "schema_version=2\ndecomposition_epoch=7\nworld_size=2\npm_grid_nx=8\npm_grid_ny=8\npm_grid_nz=8\n"
+          "pm_decomposition_mode=slab\ngravity_kick_opportunity=3\npm_update_cadence_steps=2\n"
+          "long_range_field_version=0\nlast_long_range_refresh_opportunity=2\n"
+          "long_range_field_built_step_index=0\nlong_range_field_built_scale_factor=1\n"
+          "long_range_restart_policy=deterministic_rebuild\nitem_count=2\nrank[0]=0\nrank[1]=1\n"
+          "pm_slab_rank_count=2\npm_slab_begin_x[0]=0\npm_slab_end_x[0]=4\npm_slab_begin_x[1]=4\npm_slab_end_x[1]=8\n");
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+}
+
+void testDistributedRestartCompatibilityReporting() {
+  cosmosim::parallel::DistributedRestartState restart;
+  restart.schema_version = 2;
+  restart.world_size = 2;
+  restart.pm_grid_nx = 8;
+  restart.pm_grid_ny = 8;
+  restart.pm_grid_nz = 8;
+  restart.pm_decomposition_mode = "slab";
+  restart.pm_slab_begin_x_by_rank = {0, 4};
+  restart.pm_slab_end_x_by_rank = {4, 8};
+
+  cosmosim::parallel::DistributedExecutionTopology runtime;
+  runtime.world_size = 2;
+  runtime.world_rank = 1;
+  runtime.pm_slab = cosmosim::parallel::makePmSlabLayout(8, 8, 8, 2, 1);
+  const auto ok = cosmosim::parallel::evaluateDistributedRestartCompatibility(restart, runtime);
+  assert(ok.compatible());
+  assert(ok.mismatch_messages.empty());
+
+  restart.world_size = 3;
+  const auto rank_count_bad = cosmosim::parallel::evaluateDistributedRestartCompatibility(restart, runtime);
+  assert(!rank_count_bad.compatible());
+  assert(!rank_count_bad.world_size_match);
+  assert(!rank_count_bad.pm_slab_table_shape_match);
+  restart.world_size = 2;
+
+  restart.schema_version = 1;
+  const auto schema_bad = cosmosim::parallel::evaluateDistributedRestartCompatibility(restart, runtime);
+  assert(!schema_bad.compatible());
+  assert(!schema_bad.supported_schema_match);
+  restart.schema_version = 2;
+
+  runtime.pm_slab = cosmosim::parallel::makePmSlabLayout(10, 8, 8, 2, 1);
+  const auto bad = cosmosim::parallel::evaluateDistributedRestartCompatibility(restart, runtime);
+  assert(!bad.compatible());
+  assert(!bad.pm_grid_shape_match);
+  assert(!bad.mismatch_messages.empty());
+
+  restart.pm_update_cadence_steps = 0;
+  runtime.pm_slab = cosmosim::parallel::makePmSlabLayout(8, 8, 8, 2, 1);
+  const auto cadence_bad = cosmosim::parallel::evaluateDistributedRestartCompatibility(restart, runtime);
+  assert(!cadence_bad.compatible());
+  assert(!cadence_bad.pm_cadence_steps_match);
+}
+
+void testGhostTransferInvariantFailures() {
+  {
+    bool threw = false;
+    try {
+      const std::vector<cosmosim::parallel::LocalGhostDescriptor> descriptors = {
+          {.residency = cosmosim::parallel::LocalIndexResidency::kOwned, .owning_rank = 1},
+      };
+      static_cast<void>(cosmosim::parallel::buildGhostExchangePlan(0, descriptors, sizeof(double)));
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+
+  {
+    bool threw = false;
+    try {
+      const std::vector<cosmosim::parallel::LocalGhostDescriptor> descriptors = {
+          {.residency = cosmosim::parallel::LocalIndexResidency::kGhost, .owning_rank = 0},
+      };
+      static_cast<void>(cosmosim::parallel::buildGhostExchangePlan(0, descriptors, sizeof(double)));
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+
+  {
+    bool threw = false;
+    try {
+      const std::vector<cosmosim::parallel::LocalGhostDescriptor> descriptors = {
+          {.residency = cosmosim::parallel::LocalIndexResidency::kGhost, .owning_rank = 1},
+      };
+      static_cast<void>(cosmosim::parallel::buildGhostExchangePlan(0, descriptors, 0));
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+}
+
+void testDeterministicReductionAgreement() {
+  const std::vector<double> rank_values = {1.5, -2.0, 3.25, 10.0};
+  const double deterministic = cosmosim::parallel::deterministicRankOrderedSum(rank_values);
+  assert(std::abs(deterministic - 12.75) < 1.0e-15);
+
+  const auto exact = cosmosim::parallel::compareReductionAgreement(rank_values, deterministic);
+  assert(std::abs(exact.deterministic_baseline_sum - deterministic) < 1.0e-15);
+  assert(std::abs(exact.measured_sum - deterministic) < 1.0e-15);
+  assert(exact.absolute_error < 1.0e-15);
+  assert(exact.relative_error < 1.0e-15);
+
+  const auto perturbed = cosmosim::parallel::compareReductionAgreement(rank_values, deterministic + 1.0e-6);
+  assert(perturbed.absolute_error > 0.0);
+  assert(perturbed.relative_error > 0.0);
+  assert(!cosmosim::parallel::satisfiesReductionAgreement(
+      perturbed,
+      {.absolute_tolerance = 1.0e-9, .relative_tolerance = 1.0e-9}));
+  assert(cosmosim::parallel::satisfiesReductionAgreement(
+      perturbed,
+      {.mode = cosmosim::parallel::ReductionAgreementMode::kAbsoluteOrRelative,
+       .absolute_tolerance = 2.0e-6,
+       .relative_tolerance = 0.0}));
+}
+
+void testGhostExchangePlanValidationDriftRejection() {
+  const std::vector<cosmosim::parallel::LocalGhostDescriptor> descriptors = {
+      {.residency = cosmosim::parallel::LocalIndexResidency::kOwned, .owning_rank = 0},
+      {.residency = cosmosim::parallel::LocalIndexResidency::kGhost, .owning_rank = 2},
+      {.residency = cosmosim::parallel::LocalIndexResidency::kGhost, .owning_rank = 1},
+  };
+  auto plan = cosmosim::parallel::buildGhostExchangePlan(0, descriptors, sizeof(double));
+
+  {
+    bool threw = false;
+    auto bad = plan;
+    bad.outbound_transfers[0].role = cosmosim::parallel::GhostTransferRole::kInboundReceive;
+    try {
+      cosmosim::parallel::validateGhostExchangePlan(bad);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+
+  {
+    bool threw = false;
+    auto bad = plan;
+    bad.inbound_transfers[0].peer_rank = 99;
+    try {
+      cosmosim::parallel::validateGhostExchangePlan(bad);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+
+  {
+    bool threw = false;
+    auto bad = plan;
+    bad.outbound_transfers[0].local_indices.push_back(42);
+    try {
+      cosmosim::parallel::validateGhostExchangePlan(bad);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+}
+
+void testReductionAgreementPolicyModes() {
+  const cosmosim::parallel::ReductionAgreement agreement{
+      .deterministic_baseline_sum = 10.0,
+      .measured_sum = 10.2,
+      .absolute_error = 0.2,
+      .relative_error = 0.02,
+  };
+
+  assert(cosmosim::parallel::satisfiesReductionAgreement(
+      agreement,
+      {.mode = cosmosim::parallel::ReductionAgreementMode::kAbsoluteOnly,
+       .absolute_tolerance = 0.25,
+       .relative_tolerance = 0.0}));
+  assert(!cosmosim::parallel::satisfiesReductionAgreement(
+      agreement,
+      {.mode = cosmosim::parallel::ReductionAgreementMode::kAbsoluteOnly,
+       .absolute_tolerance = 0.1,
+       .relative_tolerance = 1.0}));
+  assert(cosmosim::parallel::satisfiesReductionAgreement(
+      agreement,
+      {.mode = cosmosim::parallel::ReductionAgreementMode::kRelativeOnly,
+       .absolute_tolerance = 0.0,
+       .relative_tolerance = 0.03}));
+  assert(!cosmosim::parallel::satisfiesReductionAgreement(
+      agreement,
+      {.mode = cosmosim::parallel::ReductionAgreementMode::kRelativeOnly,
+       .absolute_tolerance = 1.0,
+       .relative_tolerance = 0.01}));
+  assert(cosmosim::parallel::satisfiesReductionAgreement(
+      agreement,
+      {.mode = cosmosim::parallel::ReductionAgreementMode::kAbsoluteAndRelative,
+       .absolute_tolerance = 0.3,
+       .relative_tolerance = 0.03}));
+  assert(!cosmosim::parallel::satisfiesReductionAgreement(
+      agreement,
+      {.mode = cosmosim::parallel::ReductionAgreementMode::kAbsoluteAndRelative,
+       .absolute_tolerance = 0.3,
+       .relative_tolerance = 0.01}));
+  assert(cosmosim::parallel::satisfiesReductionAgreement(
+      agreement,
+      {.mode = cosmosim::parallel::ReductionAgreementMode::kAbsoluteOrRelative,
+       .absolute_tolerance = 0.1,
+       .relative_tolerance = 0.03}));
+}
+
+void testRankConfigConsensus() {
+  const std::vector<cosmosim::parallel::RankConfigDigest> matching = {
+      {.world_rank = 0, .normalized_config_hash = 0xabcU, .mpi_ranks_expected = 2, .deterministic_reduction = true},
+      {.world_rank = 1, .normalized_config_hash = 0xabcU, .mpi_ranks_expected = 2, .deterministic_reduction = true},
+  };
+  const auto ok = cosmosim::parallel::evaluateRankConfigConsensus(matching);
+  assert(ok.allConsistent());
+  assert(ok.mismatched_ranks.empty());
+  assert(ok.mismatches.empty());
+
+  const std::vector<cosmosim::parallel::RankConfigDigest> mismatch = {
+      {.world_rank = 0, .normalized_config_hash = 0xabcU, .mpi_ranks_expected = 2, .deterministic_reduction = true},
+      {.world_rank = 1, .normalized_config_hash = 0xdefU, .mpi_ranks_expected = 4, .deterministic_reduction = false},
+  };
+  const auto bad = cosmosim::parallel::evaluateRankConfigConsensus(mismatch);
+  assert(!bad.normalized_config_hash_match);
+  assert(!bad.mpi_ranks_expected_match);
+  assert(!bad.deterministic_reduction_match);
+  assert(!bad.allConsistent());
+  assert(bad.mismatched_ranks.size() == 1);
+  assert(bad.mismatched_ranks[0] == 1);
+  assert(bad.mismatches.size() == 3);
+  assert(bad.mismatches[0].property == cosmosim::parallel::RankConfigMismatchProperty::kNormalizedConfigHash);
+  assert(bad.mismatches[0].baseline_rank == 0);
+  assert(bad.mismatches[0].rank == 1);
+  assert(bad.mismatches[0].baseline_value == "2748");
+  assert(bad.mismatches[0].rank_value == "3567");
+  assert(bad.mismatches[1].property == cosmosim::parallel::RankConfigMismatchProperty::kMpiRanksExpected);
+  assert(bad.mismatches[2].property == cosmosim::parallel::RankConfigMismatchProperty::kDeterministicReduction);
+}
+
+void testGhostBufferPayloadShapeValidation() {
+  cosmosim::parallel::GhostExchangeBufferSoA source;
+  source.entity_id = {1};
+  source.density_code = {2.0};
+  source.velocity_x_code = {3.0};
+  source.pressure_code = {4.0};
+  cosmosim::parallel::GhostExchangeBuffer buffer;
+  const std::vector<std::uint32_t> packed_indices = {0};
+  buffer.packFrom(source, packed_indices);
+
+  cosmosim::parallel::GhostExchangeBufferSoA destination;
+  buffer.unpackAppendTo(destination);
+  assert(destination.entity_id.size() == 1);
+}
+
+
+void testMpiContextContractValidation() {
+  const cosmosim::parallel::MpiContext runtime(true, 4, 2);
+  runtime.validateExpectedWorldSizeOrThrow(4);
+  assert(runtime.isEnabled());
+  assert(!runtime.isRoot());
+  assert(runtime.worldSize() == 4);
+  assert(runtime.worldRank() == 2);
+
+  bool threw = false;
+  try {
+    runtime.validateExpectedWorldSizeOrThrow(3);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testDistributedExecutionTopologyCpuOnly() {
+  const cosmosim::parallel::MpiContext runtime(true, 3, 1);
+  const auto topology = cosmosim::parallel::buildDistributedExecutionTopology(
+      12, 8, 4, runtime, /*mpi_ranks_expected=*/3, /*configured_gpu_devices=*/0, /*cuda_runtime_available=*/false, /*visible_device_count=*/0);
+  assert(topology.mpi_enabled);
+  assert(topology.world_size == 3);
+  assert(topology.world_rank == 1);
+  assert(topology.isDistributed());
+  assert(!topology.usesCuda());
+  assert(topology.pm_slab.owned_x.begin_x == 4);
+  assert(topology.pm_slab.owned_x.end_x == 8);
+}
+
+void testDistributedExecutionTopologyCudaAssignment() {
+  const cosmosim::parallel::MpiContext runtime(true, 4, 3);
+  const auto topology = cosmosim::parallel::buildDistributedExecutionTopology(
+      16, 8, 8, runtime, /*mpi_ranks_expected=*/4, /*configured_gpu_devices=*/2, /*cuda_runtime_available=*/true, /*visible_device_count=*/4);
+  assert(topology.usesCuda());
+  assert(topology.device_assignment.requested_device_count == 2);
+  assert(topology.device_assignment.active_device_count == 2);
+  assert(topology.device_assignment.assigned_device_index == 1);
+  assert(topology.device_assignment.isValid());
+}
+
+void testDistributedExecutionTopologyRejectsInvalidGpuRequest() {
+  bool threw = false;
+  try {
+    const cosmosim::parallel::MpiContext runtime(true, 2, 0);
+    (void)cosmosim::parallel::buildDistributedExecutionTopology(
+        8, 8, 8, runtime, /*mpi_ranks_expected=*/2, /*configured_gpu_devices=*/1, /*cuda_runtime_available=*/false, /*visible_device_count=*/0);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testPmSlabUnevenPartitionOwnership() {
+  const std::size_t nx = 10;
+  const int world_size = 3;
+  const auto r0 = cosmosim::parallel::pmOwnedXRangeForRank(nx, world_size, 0);
+  const auto r1 = cosmosim::parallel::pmOwnedXRangeForRank(nx, world_size, 1);
+  const auto r2 = cosmosim::parallel::pmOwnedXRangeForRank(nx, world_size, 2);
+
+  assert(r0.begin_x == 0 && r0.end_x == 4);
+  assert(r1.begin_x == 4 && r1.end_x == 8);
+  assert(r2.begin_x == 8 && r2.end_x == 10);
+
+  for (std::size_t x = 0; x < nx; ++x) {
+    const int owner = cosmosim::parallel::pmOwnerRankForGlobalX(nx, world_size, x);
+    if (x < 4) {
+      assert(owner == 0);
+    } else if (x < 8) {
+      assert(owner == 1);
+    } else {
+      assert(owner == 2);
+    }
+  }
+}
+
+void testPmSlabLayoutRoundTripAndCellOwnership() {
+  const auto layout = cosmosim::parallel::makePmSlabLayout(
+      /*global_nx=*/10, /*global_ny=*/6, /*global_nz=*/4, /*world_size=*/3, /*world_rank=*/1);
+  assert(layout.isValid());
+  assert(layout.local_nx() == 4);
+  assert(layout.localCellCount() == 4 * 6 * 4);
+  assert(!layout.ownsFullDomain());
+  assert(layout.owned_x.begin_x == 4);
+  assert(layout.owned_x.end_x == 8);
+
+  for (std::size_t global_x = layout.owned_x.begin_x; global_x < layout.owned_x.end_x; ++global_x) {
+    const std::size_t local_x = layout.localXFromGlobal(global_x);
+    assert(layout.globalXFromLocal(local_x) == global_x);
+  }
+
+  const std::size_t idx = layout.localLinearIndex(/*global_x=*/5, /*global_y=*/2, /*global_z=*/3);
+  assert(idx == ((1 * 6 + 2) * 4 + 3));
+  assert(layout.ownsGlobalCell(/*global_x=*/6, /*global_y=*/5, /*global_z=*/3));
+  assert(!layout.ownsGlobalCell(/*global_x=*/8, /*global_y=*/1, /*global_z=*/1));
+
+  bool threw = false;
+  try {
+    (void)layout.localXFromGlobal(8);
+  } catch (const std::out_of_range&) {
+    threw = true;
+  }
+  assert(threw);
+
+  threw = false;
+  try {
+    (void)cosmosim::parallel::pmOwnerRankForGlobalCell(
+        10, 6, 4, 3, /*global_x=*/9, /*global_y=*/5, /*global_z=*/3);
+  } catch (...) {
+    threw = true;
+  }
+  assert(!threw);
+  assert(cosmosim::parallel::pmOwnerRankForGlobalCell(10, 6, 4, 3, 9, 5, 3) == 2);
+}
+
+
+void testGhostExchangePairStableTagsIgnoreNeighborSlotOrder() {
+  const int size_tag_02 = cosmosim::parallel::ghostExchangePairStableTag(6810, 0, 2);
+  const int size_tag_20 = cosmosim::parallel::ghostExchangePairStableTag(6810, 2, 0);
+  const int payload_tag_02 = cosmosim::parallel::ghostExchangePairStableTag(7810, 0, 2);
+  const int payload_tag_20 = cosmosim::parallel::ghostExchangePairStableTag(7810, 2, 0);
+  assert(size_tag_02 == size_tag_20);
+  assert(payload_tag_02 == payload_tag_20);
+  assert(size_tag_02 != payload_tag_02);
+
+  bool threw = false;
+  try {
+    (void)cosmosim::parallel::ghostExchangePairStableTag(6810, 3, 3);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testGhostUnpackRequiresDescriptorSlotCount() {
+  cosmosim::parallel::GhostExchangeBufferSoA source;
+  source.entity_id = {1, 2};
+  source.density_code = {3.0, 4.0};
+  source.velocity_x_code = {5.0, 6.0};
+  source.pressure_code = {7.0, 8.0};
+
+  cosmosim::parallel::GhostTransferDescriptor send_descriptor;
+  send_descriptor.role = cosmosim::parallel::GhostTransferRole::kOutboundSend;
+  send_descriptor.intent = cosmosim::parallel::GhostTransferIntent::kGhostRefreshRequest;
+  send_descriptor.peer_rank = 1;
+  send_descriptor.expected_post_transfer_residency = cosmosim::parallel::LocalIndexResidency::kGhost;
+  send_descriptor.local_indices = {0, 1};
+
+  cosmosim::parallel::GhostExchangeBuffer buffer;
+  buffer.packFrom(send_descriptor, source, send_descriptor.local_indices);
+
+  cosmosim::parallel::GhostTransferDescriptor recv_descriptor;
+  recv_descriptor.role = cosmosim::parallel::GhostTransferRole::kInboundReceive;
+  recv_descriptor.intent = cosmosim::parallel::GhostTransferIntent::kGhostRefreshReceiveStaging;
+  recv_descriptor.peer_rank = 1;
+  recv_descriptor.expected_post_transfer_residency = cosmosim::parallel::LocalIndexResidency::kGhost;
+  recv_descriptor.local_indices = {5};
+
+  cosmosim::parallel::GhostExchangeBufferSoA destination;
+  bool threw = false;
+  try {
+    buffer.unpackAppendTo(recv_descriptor, destination);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
+void testLocalOwnershipIdentitySummaryDetectsReplicationAndDuplicates() {
+  const std::vector<std::uint64_t> rank0_ids = {1, 2, 3};
+  const std::vector<std::uint64_t> rank1_ids = {4, 5, 6};
+  const auto rank0 = cosmosim::parallel::summarizeLocalOwnedParticleIds(rank0_ids);
+  const auto rank1 = cosmosim::parallel::summarizeLocalOwnedParticleIds(rank1_ids);
+  const cosmosim::parallel::LocalOwnershipIdentitySummary reduced{
+      .local_owned_count = rank0.local_owned_count + rank1.local_owned_count,
+      .local_particle_id_sum = rank0.local_particle_id_sum + rank1.local_particle_id_sum,
+      .local_particle_id_square_sum = rank0.local_particle_id_square_sum + rank1.local_particle_id_square_sum,
+      .local_particle_id_xor = rank0.local_particle_id_xor ^ rank1.local_particle_id_xor,
+      .local_particle_ids_unique = rank0.local_particle_ids_unique && rank1.local_particle_ids_unique,
+  };
+  assert(cosmosim::parallel::partitionIdentityMatchesGeneratedSet(
+      reduced,
+      /*expected_global_count=*/6,
+      /*expected_particle_id_sum=*/21,
+      /*expected_particle_id_square_sum=*/91,
+      /*expected_particle_id_xor=*/(1ULL ^ 2ULL ^ 3ULL ^ 4ULL ^ 5ULL ^ 6ULL)));
+
+  const std::vector<std::uint64_t> duplicate_ids = {7, 8, 7};
+  const auto duplicate = cosmosim::parallel::summarizeLocalOwnedParticleIds(duplicate_ids);
+  assert(!duplicate.local_particle_ids_unique);
+  assert(!cosmosim::parallel::partitionIdentityMatchesGeneratedSet(
+      duplicate,
+      /*expected_global_count=*/3,
+      /*expected_particle_id_sum=*/22,
+      /*expected_particle_id_xor=*/8ULL));
+
+  const cosmosim::parallel::LocalOwnershipIdentitySummary replicated_two_rank{
+      .local_owned_count = 12,
+      .local_particle_id_sum = 42,
+      .local_particle_id_xor = 0,
+      .local_particle_ids_unique = true,
+  };
+  assert(!cosmosim::parallel::partitionIdentityMatchesGeneratedSet(
+      replicated_two_rank,
+      /*expected_global_count=*/6,
+      /*expected_particle_id_sum=*/21,
+      /*expected_particle_id_xor=*/(1ULL ^ 2ULL ^ 3ULL ^ 4ULL ^ 5ULL ^ 6ULL)));
+
+  const cosmosim::parallel::LocalOwnershipIdentitySummary same_sum_xor_wrong_square{
+      .local_owned_count = 4,
+      .local_particle_id_sum = 10,
+      .local_particle_id_square_sum = 26,
+      .local_particle_id_xor = (1ULL ^ 2ULL ^ 3ULL ^ 4ULL),
+      .local_particle_ids_unique = true,
+  };
+  assert(!cosmosim::parallel::partitionIdentityMatchesGeneratedSet(
+      same_sum_xor_wrong_square,
+      /*expected_global_count=*/4,
+      /*expected_particle_id_sum=*/10,
+      /*expected_particle_id_square_sum=*/30,
+      /*expected_particle_id_xor=*/(1ULL ^ 2ULL ^ 3ULL ^ 4ULL)));
+
+}
+
+
+void testBlockingGhostRefreshResultCommitsIntoIndexedGhostSlots() {
+  const cosmosim::parallel::GhostLayerEpoch epoch{
+      .decomposition_epoch = 8, .ghost_sync_epoch = 3, .particle_index_generation = 5};
+  const std::vector<cosmosim::parallel::LocalGhostDescriptor> descriptors{
+      {.residency = cosmosim::parallel::LocalIndexResidency::kOwned,
+       .owning_rank = 0,
+       .particle_id = 11,
+       .epoch = epoch},
+      {.residency = cosmosim::parallel::LocalIndexResidency::kGhost,
+       .owning_rank = 1,
+       .particle_id = 22,
+       .epoch = epoch},
+      {.residency = cosmosim::parallel::LocalIndexResidency::kGhost,
+       .owning_rank = 2,
+       .particle_id = 33,
+       .epoch = epoch},
+  };
+  const std::vector<int> neighbors{1, 2};
+  const std::vector<std::vector<std::uint32_t>> sends{{}, {}};
+  const std::vector<std::vector<std::uint32_t>> recvs{{1}, {2}};
+  const auto plan = cosmosim::parallel::buildExplicitGhostExchangePlan(
+      0,
+      neighbors,
+      sends,
+      recvs,
+      cosmosim::parallel::ghostRefreshPayloadRecordBytes(),
+      epoch);
+
+  cosmosim::parallel::GhostExchangeBufferSoA storage;
+  storage.epoch = epoch;
+  storage.entity_id = {11, 22, 33};
+  storage.density_code = {0.0, -1.0, -1.0};
+  storage.velocity_x_code = {0.0, -1.0, -1.0};
+  storage.pressure_code = {0.0, -1.0, -1.0};
+
+  cosmosim::parallel::BlockingGhostExchangeResult result;
+  result.received_ghosts.epoch = epoch;
+  result.received_ghosts.entity_id = {22, 33};
+  result.received_ghosts.density_code = {2.2, 3.3};
+  result.received_ghosts.velocity_x_code = {22.0, 33.0};
+  result.received_ghosts.pressure_code = {220.0, 330.0};
+
+  const auto report = cosmosim::parallel::commitBlockingGhostRefreshResult(
+      storage, descriptors, plan, result, epoch);
+  assert(report.updated_ghost_slots == 2U);
+  assert(storage.entity_id[0] == 11);
+  assert(storage.density_code[1] == 2.2);
+  assert(storage.velocity_x_code[2] == 33.0);
+  assert(storage.pressure_code[2] == 330.0);
+
+  result.received_ghosts.entity_id[1] = 44;
+  bool mismatch_threw = false;
+  try {
+    (void)cosmosim::parallel::commitBlockingGhostRefreshResult(storage, descriptors, plan, result, epoch);
+  } catch (const std::invalid_argument&) {
+    mismatch_threw = true;
+  }
+  assert(mismatch_threw);
+}
+
+
+void testRuntimeFeedbackRaisesMeasuredCostComponents() {
+  std::vector<cosmosim::parallel::DecompositionItem> items(2);
+  items[0].entity_id = 1;
+  items[0].kind = cosmosim::parallel::DecompositionEntityKind::kParticle;
+  items[0].work_components = cosmosim::parallel::DecompositionWorkComponents{
+      .tree_interaction_cost = 10.0,
+      .pm_mesh_cost = 1.0,
+      .generic_work_cost = 1.0,
+      .has_explicit_components = true,
+  };
+  items[1].entity_id = 2;
+  items[1].kind = cosmosim::parallel::DecompositionEntityKind::kParticle;
+  items[1].work_components = cosmosim::parallel::DecompositionWorkComponents{
+      .tree_interaction_cost = 1.0,
+      .pm_mesh_cost = 1.0,
+      .generic_work_cost = 1.0,
+      .has_explicit_components = true,
+  };
+  cosmosim::parallel::applyRuntimeDecompositionFeedback(
+      items,
+      cosmosim::parallel::DecompositionRuntimeMeasurements{
+          .tree_pair_evaluations_recent = 110,
+          .pm_mesh_cells_touched_recent = 20,
+          .tree_wall_ms_recent = 5.0,
+          .has_measurements = true,
+      },
+      cosmosim::parallel::DecompositionFeedbackCoefficients{});
+  assert(items[0].work_components.tree_interaction_cost > items[1].work_components.tree_interaction_cost);
+  assert(items[0].work_components.pm_mesh_cost > 1.0);
+  assert(items[1].work_components.generic_work_cost > 1.0);
+}
+
+void testRuntimeRebalancePlanProducesParticleAndPatchIntent() {
+  std::vector<cosmosim::parallel::DecompositionItem> items(4);
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    items[i].entity_id = 100 + i;
+    items[i].kind = (i == 3) ? cosmosim::parallel::DecompositionEntityKind::kAmrPatch
+                             : cosmosim::parallel::DecompositionEntityKind::kParticle;
+    items[i].current_owner_rank = 0;
+    items[i].x_comov = 0.1 + 0.2 * static_cast<double>(i);
+    items[i].work_components = cosmosim::parallel::DecompositionWorkComponents{
+        .particle_count_cost = (i == 3) ? 0.0 : 1.0,
+        .amr_patch_cost = (i == 3) ? 100.0 : 0.0,
+        .generic_work_cost = 1.0,
+        .has_explicit_components = true,
+    };
+  }
+  cosmosim::parallel::DecompositionConfig decomposition_config;
+  decomposition_config.world_size = 2;
+  decomposition_config.domain_x_min_comov = 0.0;
+  decomposition_config.domain_x_max_comov = 1.0;
+  decomposition_config.component_weights.generic_work = 1.0;
+  decomposition_config.component_weights.amr_patch = 1.0;
+  cosmosim::parallel::RuntimeRebalanceConfig rebalance_config;
+  rebalance_config.world_size = 2;
+  rebalance_config.imbalance_trigger_ratio = 1.0;
+  rebalance_config.memory_trigger_ratio = 10.0;
+  rebalance_config.max_migrated_load_fraction = 1.0;
+  const auto plan = cosmosim::parallel::buildRuntimeRebalancePlan(items, decomposition_config, rebalance_config);
+  assert(plan.should_rebalance);
+  assert(!plan.particle_migrations.empty() || !plan.amr_patch_ownership_updates.empty());
+}
+
+void testRuntimeRebalanceUsesCurrentOwnershipImbalance() {
+  std::vector<cosmosim::parallel::DecompositionItem> items(4);
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    items[i].entity_id = 200 + i;
+    items[i].kind = cosmosim::parallel::DecompositionEntityKind::kParticle;
+    items[i].current_owner_rank = 0;
+    items[i].x_comov = 0.1 + 0.2 * static_cast<double>(i);
+    items[i].work_components = cosmosim::parallel::DecompositionWorkComponents{
+        .particle_count_cost = 1.0,
+        .generic_work_cost = 1.0,
+        .has_explicit_components = true,
+    };
+  }
+  cosmosim::parallel::DecompositionConfig decomposition_config;
+  decomposition_config.world_size = 2;
+  decomposition_config.domain_x_min_comov = 0.0;
+  decomposition_config.domain_x_max_comov = 1.0;
+  decomposition_config.component_weights.particle_count = 1.0;
+  decomposition_config.component_weights.generic_work = 0.0;
+  cosmosim::parallel::RuntimeRebalanceConfig rebalance_config;
+  rebalance_config.world_size = 2;
+  rebalance_config.imbalance_trigger_ratio = 1.25;
+  rebalance_config.memory_trigger_ratio = 10.0;
+  rebalance_config.max_migrated_load_fraction = 1.0;
+
+  const auto current_metrics = cosmosim::parallel::computeCurrentOwnershipLoadBalanceMetrics(items, decomposition_config);
+  assert(current_metrics.weighted_imbalance_ratio > rebalance_config.imbalance_trigger_ratio);
+  const auto plan = cosmosim::parallel::buildRuntimeRebalancePlan(items, decomposition_config, rebalance_config);
+  assert(plan.should_rebalance);
+  assert(plan.current_metrics.weighted_imbalance_ratio > rebalance_config.imbalance_trigger_ratio);
+  assert(plan.target_decomposition.metrics.weighted_imbalance_ratio < plan.current_metrics.weighted_imbalance_ratio);
+  assert(!plan.particle_migrations.empty());
+}
+
+void testPmSlabHaloSerialDoesNotRequireMpiInitialization() {
+  const cosmosim::parallel::MpiContext mpi_context;
+  assert(!mpi_context.isEnabled());
+  assert(mpi_context.worldSize() == 1);
+  assert(mpi_context.worldRank() == 0);
+
+  const cosmosim::parallel::PmSlabLayout layout =
+      cosmosim::parallel::makePmSlabLayout(
+          /*global_nx=*/2U,
+          /*global_ny=*/2U,
+          /*global_nz=*/2U,
+          /*world_size=*/1,
+          /*world_rank=*/0);
+  const std::vector<double> local_field(layout.localCellCount(), 1.0);
+  const cosmosim::parallel::PmSlabHaloExchangeResult exchange =
+      cosmosim::parallel::executeBlockingPmSlabHaloExchange(
+          mpi_context,
+          layout,
+          local_field,
+          /*halo_depth_x=*/1U,
+          /*periodic_x=*/true,
+          /*exchange_sequence=*/1U);
+  assert(exchange.halo_depth_x == 0U);
+  assert(exchange.left_halo.empty());
+  assert(exchange.right_halo.empty());
+  assert(exchange.sent_bytes == 0U);
+  assert(exchange.received_bytes == 0U);
+}
+
+
+void testHardRankMemoryConstraintAndExpandedCostModel() {
+  using namespace cosmosim::parallel;
+  std::vector<DecompositionItem> items;
+  for (std::uint64_t i = 0U; i < 4U; ++i) {
+    DecompositionItem item;
+    item.entity_id = 1000U + i;
+    item.kind = DecompositionEntityKind::kParticle;
+    item.current_owner_rank = 0;
+    item.x_comov = 0.1 + 0.2 * static_cast<double>(i);
+    item.y_comov = 0.5;
+    item.z_comov = 0.5;
+    item.memory_bytes = 60U;
+    item.work_components = DecompositionWorkComponents{
+        .particle_count_cost = 1.0,
+        .memory_pressure_cost = 60.0,
+        .transient_memory_cost = 12.0,
+        .source_event_cost = (i % 2U == 0U) ? 1.0 : 0.0,
+        .communication_cost = 3.0 + static_cast<double>(i),
+        .generic_work_cost = 1.0,
+        .has_explicit_components = true,
+    };
+    items.push_back(item);
+  }
+
+  DecompositionConfig config;
+  config.world_size = 2;
+  config.max_rank_memory_bytes = 140U;
+  config.rank_transient_reserve_bytes = 20U;
+  config.component_weights.memory_pressure = 1.0 / 1024.0;
+  const DecompositionPlan plan = buildMortonSfcDecomposition(items, config);
+  assert(plan.metrics.max_memory_bytes == 120U);
+  assert(plan.metrics.max_peak_memory_bytes == 140U);
+  assert(plan.metrics.peak_memory_bytes_by_rank.size() == 2U);
+  for (const std::uint64_t peak : plan.metrics.peak_memory_bytes_by_rank) {
+    assert(peak <= config.max_rank_memory_bytes);
+  }
+  double source_events = 0.0;
+  double communication = 0.0;
+  double transient = 0.0;
+  for (std::size_t rank = 0; rank < 2U; ++rank) {
+    source_events += plan.metrics.source_event_cost_by_rank[rank];
+    communication += plan.metrics.communication_cost_by_rank[rank];
+    transient += plan.metrics.transient_memory_cost_by_rank[rank];
+  }
+  assert(source_events == 2.0);
+  assert(communication == 18.0);
+  assert(transient == 48.0);
+
+  RuntimeRebalanceConfig rebalance_config;
+  rebalance_config.world_size = 2;
+  rebalance_config.imbalance_trigger_ratio = 10.0;
+  rebalance_config.memory_trigger_ratio = 10.0;
+  rebalance_config.max_migrated_load_fraction = 0.01;
+  const RuntimeRebalancePlan rebalance = buildRuntimeRebalancePlan(
+      items, config, rebalance_config);
+  assert(rebalance.current_metrics.max_peak_memory_bytes == 260U);
+  assert(rebalance.should_rebalance);
+  assert(rebalance.reason == "rank_memory_limit");
+  assert(rebalance.target_decomposition.metrics.max_peak_memory_bytes <= 140U);
+
+  std::vector<DecompositionItem> impossible = items;
+  impossible.resize(3U);
+  for (DecompositionItem& item : impossible) {
+    item.memory_bytes = 80U;
+    item.work_components.memory_pressure_cost = 80.0;
+  }
+  DecompositionConfig impossible_config = config;
+  impossible_config.max_rank_memory_bytes = 120U;
+  impossible_config.rank_transient_reserve_bytes = 20U;
+  bool rejected = false;
+  try {
+    (void)buildMortonSfcDecomposition(impossible, impossible_config);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+}
+
+void testMemoryFeasibilityPrecedesWorkBalancing() {
+  using namespace cosmosim::parallel;
+  std::vector<DecompositionItem> items(4);
+  for (std::size_t i = 0U; i < items.size(); ++i) {
+    auto& item = items[i];
+    item.entity_id = 700U + i;
+    item.kind = DecompositionEntityKind::kParticle;
+    item.current_owner_rank = 0;
+    item.x_comov = 0.1 + 0.2 * static_cast<double>(i);
+    item.memory_bytes = 4U;
+    item.work_units = i == 0U ? 100.0 : 1.0;
+  }
+  DecompositionConfig config;
+  config.world_size = 2;
+  config.owned_particle_weight = 0.0;
+  config.work_weight = 1.0;
+  config.max_rank_memory_bytes = 8U;
+  const auto plan = buildMortonSfcDecomposition(items, config);
+  assert(plan.metrics.memory_bytes_by_rank == std::vector<std::uint64_t>({8U, 8U}));
+  assert(plan.ranges_by_rank[0].end_sorted == 2U);
+  RuntimeRebalanceConfig rebalance_config;
+  rebalance_config.world_size = 2;
+  rebalance_config.imbalance_trigger_ratio = 1000.0;
+  rebalance_config.memory_trigger_ratio = 1000.0;
+  rebalance_config.max_migrated_load_fraction = 0.01;
+  const auto rebalance = buildRuntimeRebalancePlan(items, config, rebalance_config);
+  assert(rebalance.should_rebalance);
+  assert(rebalance.reason == "rank_memory_limit");
+  assert(rebalance.target_decomposition.metrics.max_peak_memory_bytes == 8U);
+
+  // The same exact-capacity case must remain feasible with a transient reserve.
+  config.max_rank_memory_bytes = 12U;
+  config.rank_transient_reserve_bytes = 4U;
+  assert(buildMortonSfcDecomposition(items, config).metrics.max_peak_memory_bytes == 12U);
+  // Empty ranks and zero-byte groups may not manufacture an infeasible suffix.
+  config.world_size = 4;
+  config.max_rank_memory_bytes = 8U;
+  config.rank_transient_reserve_bytes = 0U;
+  items.resize(2U);
+  const auto sparse = buildMortonSfcDecomposition(items, config);
+  assert(sparse.ranges_by_rank.size() == 4U);
+  assert(sparse.metrics.max_peak_memory_bytes <= 8U);
+  items[0].memory_bytes = 0U;
+  items[1].memory_bytes = 0U;
+  assert(buildMortonSfcDecomposition(items, config).metrics.max_peak_memory_bytes == 0U);
+
+  // A single indivisible group above the cap and an impossible total fail.
+  items[0].memory_bytes = 9U;
+  bool rejected = false;
+  try { (void)buildMortonSfcDecomposition(items, config); }
+  catch (const std::runtime_error&) { rejected = true; }
+  assert(rejected);
+  items[0].memory_bytes = 4U;
+  items[1].memory_bytes = 4U;
+  config.world_size = 1;
+  config.max_rank_memory_bytes = 7U;
+  rejected = false;
+  try { (void)buildMortonSfcDecomposition(items, config); }
+  catch (const std::runtime_error&) { rejected = true; }
+  assert(rejected);
+
+  // Equal SFC point/ID records are indivisible in the distributed cut protocol.
+  config.world_size = 2;
+  config.max_rank_memory_bytes = 6U;
+  items[1].entity_id = items[0].entity_id;
+  items[1].x_comov = items[0].x_comov;
+  rejected = false;
+  try { (void)buildMortonSfcDecomposition(items, config); }
+  catch (const std::runtime_error&) { rejected = true; }
+  assert(rejected);
+}
+
+void testAuthoritativeTopDomainLeavesPreserveOwnedGeometry() {
+  std::vector<cosmosim::parallel::DecompositionItem> items;
+  for (std::uint64_t i = 0; i < 6U; ++i) {
+    cosmosim::parallel::DecompositionItem item;
+    item.entity_id = 100U + i;
+    item.current_owner_rank = 1;
+    item.x_comov = 0.10 + 0.10 * static_cast<double>(i);
+    item.y_comov = 0.20 + 0.02 * static_cast<double>(i);
+    item.z_comov = 0.30;
+    item.has_spatial_bounds = true;
+    item.min_x_comov = item.x_comov - 0.01;
+    item.max_x_comov = item.x_comov + 0.01;
+    item.min_y_comov = item.y_comov - 0.02;
+    item.max_y_comov = item.y_comov + 0.02;
+    item.min_z_comov = 0.25;
+    item.max_z_comov = 0.35;
+    item.work_units = 2.0 + static_cast<double>(i);
+    item.kind = i % 2U == 0U
+        ? cosmosim::parallel::DecompositionEntityKind::kParticle
+        : cosmosim::parallel::DecompositionEntityKind::kAmrPatch;
+    items.push_back(item);
+  }
+  cosmosim::parallel::DecompositionConfig config;
+  config.world_size = 3;
+  config.work_weight = 1.0;
+  const auto leaves = cosmosim::parallel::buildAuthoritativeTopDomainLeaves(
+      items, config, /*owner_rank=*/1, /*decomposition_epoch=*/42U,
+      /*max_leaves_per_rank=*/3U);
+  assert(!leaves.empty());
+  assert(leaves.size() <= 3U);
+  std::uint64_t entity_count = 0U;
+  double total_work = 0.0;
+  for (const auto& leaf : leaves) {
+    assert(leaf.owner_rank == 1);
+    assert(leaf.decomposition_epoch == 42U);
+    assert(leaf.domain_leaf_id != 0U);
+    assert(leaf.min_x_comov <= leaf.max_x_comov);
+    assert(leaf.min_y_comov <= leaf.max_y_comov);
+    assert(leaf.min_z_comov <= leaf.max_z_comov);
+    assert(leaf.periodic_geometry);
+    entity_count += leaf.entity_count;
+    total_work += leaf.work_weight;
+  }
+  assert(entity_count == items.size());
+  assert(total_work > 0.0);
+  const auto fingerprint = cosmosim::parallel::topDomainGeometryFingerprint(leaves);
+  assert(fingerprint != 0U);
+
+  auto changed = leaves;
+  changed.front().max_x_comov += 0.05;
+  assert(cosmosim::parallel::topDomainGeometryFingerprint(changed) != fingerprint);
+}
+
+void testAuthoritativeTopDomainPeriodicSeamBoundsStayCompact() {
+  cosmosim::parallel::DecompositionConfig config;
+  config.world_size = 1;
+  config.domain_x_min_comov = 0.0;
+  config.domain_x_max_comov = 1.0;
+  config.domain_y_min_comov = 0.0;
+  config.domain_y_max_comov = 1.0;
+  config.domain_z_min_comov = 0.0;
+  config.domain_z_max_comov = 1.0;
+
+  std::vector<cosmosim::parallel::DecompositionItem> items;
+  for (std::size_t i = 0; i < 4U; ++i) {
+    cosmosim::parallel::DecompositionItem item;
+    item.entity_id = 10U + i;
+    item.current_owner_rank = 0;
+    item.x_comov = i < 2U ? 0.995 + 0.001 * static_cast<double>(i)
+                          : 0.002 + 0.001 * static_cast<double>(i - 2U);
+    item.y_comov = 0.40 + 0.01 * static_cast<double>(i);
+    item.z_comov = 0.60 + 0.01 * static_cast<double>(i);
+    items.push_back(item);
+  }
+
+  const auto leaves = cosmosim::parallel::buildAuthoritativeTopDomainLeaves(
+      items, config, 0, 9U, 1U);
+  assert(leaves.size() == 1U);
+  const auto& leaf = leaves.front();
+  assert(leaf.periodic_geometry);
+  assert(leaf.max_x_comov - leaf.min_x_comov < 0.02);
+  assert(leaf.min_x_comov < leaf.max_x_comov);
+
+  std::vector<cosmosim::parallel::TopDomainLeaf> seeds{leaf};
+  const std::vector<double> x{0.997, 0.001, 0.004};
+  const std::vector<double> y{0.2, 0.2, 0.2};
+  const std::vector<double> z{0.3, 0.3, 0.3};
+  const auto refreshed = cosmosim::parallel::refitAuthoritativeTopDomainLeaves(
+      seeds, x, y, z, config, 0, 9U, nullptr);
+  assert(refreshed.size() == 1U);
+  assert(refreshed.front().max_x_comov - refreshed.front().min_x_comov < 0.02);
+  assert(refreshed.front().domain_leaf_id == leaf.domain_leaf_id);
+}
+
+void testTopDomainRefitPreservesTiedIntervals() {
+  cosmosim::parallel::DecompositionConfig config;
+  config.world_size = 1;
+  std::vector<cosmosim::parallel::TopDomainLeaf> seeds(2);
+  for (std::size_t i = 0; i < seeds.size(); ++i) {
+    seeds[i].domain_leaf_id = 100U + static_cast<std::uint64_t>(i);
+    seeds[i].owner_rank = 0;
+    seeds[i].decomposition_epoch = 7U;
+    seeds[i].sfc_key_begin = 0U;
+    seeds[i].sfc_key_end = std::numeric_limits<std::uint64_t>::max();
+    seeds[i].periodic_geometry = true;
+  }
+  const std::vector<double> x{0.10, 0.20, 0.30, 0.40};
+  const std::vector<double> y{0.11, 0.21, 0.31, 0.41};
+  const std::vector<double> z{0.12, 0.22, 0.32, 0.42};
+  cosmosim::parallel::TopDomainGeometryRefitDiagnostics diagnostics;
+  const auto refreshed = cosmosim::parallel::refitAuthoritativeTopDomainLeaves(
+      seeds, x, y, z, config, 0, 7U, &diagnostics);
+  assert(refreshed.size() == 2U);
+  assert(diagnostics.empty_seed_leaf_count == 0U);
+  assert(refreshed[0].domain_leaf_id == seeds[0].domain_leaf_id);
+  assert(refreshed[1].domain_leaf_id == seeds[1].domain_leaf_id);
+  assert(refreshed[0].entity_count > 0U);
+  assert(refreshed[1].entity_count > 0U);
+  assert(refreshed[0].entity_count + refreshed[1].entity_count == x.size());
+  const auto repeated = cosmosim::parallel::refitAuthoritativeTopDomainLeaves(
+      seeds, x, y, z, config, 0, 7U, nullptr);
+  assert(repeated.size() == refreshed.size());
+  for (std::size_t i = 0; i < refreshed.size(); ++i) {
+    assert(repeated[i].domain_leaf_id == refreshed[i].domain_leaf_id);
+    assert(repeated[i].entity_count == refreshed[i].entity_count);
+    assert(repeated[i].min_x_comov == refreshed[i].min_x_comov);
+    assert(repeated[i].max_x_comov == refreshed[i].max_x_comov);
+  }
+}
+
+bool nearMetric(double measured, double reference) {
+  const double scale = std::max({1.0, std::abs(measured), std::abs(reference)});
+  return std::abs(measured - reference) <= 1e-9 * scale;
+}
+
+void assertPlansEquivalent(
+    const cosmosim::parallel::DecompositionPlan& reference,
+    const cosmosim::parallel::DecompositionPlan& candidate) {
+  assert(reference.owning_rank_by_item == candidate.owning_rank_by_item);
+  assert(reference.sorted_indices == candidate.sorted_indices);
+  assert(reference.ranges_by_rank.size() == candidate.ranges_by_rank.size());
+  for (std::size_t rank = 0; rank < reference.ranges_by_rank.size(); ++rank) {
+    assert(reference.ranges_by_rank[rank].begin_sorted == candidate.ranges_by_rank[rank].begin_sorted);
+    assert(reference.ranges_by_rank[rank].end_sorted == candidate.ranges_by_rank[rank].end_sorted);
+  }
+  const auto& rm = reference.metrics;
+  const auto& cm = candidate.metrics;
+  assert(rm.memory_bytes_by_rank == cm.memory_bytes_by_rank);
+  assert(rm.owned_particles_by_rank == cm.owned_particles_by_rank);
+  assert(rm.active_targets_by_rank == cm.active_targets_by_rank);
+  assert(rm.remote_tree_interactions_by_rank == cm.remote_tree_interactions_by_rank);
+  assert(rm.peak_memory_bytes_by_rank == cm.peak_memory_bytes_by_rank);
+  assert(rm.total_memory_bytes == cm.total_memory_bytes);
+  assert(rm.max_memory_bytes == cm.max_memory_bytes);
+  assert(rm.max_peak_memory_bytes == cm.max_peak_memory_bytes);
+  assert(rm.weighted_load_by_rank.size() == cm.weighted_load_by_rank.size());
+  for (std::size_t rank = 0; rank < rm.weighted_load_by_rank.size(); ++rank) {
+    assert(nearMetric(rm.weighted_load_by_rank[rank], cm.weighted_load_by_rank[rank]));
+  }
+  assert(nearMetric(rm.mean_weighted_load, cm.mean_weighted_load));
+  assert(nearMetric(rm.max_weighted_load, cm.max_weighted_load));
+  assert(nearMetric(rm.weighted_imbalance_ratio, cm.weighted_imbalance_ratio));
+  assert(nearMetric(rm.memory_imbalance_ratio, cm.memory_imbalance_ratio));
+  assert(nearMetric(rm.peak_memory_imbalance_ratio, cm.peak_memory_imbalance_ratio));
+  const auto assert_lane = [](const std::vector<double>& a, const std::vector<double>& b) {
+    assert(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      assert(nearMetric(a[i], b[i]));
+    }
+  };
+  assert_lane(rm.particle_count_cost_by_rank, cm.particle_count_cost_by_rank);
+  assert_lane(rm.gas_cell_cost_by_rank, cm.gas_cell_cost_by_rank);
+  assert_lane(rm.tree_interaction_cost_by_rank, cm.tree_interaction_cost_by_rank);
+  assert_lane(rm.pm_mesh_cost_by_rank, cm.pm_mesh_cost_by_rank);
+  assert_lane(rm.amr_patch_cost_by_rank, cm.amr_patch_cost_by_rank);
+  assert_lane(rm.active_fraction_cost_by_rank, cm.active_fraction_cost_by_rank);
+  assert_lane(rm.memory_pressure_cost_by_rank, cm.memory_pressure_cost_by_rank);
+  assert_lane(rm.transient_memory_cost_by_rank, cm.transient_memory_cost_by_rank);
+  assert_lane(rm.source_event_cost_by_rank, cm.source_event_cost_by_rank);
+  assert_lane(rm.communication_cost_by_rank, cm.communication_cost_by_rank);
+  assert_lane(rm.gpu_occupancy_cost_by_rank, cm.gpu_occupancy_cost_by_rank);
+  assert_lane(rm.generic_work_cost_by_rank, cm.generic_work_cost_by_rank);
+}
+
+// All fixtures publish explicit nonnegative components so the test-side
+// component span equals the rich adapter's effective components without
+// duplicating default-component synthesis.
+std::vector<cosmosim::parallel::DecompositionWorkComponents> extractComponents(
+    const std::vector<cosmosim::parallel::DecompositionItem>& items) {
+  std::vector<cosmosim::parallel::DecompositionWorkComponents> components;
+  components.reserve(items.size());
+  for (const cosmosim::parallel::DecompositionItem& item : items) {
+    components.push_back(item.work_components);
+  }
+  return components;
+}
+
+std::vector<cosmosim::parallel::DecompositionItem> makePlannerFixtureItems(
+    std::string_view shape, std::size_t count, int world_size) {
+  using cosmosim::parallel::DecompositionEntityKind;
+  std::vector<cosmosim::parallel::DecompositionItem> items(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    cosmosim::parallel::DecompositionItem& item = items[i];
+    item.entity_id = 1000U + static_cast<std::uint64_t>(i);
+    item.kind = (i % 3U == 2U) ? DecompositionEntityKind::kAmrPatch : DecompositionEntityKind::kParticle;
+    item.current_owner_rank = static_cast<int>(i % static_cast<std::size_t>(world_size));
+    if (shape == "uniform") {
+      item.x_comov = std::fmod(static_cast<double>(i) * 0.61803398875, 1.0);
+      item.y_comov = std::fmod(static_cast<double>(i) * 0.7548776662, 1.0);
+      item.z_comov = std::fmod(static_cast<double>(i) * 0.5698402906, 1.0);
+    } else if (shape == "clustered") {
+      item.x_comov = 0.25 + static_cast<double>(i % 8U) * 1e-4;
+      item.y_comov = 0.50 + static_cast<double>(i % 5U) * 1e-4;
+      item.z_comov = 0.75 + static_cast<double>(i % 3U) * 1e-4;
+    } else if (shape == "duplicate") {
+      item.x_comov = 0.5;
+      item.y_comov = 0.5;
+      item.z_comov = 0.5;
+    } else {
+      assert(shape == "periodic");
+      item.x_comov = (i % 2U == 0U) ? -0.05 : 1.05;
+      item.y_comov = 0.30;
+      item.z_comov = 0.70;
+    }
+    item.has_spatial_bounds = true;
+    item.min_x_comov = item.max_x_comov = item.x_comov;
+    item.min_y_comov = item.max_y_comov = item.y_comov;
+    item.min_z_comov = item.max_z_comov = item.z_comov;
+    item.active_target_count_recent = static_cast<std::uint64_t>(i % 5U);
+    item.remote_tree_interactions_recent = static_cast<std::uint64_t>((i * 7U) % 11U);
+    item.work_units = 1.0 + static_cast<double>(i % 4U);
+    item.memory_bytes = 64U + static_cast<std::uint64_t>(i) * 16U;
+    item.work_components = cosmosim::parallel::DecompositionWorkComponents{
+        .particle_count_cost = 1.0,
+        .gas_cell_cost = (i % 4U == 0U) ? 2.5 : 0.0,
+        .tree_interaction_cost = static_cast<double>((i * 3U) % 7U),
+        .pm_mesh_cost = static_cast<double>(i % 6U),
+        .amr_patch_cost = (item.kind == DecompositionEntityKind::kAmrPatch)
+            ? static_cast<double>(16U + i)
+            : 0.0,
+        .active_fraction_cost = static_cast<double>(item.active_target_count_recent),
+        .memory_pressure_cost = static_cast<double>(item.memory_bytes),
+        .transient_memory_cost = (i % 4U == 0U) ? 4096.0 : 0.0,
+        .source_event_cost = (i % 9U == 0U) ? 1.0 : 0.0,
+        .communication_cost = static_cast<double>(item.remote_tree_interactions_recent),
+        .gpu_occupancy_cost = 0.0,
+        .generic_work_cost = 1.0 + std::sqrt(static_cast<double>(1U + (i % 16U))),
+        .has_explicit_components = true,
+    };
+  }
+  return items;
+}
+
+cosmosim::parallel::DecompositionConfig makePlannerFixtureConfig(
+    int world_size, bool legacy_weights, bool prefer_components) {
+  cosmosim::parallel::DecompositionConfig config;
+  config.world_size = world_size;
+  config.domain_x_min_comov = 0.0;
+  config.domain_x_max_comov = 1.0;
+  config.domain_y_min_comov = 0.0;
+  config.domain_y_max_comov = 1.0;
+  config.domain_z_min_comov = 0.0;
+  config.domain_z_max_comov = 1.0;
+  config.owned_particle_weight = legacy_weights ? 1.0 : 0.0;
+  config.active_target_weight = legacy_weights ? 0.5 : 0.0;
+  config.remote_tree_interaction_weight = legacy_weights ? 0.25 : 0.0;
+  config.work_weight = legacy_weights ? 0.1 : 0.0;
+  config.memory_weight = legacy_weights ? 1.0 / 256.0 : 0.0;
+  config.prefer_component_work_model = prefer_components;
+  return config;
+}
+
+void testRichAndCompactPlannerEquivalence() {
+  using cosmosim::parallel::buildMortonSfcDecomposition;
+  using cosmosim::parallel::buildMortonSfcDecompositionFromCompact;
+  using cosmosim::parallel::DecompositionConfig;
+  using cosmosim::parallel::DecompositionItem;
+  using cosmosim::parallel::DecompositionPlan;
+  using cosmosim::parallel::DecompositionWorkComponents;
+  using cosmosim::parallel::makeCompactRuntimeDecompositionRecords;
+
+  const std::array<std::string_view, 4> shapes{"uniform", "clustered", "duplicate", "periodic"};
+  for (const bool legacy_weights : {false, true}) {
+    for (const bool prefer_components : {true, false}) {
+      for (const int world_size : {2, 3, 4}) {
+        for (const std::string_view shape : shapes) {
+          for (const std::size_t count : {std::size_t{0}, std::size_t{1}, std::size_t{17}, std::size_t{64}}) {
+            const DecompositionConfig config = makePlannerFixtureConfig(world_size, legacy_weights, prefer_components);
+            const std::vector<DecompositionItem> items = makePlannerFixtureItems(shape, count, world_size);
+
+            const DecompositionPlan rich = buildMortonSfcDecomposition(items, config);
+            auto records = makeCompactRuntimeDecompositionRecords(items, config);
+            const std::vector<DecompositionWorkComponents> components = extractComponents(items);
+            const DecompositionPlan compact =
+                buildMortonSfcDecompositionFromCompact(records, config, components);
+
+            assertPlansEquivalent(rich, compact);
+
+            const DecompositionPlan rich_repeat = buildMortonSfcDecomposition(items, config);
+            assert(rich_repeat.owning_rank_by_item == rich.owning_rank_by_item);
+            assert(rich_repeat.sorted_indices == rich.sorted_indices);
+
+            auto records_repeat = makeCompactRuntimeDecompositionRecords(items, config);
+            const DecompositionPlan compact_repeat =
+                buildMortonSfcDecompositionFromCompact(records_repeat, config, components);
+            assert(compact_repeat.owning_rank_by_item == compact.owning_rank_by_item);
+          }
+        }
+      }
+    }
+  }
+
+  {
+    DecompositionConfig config = makePlannerFixtureConfig(3, false, true);
+    const std::vector<DecompositionItem> items =
+        makePlannerFixtureItems("uniform", 32, 3);
+    std::uint64_t required = 0;
+    for (const DecompositionItem& item : items) {
+      required += item.memory_bytes;
+    }
+    config.max_rank_memory_bytes = required / 3U + 1024U;
+    config.rank_transient_reserve_bytes = 0U;
+    const DecompositionPlan rich = buildMortonSfcDecomposition(items, config);
+    auto records = makeCompactRuntimeDecompositionRecords(items, config);
+    const std::vector<DecompositionWorkComponents> components = extractComponents(items);
+    const DecompositionPlan compact =
+        buildMortonSfcDecompositionFromCompact(records, config, components);
+    assertPlansEquivalent(rich, compact);
+  }
+
+  {
+    DecompositionConfig config = makePlannerFixtureConfig(2, false, true);
+    const std::vector<DecompositionItem> items = makePlannerFixtureItems("uniform", 16, 2);
+    config.max_rank_memory_bytes = 1024U;
+    config.rank_transient_reserve_bytes = 1024U;
+    bool rich_threw = false;
+    bool compact_threw = false;
+    std::string rich_message;
+    std::string compact_message;
+    try {
+      (void)buildMortonSfcDecomposition(items, config);
+    } catch (const std::invalid_argument& e) {
+      rich_threw = true;
+      rich_message = e.what();
+    }
+    try {
+      auto records = makeCompactRuntimeDecompositionRecords(items, config);
+      (void)buildMortonSfcDecompositionFromCompact(records, config, extractComponents(items));
+    } catch (const std::invalid_argument& e) {
+      compact_threw = true;
+      compact_message = e.what();
+    }
+    assert(rich_threw && compact_threw);
+    assert(rich_message == compact_message);
+  }
+
+  {
+    DecompositionConfig config = makePlannerFixtureConfig(1, false, true);
+    std::vector<DecompositionItem> items = makePlannerFixtureItems("uniform", 3, 1);
+    for (DecompositionItem& item : items) {
+      item.memory_bytes = 1000U;
+    }
+    config.max_rank_memory_bytes = 1500U;
+    config.rank_transient_reserve_bytes = 0U;
+    bool rich_threw = false;
+    bool compact_threw = false;
+    std::string rich_message;
+    std::string compact_message;
+    try {
+      (void)buildMortonSfcDecomposition(items, config);
+    } catch (const std::runtime_error& e) {
+      rich_threw = true;
+      rich_message = e.what();
+    }
+    try {
+      auto records = makeCompactRuntimeDecompositionRecords(items, config);
+      (void)buildMortonSfcDecompositionFromCompact(records, config, extractComponents(items));
+    } catch (const std::runtime_error& e) {
+      compact_threw = true;
+      compact_message = e.what();
+    }
+    assert(rich_threw && compact_threw);
+    assert(rich_message == compact_message);
+  }
+}
+
+void testCompactPlannerContractValidation() {
+  using cosmosim::parallel::buildMortonSfcDecompositionFromCompact;
+  using cosmosim::parallel::DecompositionConfig;
+  using cosmosim::parallel::DecompositionItem;
+  using cosmosim::parallel::DecompositionWorkComponents;
+  using cosmosim::parallel::makeCompactRuntimeDecompositionRecords;
+  using cosmosim::parallel::CompactRuntimeDecompositionRecord;
+
+  const DecompositionConfig config = makePlannerFixtureConfig(2, false, true);
+  const std::vector<DecompositionItem> items = makePlannerFixtureItems("uniform", 4, 2);
+  const std::vector<DecompositionWorkComponents> components = extractComponents(items);
+
+  {
+    auto records = makeCompactRuntimeDecompositionRecords(items, config);
+    std::vector<DecompositionWorkComponents> short_span(components.begin(), components.begin() + 2);
+    bool threw = false;
+    try {
+      (void)buildMortonSfcDecompositionFromCompact(records, config, short_span);
+    } catch (const std::invalid_argument& e) {
+      threw = std::string_view(e.what()) ==
+              "decomposition component span does not cover compact records";
+    }
+    assert(threw);
+  }
+
+  {
+    auto records = makeCompactRuntimeDecompositionRecords(items, config);
+    records[0].local_index = records.size();
+    bool threw = false;
+    try {
+      (void)buildMortonSfcDecompositionFromCompact(records, config, components);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    assert(threw);
+  }
+
+  {
+    auto records = makeCompactRuntimeDecompositionRecords(items, config);
+    records[0].weighted_load = std::numeric_limits<double>::quiet_NaN();
+    bool threw = false;
+    try {
+      (void)buildMortonSfcDecompositionFromCompact(records, config, components);
+    } catch (const std::invalid_argument& e) {
+      threw = std::string_view(e.what()) == "decomposition item weighted load must be finite";
+    }
+    assert(threw);
+  }
+}
+
+// P5 qualification: the compact planner's dense-index contract must reject
+// every population that is not a permutation of [0, record count): duplicates,
+// holes (which by pigeonhole imply a duplicate when every value is in range),
+// and out-of-range values all fail closed before ownership is consumed.
+void testCompactPlannerDenseIndexContract() {
+  using cosmosim::parallel::buildMortonSfcDecompositionFromCompact;
+  using cosmosim::parallel::DecompositionConfig;
+  using cosmosim::parallel::DecompositionItem;
+  using cosmosim::parallel::DecompositionWorkComponents;
+  using cosmosim::parallel::makeCompactRuntimeDecompositionRecords;
+
+  const DecompositionConfig config = makePlannerFixtureConfig(2, false, true);
+  const std::vector<DecompositionItem> items = makePlannerFixtureItems("uniform", 4, 2);
+  const std::vector<DecompositionWorkComponents> components = extractComponents(items);
+  constexpr std::size_t k_record_count = 4U;
+
+  std::size_t permutation_plans = 0U;
+  std::size_t rejected_populations = 0U;
+  for (std::size_t code = 0U; code < 256U; ++code) {
+    auto records = makeCompactRuntimeDecompositionRecords(items, config);
+    assert(records.size() == k_record_count);
+    std::size_t value = code;
+    for (std::size_t i = 0U; i < records.size(); ++i) {
+      records[i].local_index = value % k_record_count;
+      value /= k_record_count;
+    }
+    std::vector<std::size_t> sorted_indices(records.size(), 0U);
+    for (std::size_t i = 0U; i < records.size(); ++i) {
+      sorted_indices[i] = records[i].local_index;
+    }
+    std::sort(sorted_indices.begin(), sorted_indices.end());
+    const bool is_permutation = std::adjacent_find(sorted_indices.begin(), sorted_indices.end()) ==
+            sorted_indices.end() &&
+        sorted_indices.back() == k_record_count - 1U;
+    bool succeeded = false;
+    try {
+      const auto plan =
+          buildMortonSfcDecompositionFromCompact(records, config, components);
+      succeeded = true;
+      assert(plan.owning_rank_by_item.size() == k_record_count);
+      for (const int owner : plan.owning_rank_by_item) {
+        // The -1 sentinel must never survive a successful plan.
+        assert(owner >= 0);
+        assert(owner < config.world_size);
+      }
+    } catch (const std::invalid_argument&) {
+      succeeded = false;
+    }
+    if (is_permutation) {
+      assert(succeeded);
+      ++permutation_plans;
+    } else {
+      assert(!succeeded);
+      ++rejected_populations;
+    }
+  }
+  assert(permutation_plans == 24U);
+  assert(rejected_populations == 256U - 24U);
+
+  // Message identity for the two guard classes.
+  {
+    auto records = makeCompactRuntimeDecompositionRecords(items, config);
+    records[3].local_index = records[0].local_index;
+    bool matched = false;
+    try {
+      (void)buildMortonSfcDecompositionFromCompact(records, config, components);
+    } catch (const std::invalid_argument& e) {
+      matched = std::string_view(e.what()) ==
+          "compact decomposition local_index must be unique within the record population";
+    }
+    assert(matched);
+  }
+  {
+    auto records = makeCompactRuntimeDecompositionRecords(items, config);
+    records[0].local_index = k_record_count;
+    bool matched = false;
+    try {
+      (void)buildMortonSfcDecompositionFromCompact(records, config, components);
+    } catch (const std::invalid_argument& e) {
+      matched = std::string_view(e.what()) ==
+          "compact decomposition record local_index must be dense within [0, record count)";
+    }
+    assert(matched);
+  }
+}
+
+// P5 qualification: the startup planner's transient live-set estimate models
+// the documented planner layout term-for-term, fails closed on impossible
+// populations, and is the byte count admitted through the single
+// MemoryGovernor under the production owner tag.
+void testCompactStartupPlannerTransientAdmission() {
+  using cosmosim::parallel::CompactRuntimeDecompositionRecord;
+  using cosmosim::parallel::CompactStartupPlannerMemoryEstimate;
+  using cosmosim::parallel::estimateCompactStartupPlannerTransientBytes;
+
+  const std::size_t entity_upper_bound = 42U;
+  const std::size_t patch_count = 6U;
+  const std::size_t cell_count = 42U;
+  const std::size_t world_size = 4U;
+  const std::size_t pm_x_bins = 16U;
+  const std::size_t density_grid_cell_count = 32U * 32U * 32U;
+
+  const CompactStartupPlannerMemoryEstimate estimate =
+      estimateCompactStartupPlannerTransientBytes(
+          entity_upper_bound, patch_count, cell_count, world_size, pm_x_bins,
+          density_grid_cell_count);
+
+  assert(estimate.compact_record_bytes ==
+         entity_upper_bound * sizeof(CompactRuntimeDecompositionRecord));
+  assert(estimate.memory_group_bytes ==
+         entity_upper_bound *
+             (sizeof(std::size_t) * 2U + sizeof(std::uint64_t) + sizeof(double)));
+  assert(estimate.owning_rank_bytes == entity_upper_bound * sizeof(int));
+  assert(estimate.sorted_index_bytes == entity_upper_bound * sizeof(std::size_t));
+  assert(estimate.occupancy_bytes ==
+         (density_grid_cell_count * 3U + pm_x_bins) * sizeof(std::uint32_t));
+  assert(estimate.patch_mapping_bytes ==
+         patch_count * sizeof(std::uint32_t) * 2U);
+  const std::size_t rank_metric_lane =
+      sizeof(double) * 14U + sizeof(std::uint64_t) * 5U +
+      sizeof(std::size_t) * 2U;
+  const std::size_t expected_other_scratch =
+      world_size * rank_metric_lane +
+      (world_size + 1U) * sizeof(std::size_t) +
+      cell_count * sizeof(std::uint32_t) +
+      patch_count * sizeof(std::uint32_t);
+  assert(estimate.other_known_scratch_bytes == expected_other_scratch);
+  assert(estimate.total_bytes ==
+         estimate.compact_record_bytes + estimate.memory_group_bytes +
+             estimate.owning_rank_bytes + estimate.sorted_index_bytes +
+             estimate.occupancy_bytes + estimate.patch_mapping_bytes +
+             estimate.other_known_scratch_bytes);
+  assert(estimate.total_bytes > 0U);
+
+  // Checked arithmetic: impossible populations fail closed instead of
+  // wrapping into an undersized admission.
+  bool overflowed = false;
+  try {
+    (void)estimateCompactStartupPlannerTransientBytes(
+        std::numeric_limits<std::size_t>::max(), 0U, 0U, 1U, 0U, 0U);
+  } catch (const std::overflow_error&) {
+    overflowed = true;
+  }
+  assert(overflowed);
+
+  // Startup memory-rejection behavior at the governor seam: the modeled
+  // transient live set is admitted under the production owner tag, and a
+  // budget below it rejects with that owner pinned to the refusal.
+  constexpr std::string_view k_owner = "parallel.decomposition.startup_planner";
+  cosmosim::core::MemoryGovernor rejecting(
+      cosmosim::core::MemoryGovernorPolicy{
+          .hard_limit_bytes = estimate.total_bytes - 1U});
+  bool rejected = false;
+  try {
+    auto reservation = rejecting.reserve(
+        cosmosim::core::MemoryClass::kPhaseResident, estimate.total_bytes,
+        k_owner);
+    reservation.commit();
+  } catch (const std::runtime_error& ex) {
+    const std::string_view message(ex.what());
+    rejected = message.find("memory reservation rejected") != std::string_view::npos &&
+        message.find("owner=parallel.decomposition.startup_planner") !=
+            std::string_view::npos &&
+        message.find("hard_limit_bytes=") != std::string_view::npos;
+  }
+  assert(rejected);
+
+  cosmosim::core::MemoryGovernor accepting(
+      cosmosim::core::MemoryGovernorPolicy{
+          .hard_limit_bytes = estimate.total_bytes + 1024U * 1024U});
+  auto admitted = accepting.reserve(
+      cosmosim::core::MemoryClass::kPhaseResident, estimate.total_bytes,
+      k_owner);
+  admitted.commit();
+  assert(admitted.committed());
+  assert(accepting.snapshot().accounted_bytes >= estimate.total_bytes);
+}
+
+void testExplicitComponentWeightedLoadAuthority() {
+  using cosmosim::parallel::DecompositionConfig;
+  using cosmosim::parallel::DecompositionItem;
+  using cosmosim::parallel::makeCompactRuntimeDecompositionRecords;
+  using cosmosim::parallel::weightedLoadFromExplicitComponents;
+
+  for (const bool prefer_components : {true, false}) {
+    const DecompositionConfig config = makePlannerFixtureConfig(3, false, prefer_components);
+    const std::vector<DecompositionItem> items = makePlannerFixtureItems("uniform", 12, 3);
+    const auto records = makeCompactRuntimeDecompositionRecords(items, config);
+    assert(records.size() == items.size());
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      const DecompositionItem& item = items[i];
+      const double helper = weightedLoadFromExplicitComponents(
+          item.work_components, item.kind, item.active_target_count_recent,
+          item.remote_tree_interactions_recent, item.work_units, item.memory_bytes, config);
+      assert(nearMetric(helper, records[i].weighted_load));
+    }
+  }
+}
+
+void testEmptyCompactDmoRuntimeDecompositionSourceView() {
+  using cosmosim::workflows::internal::RuntimeDecompositionSourceStorage;
+
+  constexpr std::uint32_t k_local_rank = 7U;
+  cosmosim::core::SimulationState dmo;
+  assert(dmo.particles.size() == 0U);
+  assert(dmo.compactHomogeneousDmoMetadata(k_local_rank));
+  assert(dmo.hasHomogeneousDmoMetadata());
+  assert(dmo.particle_sidecar.species_tag.empty());
+  assert(dmo.particle_sidecar.owning_rank.empty());
+
+  bool particle_row_rejected = false;
+  try {
+    (void)dmo.particleSpeciesTag(0U);
+  } catch (const std::out_of_range&) {
+    particle_row_rejected = true;
+  }
+  assert(particle_row_rejected);
+
+  const RuntimeDecompositionSourceStorage storage(
+      dmo, static_cast<int>(k_local_rank), {});
+  const auto view = storage.view();
+  assert(view.particle_count == 0U);
+  assert(view.localEntityCount() == 0U);
+  assert(view.particle_metadata_uniform);
+  assert(view.uniform_particle_species_tag ==
+         static_cast<std::uint32_t>(cosmosim::core::ParticleSpecies::kDarkMatter));
+  assert(view.uniform_particle_owning_rank == k_local_rank);
+  assert(view.particle_species_tag.empty());
+  assert(view.particle_owning_rank.empty());
+
+  // Constructing the borrowed decomposition view must not materialize the
+  // compact metadata sidecars merely because the rank is empty.
+  assert(dmo.hasHomogeneousDmoMetadata());
+  assert(dmo.particle_sidecar.species_tag.empty());
+  assert(dmo.particle_sidecar.owning_rank.empty());
+}
+
+void testRuntimeDecompositionSourceMemoryEstimateMatchesStorage() {
+  using cosmosim::parallel::estimateRuntimeDecompositionSourceStorage;
+  using cosmosim::parallel::RuntimeDecompositionSourceMemoryEstimate;
+  using cosmosim::parallel::runtimeDecompositionHasGasIncidenceSource;
+  using cosmosim::workflows::internal::RuntimeDecompositionSourceStorage;
+
+  cosmosim::core::SimulationState dmo;
+  dmo.resizeParticles(64);
+  dmo.resizePatches(8);
+  for (std::size_t i = 0; i < dmo.particles.size(); ++i) {
+    dmo.particle_sidecar.particle_id[i] = static_cast<std::uint64_t>(i) + 1U;
+  }
+  assert(!runtimeDecompositionHasGasIncidenceSource(dmo));
+
+  const std::vector<std::uint32_t> active{0, 5, 9};
+  const RuntimeDecompositionSourceMemoryEstimate est_active =
+      estimateRuntimeDecompositionSourceStorage(dmo, active);
+  const RuntimeDecompositionSourceMemoryEstimate est_empty =
+      estimateRuntimeDecompositionSourceStorage(dmo, std::span<const std::uint32_t>{});
+  const RuntimeDecompositionSourceMemoryEstimate est_again =
+      estimateRuntimeDecompositionSourceStorage(dmo, active);
+
+  assert(est_active.total_bytes == est_again.total_bytes);
+  assert(est_active.active_mask_bytes == est_again.active_mask_bytes);
+  assert(est_active.compact_patch_index_bytes == est_again.compact_patch_index_bytes);
+  assert(est_active.gas_incidence_offset_bytes == est_again.gas_incidence_offset_bytes);
+  assert(est_active.gas_incidence_index_bytes == est_again.gas_incidence_index_bytes);
+  assert(est_active.gas_incidence_construction_bytes ==
+         est_again.gas_incidence_construction_bytes);
+  assert(est_active.other_source_owned_bytes == est_again.other_source_owned_bytes);
+
+  assert(est_active.gas_incidence_offset_bytes == 0U);
+  assert(est_active.gas_incidence_index_bytes == 0U);
+  assert(est_active.gas_incidence_construction_bytes == 0U);
+  assert(est_active.active_mask_bytes == dmo.particles.size() * 1U);
+  assert(est_empty.active_mask_bytes == 0U);
+  assert(est_active.compact_patch_index_bytes == dmo.patches.size() * 4U);
+  assert(est_active.other_source_owned_bytes == 5U * sizeof(std::uint64_t));
+  assert(est_active.total_bytes ==
+         est_active.active_mask_bytes + est_active.compact_patch_index_bytes +
+         est_active.gas_incidence_offset_bytes + est_active.gas_incidence_index_bytes +
+         est_active.gas_incidence_construction_bytes + est_active.other_source_owned_bytes);
+
+  const RuntimeDecompositionSourceStorage storage(dmo, 0, active);
+  const auto view = storage.view();
+  const std::uint64_t scratch_components =
+      est_active.active_mask_bytes + est_active.compact_patch_index_bytes +
+      est_active.gas_incidence_offset_bytes + est_active.gas_incidence_index_bytes +
+      est_active.gas_incidence_construction_bytes;
+  assert(scratch_components >= view.source_scratch_bytes);
+  assert(est_active.total_bytes >=
+         view.source_scratch_bytes + est_active.other_source_owned_bytes);
+  assert(view.active_particle_mask.size() == dmo.particles.size());
+  assert(view.gas_patch_list_offsets.empty());
+  assert(view.gas_patch_indices.empty());
+  assert(view.compact_patch_indices.empty());
+
+  cosmosim::core::SimulationState cells_only;
+  cells_only.resizeParticles(4);
+  cells_only.resizeCells(8);
+  assert(!runtimeDecompositionHasGasIncidenceSource(cells_only));
+  const auto est_cells_only = estimateRuntimeDecompositionSourceStorage(cells_only, {});
+  assert(est_cells_only.gas_incidence_offset_bytes == 0U);
+  assert(est_cells_only.gas_incidence_index_bytes == 0U);
+  assert(est_cells_only.gas_incidence_construction_bytes == 0U);
+
+  cosmosim::core::SimulationState gas;
+  gas.resizeParticles(8);
+  gas.resizeCells(8);
+  gas.resizePatches(1);
+  for (std::size_t i = 0; i < gas.particles.size(); ++i) {
+    gas.particle_sidecar.particle_id[i] = static_cast<std::uint64_t>(i) + 1U;
+  }
+  gas.patches.patch_id[0] = 100U;
+  gas.patches.cell_count[0] = 8;
+  gas.patches.first_cell[0] = 0;
+  std::vector<cosmosim::core::GasCellIdentityRecord> records(8);
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    records[i].gas_cell_id = static_cast<std::uint64_t>(i) + 1U;
+    records[i].parent_particle_id = static_cast<std::uint64_t>(i) + 1U;
+    records[i].owning_patch_id = 100U;
+    records[i].local_cell_row = i;
+  }
+  gas.replaceGasCellIdentityRecords(std::move(records));
+  assert(runtimeDecompositionHasGasIncidenceSource(gas));
+
+  const auto gest = estimateRuntimeDecompositionSourceStorage(gas, {});
+  assert(gest.gas_incidence_offset_bytes == (gas.particles.size() + 1U) * 4U);
+  assert(gest.gas_incidence_index_bytes == gas.gas_cells.size() * 4U);
+  assert(gest.gas_incidence_construction_bytes == gas.gas_cells.size() * 16U);
+  assert(gest.total_bytes ==
+         gest.active_mask_bytes + gest.compact_patch_index_bytes + gest.gas_incidence_offset_bytes +
+         gest.gas_incidence_index_bytes + gest.gas_incidence_construction_bytes +
+         gest.other_source_owned_bytes);
+
+  const RuntimeDecompositionSourceStorage gstorage(gas, 0, {});
+  const auto gview = gstorage.view();
+  assert(!gview.gas_patch_list_offsets.empty());
+  assert(gview.compact_patch_indices.size() == 1U);
+  const std::uint64_t gscratch =
+      gest.active_mask_bytes + gest.compact_patch_index_bytes + gest.gas_incidence_offset_bytes +
+      gest.gas_incidence_index_bytes + gest.gas_incidence_construction_bytes;
+  assert(gscratch >= gview.source_scratch_bytes);
+  assert(gest.total_bytes >= gview.source_scratch_bytes + gest.other_source_owned_bytes);
+}
+
+}  // namespace
+
+int main() {
+  testRestartMetadataLargeAndMalformedCounts();
+  testExactDistributedCutRepairSynthetic();
+  testBoundedMpiTransferPlannerSyntheticLimits();
+  testDirectedAmrBoundaryRequestPlannerSelectsOnlySharedFaces();
+  testGhostPackUnpackRoundTrip();
+  testGhostOptionalLaneAbsenceSurvivesWireAndCommit();
+  testMortonDecompositionInvariants();
+  testMortonDecompositionKeepsOneItemPerRankWhenPossible();
+  testRestartStateRoundTrip();
+  testGravityAwareDecompositionTracksInteractionCost();
+  testClusteredGravityAwareDecompositionImprovesWeightedImbalance();
+  testExplicitComponentWorkModelAndDiagnostics();
+  testExplicitOwnedVsGhostContracts();
+  testOwnershipDescriptorsAndGhostEpochContracts();
+  testExchangeObjectDescriptorValidation();
+  testGhostExchangeBufferRejectsOwnershipMigrationIntent();
+  testExplicitBlockingGhostExchangePlanRequiresOwnedSendAndGhostReceive();
+  testRestartStateRejectsMissingOrDuplicateOwnershipEntries();
+  testDistributedRestartCompatibilityReporting();
+  testGhostTransferInvariantFailures();
+  testDeterministicReductionAgreement();
+  testGhostExchangePlanValidationDriftRejection();
+  testReductionAgreementPolicyModes();
+  testRankConfigConsensus();
+  testGhostExchangePairStableTagsIgnoreNeighborSlotOrder();
+  testGhostUnpackRequiresDescriptorSlotCount();
+  testBlockingGhostRefreshResultCommitsIntoIndexedGhostSlots();
+  testRuntimeFeedbackRaisesMeasuredCostComponents();
+  testRuntimeRebalancePlanProducesParticleAndPatchIntent();
+  testRuntimeRebalanceUsesCurrentOwnershipImbalance();
+  testLocalOwnershipIdentitySummaryDetectsReplicationAndDuplicates();
+  testGhostBufferPayloadShapeValidation();
+  testMpiContextContractValidation();
+  testDistributedExecutionTopologyCpuOnly();
+  testRichAndCompactPlannerEquivalence();
+  testCompactPlannerContractValidation();
+  testCompactPlannerDenseIndexContract();
+  testCompactStartupPlannerTransientAdmission();
+  testExplicitComponentWeightedLoadAuthority();
+  testEmptyCompactDmoRuntimeDecompositionSourceView();
+  testRuntimeDecompositionSourceMemoryEstimateMatchesStorage();
+  testDistributedExecutionTopologyCudaAssignment();
+  testDistributedExecutionTopologyRejectsInvalidGpuRequest();
+  testPmSlabUnevenPartitionOwnership();
+  testPmSlabLayoutRoundTripAndCellOwnership();
+  testPmSlabHaloSerialDoesNotRequireMpiInitialization();
+  testHardRankMemoryConstraintAndExpandedCostModel();
+  testMemoryFeasibilityPrecedesWorkBalancing();
+  testAuthoritativeTopDomainLeavesPreserveOwnedGeometry();
+  testAuthoritativeTopDomainPeriodicSeamBoundsStayCompact();
+  testTopDomainRefitPreservesTiedIntervals();
+  return 0;
+}

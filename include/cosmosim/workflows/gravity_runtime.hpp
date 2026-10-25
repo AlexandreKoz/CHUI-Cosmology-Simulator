@@ -1,0 +1,128 @@
+#pragma once
+
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <span>
+
+#include "cosmosim/core/profiling.hpp"
+#include "cosmosim/core/simulation_mode.hpp"
+#include "cosmosim/core/time_integration.hpp"
+#include "cosmosim/gravity/tree_pm_coupling.hpp"
+#include "cosmosim/io/restart_checkpoint.hpp"
+#include "cosmosim/parallel/distributed_memory.hpp"
+#include "cosmosim/workflows/reference_workflow.hpp"
+#include "cosmosim/workflows/runtime_module_registry.hpp"
+#include "cosmosim/workflows/runtime_resources.hpp"
+
+namespace cosmosim::workflows {
+
+struct RuntimeServices;
+
+// Gravity-owned startup normalization and diagnostic policy description.
+// These are called by the composition lifecycle before the first gravity task.
+void initializeGravityState(
+    core::SimulationState& state,
+    const core::SimulationConfig& config);
+[[nodiscard]] std::string describeGravitySofteningPolicy(
+    const core::SimulationConfig& config,
+    const core::SimulationState& state);
+
+// Narrow read surface consumed by hydro/source orchestration. Dense-row
+// acceleration mirrors are invalidated by particle migration through
+// commitParticleDecompositionChange().
+class GravityAccelerationProvider {
+ public:
+  virtual ~GravityAccelerationProvider() = default;
+
+  [[nodiscard]] virtual std::span<const double> cellAccelX() const noexcept = 0;
+  [[nodiscard]] virtual std::span<const double> cellAccelY() const noexcept = 0;
+  [[nodiscard]] virtual std::span<const double> cellAccelZ() const noexcept = 0;
+  [[nodiscard]] virtual std::span<const double> particleAccelX() const noexcept = 0;
+  [[nodiscard]] virtual std::span<const double> particleAccelY() const noexcept = 0;
+  [[nodiscard]] virtual std::span<const double> particleAccelZ() const noexcept = 0;
+};
+
+// Persistence-facing gravity surface. Output/restart depends on this contract,
+// never on the concrete solver implementation.
+class GravityRestartStateProvider {
+ public:
+  virtual ~GravityRestartStateProvider() = default;
+
+  [[nodiscard]] virtual std::uint64_t decompositionEpoch() const noexcept = 0;
+  [[nodiscard]] virtual const gravity::PmGridShape& pmGridShape() const noexcept = 0;
+  [[nodiscard]] virtual const parallel::DistributedExecutionTopology&
+  runtimeTopology() const noexcept = 0;
+  [[nodiscard]] virtual io::GravityForceCachePersistentView
+  restartForceCacheView(const core::SimulationState& state) const = 0;
+};
+
+// Owner interface for rung-zero TreePM/PM cadence and force-cache lifecycle.
+// Stage dispatch enters only through the typed GravityStageView contract.
+class GravityRuntime : public GravityAccelerationProvider,
+                       public GravityRestartStateProvider {
+ public:
+  ~GravityRuntime() override = default;
+
+  virtual void execute(GravityStageView& view) = 0;
+  // Current retained-capacity-aware phase model. The owner continues to hold
+  // its physical reservation; the dispatcher only performs a preflight.
+  // At the serial task boundary this may evict derived optional caches to make
+  // headroom for mandatory work; it never changes source/force/scheduler truth.
+  [[nodiscard]] virtual RuntimeTaskMemoryEstimate estimateMemory(
+      const core::SimulationState&) const {
+    return {0U, false, "gravity owner does not publish a complete memory model"};
+  }
+
+  [[nodiscard]] virtual std::size_t pmGridSize() const noexcept = 0;
+  [[nodiscard]] virtual std::uint64_t longRangeRefreshCount() const noexcept = 0;
+  [[nodiscard]] virtual std::uint64_t longRangeReuseCount() const noexcept = 0;
+  [[nodiscard]] virtual int pmCadenceSteps() const noexcept = 0;
+  [[nodiscard]] virtual double gravitationalConstantCode() const noexcept = 0;
+  [[nodiscard]] virtual std::span<const ReferenceWorkflowReport::TreePmCadenceRecord>
+  cadenceRecords() const noexcept = 0;
+  [[nodiscard]] virtual core::MemoryReport memoryReport() const = 0;
+  [[nodiscard]] virtual const parallel::DecompositionRuntimeMeasurements&
+  lastRuntimeDecompositionMeasurements() const noexcept = 0;
+  virtual void shutdownMpiResources() = 0;
+
+  virtual void restoreDecompositionEpoch(std::uint64_t decomposition_epoch) = 0;
+  // Advances the decomposition epoch and explicitly invalidates authoritative
+  // top-domain geometry freshness: after this call and before a reinstall,
+  // authoritativeDomainGeometryMatches(...) is false. Ownership data,
+  // migration state, and the epoch itself are not cleared.
+  virtual void commitParticleDecompositionChange() = 0;
+  // Install authoritative top-domain leaves at segment/restart/ownership-
+  // change boundaries together with the physical source generation they
+  // cover. Replaces both the stable seed leaf set (decomposition-local
+  // identities/SFC intervals used as the refit seed) and the current
+  // published leaf set. Geometry freshness is source_generation equality,
+  // independent of ownership decomposition_epoch.
+  virtual void installAuthoritativeTopDomainLeaves(
+      std::span<const parallel::TopDomainLeaf> leaves,
+      std::uint64_t source_generation) = 0;
+  [[nodiscard]] virtual bool authoritativeDomainGeometryMatches(
+      std::uint64_t source_generation) const noexcept = 0;
+  virtual void importRestartForceCache(
+      const io::GravityForceCachePersistentState& cache,
+      const core::SimulationState& state) = 0;
+  // Hierarchical KDK endpoint reuse (rank-local; callers agree collectively).
+  // True when the last all-active synchronization endpoint left Tree and PM
+  // split components for every row at the current source positions, with PM
+  // from the integrator's committed field version: the next block may open
+  // with these forces instead of re-evaluating at the same positions.
+  [[nodiscard]] virtual bool hierarchicalEndpointForceReusable(
+      const core::SimulationState& state, const core::IntegratorState& integrator) const = 0;
+  // Per-row squared nearest direct-pair separation from the latest Tree
+  // solve (+infinity: none inside r_cut). Empty outside hierarchical KDK.
+  [[nodiscard]] virtual std::span<const double> hierarchicalNearestPairR2() const noexcept = 0;
+
+};
+
+[[nodiscard]] std::unique_ptr<GravityRuntime> makeGravityRuntime(
+    const core::SimulationConfig& config,
+    const core::ModePolicy& mode_policy,
+    const RuntimeServices& services,
+    std::filesystem::path zoom_region_path = {});
+
+}  // namespace cosmosim::workflows

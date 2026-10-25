@@ -1,0 +1,732 @@
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <filesystem>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "cosmosim/core/particle_species.hpp"
+
+namespace cosmosim::core {
+
+enum class SimulationMode {
+  kCosmoCube,
+  kZoomIn,
+  kIsolatedGalaxy,
+  kIsolatedCluster,
+};
+
+enum class GravitySolver {
+  kTreePm,
+};
+
+enum class HydroSolver {
+  kGodunovFv,
+};
+
+enum class TreePmAssignmentScheme {
+  kCic,
+  kTsc,
+};
+
+enum class TreePmOpeningCriterion {
+  kGeometric,
+  kComDistance,
+  kRelativeForceError,
+};
+
+// Displacement limit on the hierarchical coarse (PM) interval
+// (see docs/time_integration.md).
+enum class HierarchicalCoarseDisplacementCriterion {
+  kMaxSpeedMesh,
+  kRmsSplitScale,
+};
+
+// Adaptive TreePM error estimate (see docs/tree_pm_coupling.md).
+enum class TreePmAdaptiveErrorEstimator {
+  kResidualDerivative,
+  kRelativeMonopole,
+};
+
+// Adaptive TreePM treatment of nodes straddling the short-range cutoff.
+enum class TreePmCutoffNodePolicy {
+  kContain,
+  kComDistance,
+};
+
+enum class PmDecompositionMode {
+  kSlab,
+  kPencil,
+};
+
+enum class CoordinateFrame {
+  kComoving,
+  kPhysical,
+};
+
+enum class ModeHydroBoundary {
+  kAuto,
+  kPeriodic,
+  kOpen,
+  kReflective,
+};
+
+enum class ModeGravityBoundary {
+  kAuto,
+  kPeriodic,
+  kIsolatedMonopole,
+};
+
+enum class ZoomLongRangeStrategy {
+  kDisabled,
+  kGlobalCoarsePlusFocusedHighResCorrection,
+};
+
+enum class InitialConditionConvention {
+  kGenerated,
+  kChuiCanonicalV1,
+  kGadgetArepoBridgeV1,
+  kManifestV1,
+};
+
+enum class InitialConditionCoordinateFrame {
+  kUnspecified,
+  kComoving,
+  kPhysical,
+};
+
+enum class InitialConditionVelocityConvention {
+  kUnspecified,
+  kPhysicalPeculiar,
+  // Legacy/custom convention: stored = sqrt(a) * peculiar, so import multiplies by 1/sqrt(a).
+  kSqrtAScaledPeculiar,
+  // Standard GADGET/AREPO cosmological snapshot convention: peculiar = stored * sqrt(a).
+  kGadgetArepoStoredPeculiar,
+  kComovingCoordinateRate,
+};
+
+enum class InitialConditionSpeciesPolicy {
+  kReject,
+  kDarkMatter,
+  kStar,
+  kBlackHole,
+  kTracer,
+};
+
+enum class InitialConditionMissingFieldPolicy {
+  kReject,
+  kReconstruct,
+  kUseConfigValue,
+  kDialectDefinedDefault,
+  kPreserveUnavailable,
+};
+
+enum class StarFormationModelKind {
+  kLegacySchmidtThreshold,
+  kAdaptiveBoundJeans,
+  kEffectiveMultiphaseTngLike,
+};
+
+enum class EffectiveIsmEosRelaxation {
+  kInstantaneous,
+  kFiniteTimescale,
+};
+
+enum class EffectiveIsmBirthMassConvention {
+  kInitialSspMass,
+  kLongLivedMass,
+};
+
+enum class EffectiveIsmFeedbackCoupling {
+  kExternalFeedbackCalibrated,
+  kEffectiveEosOnly,
+};
+
+enum class StarFormationCollapseTimescale {
+  kFreeFall,
+  kMinimumFreeFallOrCompression,
+};
+
+enum class StarParticleMassPolicy {
+  kFixed,
+  kGasResolutionFraction,
+};
+
+enum class FeedbackMode {
+  kThermal,
+  kKinetic,
+  kMomentum,
+  kThermalKineticMomentum,
+};
+
+enum class FeedbackVariant {
+  kNone,
+  kDelayedCooling,
+  kStochastic,
+};
+
+enum class UvBackgroundModel {
+  kNone,
+  kHm12,
+  kFg20,
+};
+
+enum class SelfShieldingModel {
+  kNone,
+  kRahmati13Like,
+};
+
+enum class CoolingModel {
+  kPrimordial,
+  kPrimordialMetalLine,
+};
+
+enum class MetalSpeciesMode {
+  kTotalOnly,
+  kCoreElements,
+};
+
+enum class MetalDiffusionModel {
+  kNone,
+  kSmagorinsky,
+};
+
+enum class MetalDiffusionTimeIntegrator {
+  kExplicitSubcycling,
+  kRkl2,
+};
+
+enum class IntegratorTimeVariable {
+  kScaleFactor,
+  kLogScaleFactor,
+  kCodeTime,
+  kPhysicalTime,
+};
+
+struct CosmologyConfig {
+  double omega_matter = 0.315;
+  double omega_lambda = 0.685;
+  double omega_baryon = 0.049;
+  double hubble_param = 0.674;
+  double sigma8 = 0.811;
+  double scalar_index_ns = 0.965;
+  double box_size_x_mpc_comoving = 50.0;
+  double box_size_y_mpc_comoving = 50.0;
+  double box_size_z_mpc_comoving = 50.0;
+  // Legacy scalar compatibility lane; canonical runtime geometry must use axis-aware fields above.
+  double box_size_mpc_comoving = 50.0;
+};
+
+struct NumericsConfig {
+  double a_begin = 1.0;
+  double a_end = 1.0;
+  double z_begin = 0.0;
+  double z_end = 0.0;
+  double t_code_begin = 0.0;
+  double t_code_end = 1.0;
+  double t_phys_begin = 0.0;
+  double t_phys_end = 0.0;
+  IntegratorTimeVariable integrator_time_variable = IntegratorTimeVariable::kScaleFactor;
+  double cosmology_max_delta_ln_a = 1.0e-2;
+  double cosmology_max_hubble_time_fraction = 1.0e-2;
+  double source_max_fractional_change = 0.1;
+  double hydro_density_floor_code = 1.0e-10;
+  double hydro_pressure_floor_code = 1.0e-10;
+  // Maximum real-cell count represented by one hydro reconstruction/Riemann
+  // scratch batch. 0 selects the deterministic runtime automatic maximum,
+  // further bounded by current MemoryGovernor headroom.
+  std::uint64_t hydro_active_batch_max_cells = 0;
+  int max_global_steps = 1024;
+  // Zero retains the safe global KDK default. Nonzero selects the provisional
+  // synchronized collisionless DMO hierarchy; scientific qualification pending.
+  int hierarchical_max_rung = 0;
+  HierarchicalCoarseDisplacementCriterion hierarchical_coarse_displacement_criterion =
+      HierarchicalCoarseDisplacementCriterion::kMaxSpeedMesh;
+  double hierarchical_coarse_rms_displacement_factor = 0.25;
+  // Softened-encounter rung criterion dt <= eta sqrt(a^3 (r_nn^2+eps^2)^{3/2} /
+  // (G m_max)) from each row's nearest direct pair; bounds the timestep where
+  // the acceleration criterion sees |a| -> 0 during a pair crossing.
+  bool hierarchical_encounter_timestep_enabled = true;
+  int amr_max_level = 10;
+  double gravity_softening_kpc_comoving = 1.0;
+  double gravity_softening_gas_kpc_comoving = -1.0;
+  double gravity_softening_dark_matter_kpc_comoving = -1.0;
+  double gravity_softening_star_kpc_comoving = -1.0;
+  double gravity_softening_black_hole_kpc_comoving = -1.0;
+  double gravity_softening_tracer_kpc_comoving = -1.0;
+  GravitySolver gravity_solver = GravitySolver::kTreePm;
+  HydroSolver hydro_solver = HydroSolver::kGodunovFv;
+  int treepm_pm_grid_nx = 16;
+  int treepm_pm_grid_ny = 16;
+  int treepm_pm_grid_nz = 16;
+  // Legacy scalar compatibility lane; canonical runtime geometry must use axis-aware fields above.
+  int treepm_pm_grid = 16;
+  double treepm_asmth_cells = 1.25;
+  double treepm_rcut_cells = 6.25;
+  TreePmOpeningCriterion treepm_tree_opening_criterion = TreePmOpeningCriterion::kComDistance;
+  double treepm_tree_opening_theta = 0.7;
+  double treepm_tree_relative_force_tolerance = 0.005;
+  double treepm_tree_relative_force_acceleration_floor = 1.0e-30;
+  bool treepm_gaussian_pair_lookup_enabled = false;
+  bool treepm_full_residual_lookup_enabled = false;
+  bool treepm_leaf_simd_enabled = false;
+  bool treepm_radial_coefficients_enabled = false;
+  int treepm_residual_block_size = 64;
+  int treepm_tree_max_leaf_size = 16;
+
+  bool treepm_full_mac_diagnostics = true;
+  bool treepm_adaptive_acceptance_enabled = false;
+  double treepm_adaptive_maximum_opening_angle = 0.25;
+  TreePmAdaptiveErrorEstimator treepm_adaptive_error_estimator =
+      TreePmAdaptiveErrorEstimator::kResidualDerivative;
+  TreePmCutoffNodePolicy treepm_cutoff_node_policy = TreePmCutoffNodePolicy::kContain;
+  bool treepm_group_walk_enabled = false;
+  bool treepm_identical_source_tree_reuse_enabled = false;
+  bool treepm_topology_refit_enabled = false;
+  TreePmAssignmentScheme treepm_assignment_scheme = TreePmAssignmentScheme::kTsc;
+  bool treepm_enable_window_deconvolution = true;
+  int treepm_update_cadence_steps = 1;
+  // Explicitly test/diagnostic-only. Production workflows fail closed when
+  // TreePM is requested without a production FFT backend.
+  bool treepm_allow_diagnostic_naive_dft = false;
+  PmDecompositionMode treepm_pm_decomposition_mode = PmDecompositionMode::kSlab;
+  std::uint64_t treepm_tree_exchange_batch_bytes = 4ULL * 1024ULL * 1024ULL;
+  std::uint64_t treepm_pm_exchange_batch_bytes = 16ULL * 1024ULL * 1024ULL;
+};
+
+struct PhysicsConfig {
+  bool enable_cooling = true;
+  bool enable_star_formation = true;
+  bool enable_feedback = true;
+  bool enable_stellar_evolution = true;
+  std::string reionization_model = "hm12";
+  UvBackgroundModel uv_background_model = UvBackgroundModel::kHm12;
+  SelfShieldingModel self_shielding_model = SelfShieldingModel::kNone;
+  CoolingModel cooling_model = CoolingModel::kPrimordial;
+  std::string metal_line_table_path;
+  double temperature_floor_k = 100.0;
+  StarFormationModelKind star_formation_model = StarFormationModelKind::kLegacySchmidtThreshold;
+  double sf_density_threshold_code = 10.0;
+  double sf_temperature_threshold_k = 1.0e4;
+  double sf_min_converging_flow_rate_code = 0.0;
+  double sf_epsilon_ff = 0.01;
+  double sf_bound_alpha_vir_max = 1.0;
+  bool sf_require_converging_flow = true;
+  StarFormationCollapseTimescale sf_collapse_timescale =
+      StarFormationCollapseTimescale::kFreeFall;
+  double sf_jeans_mass_floor_code = 100.0;
+  StarParticleMassPolicy sf_star_particle_mass_policy =
+      StarParticleMassPolicy::kFixed;
+  double sf_target_star_particle_mass_code = 0.1;
+  double sf_target_star_particle_mass_fraction = 0.25;
+  double sf_min_star_particle_mass_code = 0.1;
+  double sf_max_star_particle_mass_code = 1.0e30;
+  std::uint32_t sf_max_spawn_particles_per_cell_step = 8;
+  double sf_max_fractional_mass_conversion = 0.25;
+  double sf_min_remaining_gas_fraction = 0.01;
+  double sf_min_remaining_gas_mass_code = 1.0e-12;
+  double sf_temperature_safety_ceiling_k = 0.0;
+  bool sf_stochastic_spawning = true;
+  std::uint64_t sf_random_seed = 123456789ull;
+
+  // SH03/TNG-inspired unresolved multiphase-ISM closure. Values are a
+  // versioned CHUI reference parameter set, not an exact IllustrisTNG match.
+  std::string sf_effective_parameter_set = "chui_sh03_tng_like_v1";
+  double sf_effective_n_h_threshold_cgs = 0.13;
+  double sf_effective_min_baryon_overdensity = 0.0;
+  double sf_effective_t_star_at_threshold_code = 1.0;
+  double sf_effective_evaporation_factor_at_threshold = 1000.0;
+  double sf_effective_evaporation_density_exponent = -0.8;
+  double sf_effective_cold_phase_temperature_k = 1000.0;
+  double sf_effective_supernova_specific_energy_code = 1.0e5;
+  double sf_effective_massive_star_fraction = 0.1;
+  double sf_effective_q_eos = 0.3;
+  double sf_effective_isothermal_temperature_k = 1.0e4;
+  double sf_effective_hot_excess_tolerance = 1.0;
+  EffectiveIsmEosRelaxation sf_effective_eos_relaxation =
+      EffectiveIsmEosRelaxation::kInstantaneous;
+  double sf_effective_eos_relaxation_timescale_code = 0.0;
+  std::uint32_t sf_effective_eos_table_bins = 256;
+  double sf_effective_eos_max_density_ratio = 1.0e6;
+  EffectiveIsmBirthMassConvention sf_effective_birth_mass_convention =
+      EffectiveIsmBirthMassConvention::kInitialSspMass;
+  EffectiveIsmFeedbackCoupling sf_effective_feedback_coupling =
+      EffectiveIsmFeedbackCoupling::kExternalFeedbackCalibrated;
+
+  FeedbackMode fb_mode = FeedbackMode::kThermalKineticMomentum;
+  FeedbackVariant fb_variant = FeedbackVariant::kNone;
+  bool fb_use_returned_mass_budget = true;
+  double fb_epsilon_thermal = 0.6;
+  double fb_epsilon_kinetic = 0.3;
+  double fb_epsilon_momentum = 0.1;
+  double fb_sn_energy_erg_per_mass_code = 1.0e49;
+  double fb_momentum_code_per_mass_code = 3.0e3;
+  std::uint32_t fb_neighbor_count = 8;
+  double fb_delayed_cooling_time_code = 0.0;
+  double fb_stochastic_event_probability = 0.25;
+  std::uint64_t fb_random_seed = 42424242ull;
+  std::string stellar_evolution_table_path;
+  double stellar_evolution_hubble_time_years = 1.44e10;
+  bool stellar_evolution_require_production_table = false;
+
+  // Total metal mass remains authoritative. Element mode is reserved until a
+  // complete sidecar/yield/cooling schema is selected; validation fails closed.
+  MetalSpeciesMode metal_species_mode = MetalSpeciesMode::kTotalOnly;
+  bool enable_metal_diffusion = false;
+  MetalDiffusionModel metal_diffusion_model = MetalDiffusionModel::kNone;
+  MetalDiffusionTimeIntegrator metal_diffusion_time_integrator =
+      MetalDiffusionTimeIntegrator::kExplicitSubcycling;
+  double metal_diffusion_coefficient = 0.05;
+  double metal_diffusion_cfl = 0.4;
+  std::uint32_t metal_diffusion_max_subcycles = 128;
+  std::uint32_t metal_diffusion_max_rkl_stages = 64;
+  double metal_diffusion_coefficient_floor_code = 0.0;
+  double metal_diffusion_coefficient_ceiling_code = 1.0e30;
+
+  bool enable_black_hole_agn = false;
+  // Seeding requires an authoritative halo/candidate provider. The reference
+  // workflow currently has none, so this is explicit and fail-closed.
+  bool bh_enable_seeding = false;
+  double bh_seed_halo_mass_threshold_code = 1.0e3;
+  double bh_seed_mass_code = 1.0;
+  std::uint32_t bh_seed_max_per_cell = 1;
+  double bh_alpha_bondi = 1.0;
+  bool bh_use_eddington_cap = true;
+  double bh_epsilon_r = 0.1;
+  double bh_epsilon_f = 0.05;
+  double bh_feedback_coupling_efficiency = 1.0;
+  double bh_duty_cycle_active_edd_ratio_threshold = 0.01;
+  double bh_proton_mass_si = 1.67262192369e-27;
+  double bh_thomson_cross_section_si = 6.6524587321e-29;
+  double bh_newton_g_si = 6.67430e-11;
+  double bh_speed_of_light_si = 2.99792458e8;
+  bool enable_tracers = false;
+  bool tracer_track_mass = true;
+  double tracer_min_host_mass_code = 0.0;
+};
+
+enum class ScienceSnapshotLayout : std::uint8_t {
+  kAuto = 0,
+  kSingle = 1,
+  kAggregated = 2,
+  kSharded = 3,
+};
+
+struct OutputConfig {
+  std::string run_name = "cosmosim_run";
+  std::string output_directory = "outputs";
+  std::string output_stem = "snapshot";
+  std::string restart_stem = "restart";
+  int snapshot_interval_steps = 64;
+  // Zero disables code-time cadence.  When positive, the workflow clips a
+  // step at each ordered event and persists the next event in restart state.
+  double snapshot_interval_time_code = 0.0;
+  ScienceSnapshotLayout snapshot_layout = ScienceSnapshotLayout::kAuto;
+  // Zero selects backend policy. This is intentionally independent of MPI
+  // world size so future aggregated science I/O is not rank-count coupled.
+  std::uint32_t snapshot_num_files = 0U;
+  bool write_restarts = true;
+};
+
+
+struct AnalysisConfig {
+  enum class DiagnosticsExecutionPolicy : std::uint8_t {
+    kRunHealthOnly = 0,
+    kRunHealthAndLightScience = 1,
+    kAllIncludingProvisional = 2,
+  };
+
+  bool enable_diagnostics = true;
+  bool enable_halo_workflow = false;
+  bool halo_on_the_fly = false;
+  DiagnosticsExecutionPolicy diagnostics_execution_policy =
+      DiagnosticsExecutionPolicy::kRunHealthAndLightScience;
+  int run_health_interval_steps = 1;
+  int science_light_interval_steps = 8;
+  int science_heavy_interval_steps = 64;
+  int retention_bundle_count = 8;
+  int power_spectrum_mesh_n = 16;
+  int power_spectrum_bin_count = 12;
+  int sf_history_bin_count = 16;
+  int quicklook_grid_n = 32;
+  std::string diagnostics_stem = "diagnostics";
+  std::string halo_catalog_stem = "halo_catalog";
+  std::string merger_tree_stem = "merger_tree_plan";
+  double halo_fof_linking_length_factor = 0.2;
+  int halo_fof_min_group_size = 16;
+  bool halo_include_gas = true;
+  bool halo_include_stars = true;
+  bool halo_include_black_holes = true;
+};
+
+struct ParallelConfig {
+  int mpi_ranks_expected = 1;
+  // OpenMP team request: 0 uses the runtime default, 1 requests serial execution,
+  // and N > 1 requests N threads when this binary was built with OpenMP.
+  // Builds without OpenMP reject requests above one during validation.
+  int omp_threads = 1;
+  int gpu_devices = 0;
+  bool deterministic_reduction = true;
+  double decomposition_particle_count_weight = 1.0;
+  double decomposition_gas_cell_weight = 1.5;
+  double decomposition_tree_interaction_weight = 1.0;
+  double decomposition_pm_mesh_weight = 0.25;
+  double decomposition_amr_patch_weight = 1.0;
+  double decomposition_active_fraction_weight = 2.0;
+  double decomposition_memory_pressure_weight = 1.0 / (1024.0 * 1024.0);
+  double decomposition_gpu_occupancy_weight = 0.0;
+  double decomposition_generic_work_weight = 0.5;
+  bool decomposition_runtime_rebalance_enabled = true;
+  bool decomposition_spatial_work_enabled = false;
+  bool decomposition_debug_exact_ownership_audit = false;
+  double decomposition_rebalance_imbalance_trigger = 1.25;
+  double decomposition_rebalance_memory_trigger = 1.50;
+  double decomposition_rebalance_max_migrated_load_fraction = 0.25;
+  double decomposition_measured_tree_pair_weight = 1.0;
+  double decomposition_measured_pm_cell_weight = 1.0;
+  double decomposition_measured_amr_cell_weight = 1.0;
+  double decomposition_measured_hydro_face_weight = 1.0;
+  double decomposition_measured_wall_ms_weight = 1.0;
+  std::uint64_t isolated_pm_root_workspace_limit_bytes = 256ULL * 1024ULL * 1024ULL;
+  std::uint64_t zoom_high_res_allgather_limit_bytes = 256ULL * 1024ULL * 1024ULL;
+  // Optional per-rank gravity peak budget. Zero disables the budget gate but
+  // never disables the estimator/report.
+  std::uint64_t gravity_memory_budget_bytes = 0U;
+  // Additional reserve for backend/library allocations not observable through
+  // owner containers plus a fractional margin applied to the complete pre-run
+  // gravity estimate. Defaults preserve the historical budget behavior.
+  std::uint64_t gravity_backend_unknown_reserve_bytes = 0U;
+  double gravity_memory_safety_margin_fraction = 0.0;
+  // Authoritative per-rank total-process budget for production DMO preflight.
+  // Zero preserves historical parameter-file behavior and disables only this
+  // process-wide gate; the estimate/report is still produced. The legacy
+  // gravity_memory_budget_bytes remains a gravity-subsystem compatibility gate.
+  std::uint64_t process_memory_budget_bytes = 0U;
+  // Explicit reserves for library/runtime memory that CHUI does not own and
+  // cannot calculate exactly from container extents.
+  std::uint64_t process_mpi_unknown_reserve_bytes = 0U;
+  std::uint64_t process_fftw_unknown_reserve_bytes = 0U;
+  std::uint64_t process_hdf5_unknown_reserve_bytes = 0U;
+  std::uint64_t process_allocator_unknown_reserve_bytes = 0U;
+  // Owned output/restart staging that is permitted to overlap resident
+  // canonical/PM state. IC-import staging is deliberately excluded once the
+  // integrator owns the canonical state because those lifetimes do not overlap.
+  std::uint64_t process_output_restart_overlap_bytes = 0U;
+  double process_memory_safety_margin_fraction = 0.0;
+};
+
+struct UnitsConfig {
+  std::string length_unit = "mpc";
+  std::string mass_unit = "msun";
+  std::string velocity_unit = "km_s";
+  CoordinateFrame coordinate_frame = CoordinateFrame::kComoving;
+};
+
+struct ModeConfig {
+  SimulationMode mode = SimulationMode::kZoomIn;
+  std::string ic_file = "generated";
+  InitialConditionConvention ic_convention =
+      InitialConditionConvention::kGenerated;
+  std::string ic_manifest_file;
+  // A generic GADGET/AREPO bridge is scientifically valid only when this
+  // complete source convention is supplied. Zero/NaN/unspecified defaults are
+  // deliberate fail-closed sentinels, not physical defaults.
+  double ic_bridge_source_length_unit_to_si = 0.0;
+  double ic_bridge_source_mass_unit_to_si = 0.0;
+  double ic_bridge_source_velocity_unit_to_si = 0.0;
+  InitialConditionCoordinateFrame ic_bridge_coordinate_frame =
+      InitialConditionCoordinateFrame::kUnspecified;
+  InitialConditionVelocityConvention ic_bridge_velocity_convention =
+      InitialConditionVelocityConvention::kUnspecified;
+  double ic_bridge_length_hubble_exponent =
+      std::numeric_limits<double>::quiet_NaN();
+  double ic_bridge_length_scale_factor_exponent =
+      std::numeric_limits<double>::quiet_NaN();
+  double ic_bridge_mass_hubble_exponent =
+      std::numeric_limits<double>::quiet_NaN();
+  double ic_bridge_mass_scale_factor_exponent =
+      std::numeric_limits<double>::quiet_NaN();
+  double ic_bridge_velocity_hubble_exponent =
+      std::numeric_limits<double>::quiet_NaN();
+  double ic_bridge_velocity_scale_factor_exponent =
+      std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t ic_chunk_particle_count = 65536ULL;
+  std::uint64_t ic_staging_particle_count = 65536ULL;
+  InitialConditionSpeciesPolicy ic_part_type2_policy =
+      InitialConditionSpeciesPolicy::kReject;
+  InitialConditionSpeciesPolicy ic_part_type3_policy =
+      InitialConditionSpeciesPolicy::kReject;
+  InitialConditionMissingFieldPolicy ic_gas_internal_energy_policy =
+      InitialConditionMissingFieldPolicy::kReject;
+  InitialConditionMissingFieldPolicy ic_gas_density_policy =
+      InitialConditionMissingFieldPolicy::kReject;
+  InitialConditionMissingFieldPolicy ic_star_formation_time_policy =
+      InitialConditionMissingFieldPolicy::kReject;
+  InitialConditionMissingFieldPolicy ic_star_initial_mass_policy =
+      InitialConditionMissingFieldPolicy::kReject;
+  InitialConditionMissingFieldPolicy ic_star_metallicity_policy =
+      InitialConditionMissingFieldPolicy::kReject;
+  InitialConditionMissingFieldPolicy ic_bh_mdot_policy =
+      InitialConditionMissingFieldPolicy::kReject;
+  double ic_gas_internal_energy_value_code = 0.0;
+  double ic_gas_density_value_code = 0.0;
+  double ic_star_formation_time_value = 0.0;
+  double ic_star_initial_mass_value_code = 0.0;
+  double ic_star_metallicity_value = 0.0;
+  double ic_bh_mdot_value_code = 0.0;
+  bool zoom_high_res_region = false;
+  std::string zoom_region_file;
+  ZoomLongRangeStrategy zoom_long_range_strategy =
+      ZoomLongRangeStrategy::kDisabled;
+  double zoom_region_center_x_mpc_comoving = 0.5;
+  double zoom_region_center_y_mpc_comoving = 0.5;
+  double zoom_region_center_z_mpc_comoving = 0.5;
+  double zoom_region_radius_mpc_comoving = 0.0;
+  int zoom_focused_pm_grid_nx = 0;
+  int zoom_focused_pm_grid_ny = 0;
+  int zoom_focused_pm_grid_nz = 0;
+  double zoom_contamination_radius_mpc_comoving = 0.0;
+  ModeHydroBoundary hydro_boundary = ModeHydroBoundary::kAuto;
+  ModeGravityBoundary gravity_boundary = ModeGravityBoundary::kAuto;
+};
+
+struct CompatibilityConfig {
+  bool allow_unknown_keys = false;
+};
+
+struct SimulationConfig final {
+ private:
+  struct ConstructionToken {};
+  explicit SimulationConfig(ConstructionToken) {}
+
+ public:
+  SimulationConfig() = delete;
+  SimulationConfig(const SimulationConfig&) = default;
+  SimulationConfig(SimulationConfig&&) noexcept = default;
+  SimulationConfig& operator=(const SimulationConfig&) = default;
+  SimulationConfig& operator=(SimulationConfig&&) noexcept = default;
+  ~SimulationConfig() = default;
+
+  int schema_version = 1;
+  CosmologyConfig cosmology;
+  NumericsConfig numerics;
+  PhysicsConfig physics;
+  OutputConfig output;
+  ParallelConfig parallel;
+  AnalysisConfig analysis;
+  UnitsConfig units;
+  ModeConfig mode;
+  CompatibilityConfig compatibility;
+
+ private:
+  friend struct FrozenConfig;
+  friend SimulationConfig makeUnvalidatedSimulationConfigForTests();
+};
+
+using NormalizedConfig = SimulationConfig;
+
+[[nodiscard]] SimulationConfig makeUnvalidatedSimulationConfigForTests();
+
+struct ProvenanceMetadata {
+  std::string source_name;
+  std::uint64_t config_hash = 0;
+  std::string config_hash_hex;
+  std::vector<std::string> deprecation_warnings;
+};
+
+struct UserConfigEntry {
+  std::string canonical_key;
+  std::string value;
+  std::string source_key;
+  int source_line = 0;
+  bool from_alias = false;
+};
+
+struct UserConfig {
+  std::string source_name;
+  std::vector<UserConfigEntry> entries;
+  std::vector<std::string> alias_resolution_notes;
+};
+
+struct FrozenConfig {
+  FrozenConfig();
+
+  UserConfig user_config;
+  NormalizedConfig config;
+  std::string raw_text;
+  std::string normalized_text;
+  ProvenanceMetadata provenance;
+};
+
+struct DerivedRuntimeConfig {
+  double t_code_begin = 0.0;
+  double t_code_end = 1.0;
+  std::array<double, 3> box_size_mpc_comoving{};
+  std::array<int, 3> treepm_pm_grid_shape{};
+  std::array<double, k_particle_species_count> gravity_softening_kpc_comoving_by_species{};
+  std::uint64_t normalized_config_hash = 0;
+  std::string normalized_config_hash_hex;
+};
+
+struct ParseOptions {
+  bool allow_unknown_keys = false;
+};
+
+class ConfigError : public std::runtime_error {
+ public:
+  explicit ConfigError(const std::string& message);
+};
+
+[[nodiscard]] FrozenConfig loadFrozenConfigFromFile(
+    const std::filesystem::path& path,
+    const ParseOptions& options = {});
+
+[[nodiscard]] FrozenConfig loadFrozenConfigFromString(
+    const std::string& config_text,
+    const std::string& source_name,
+    const ParseOptions& options = {});
+
+[[nodiscard]] DerivedRuntimeConfig deriveRuntimeConfig(const FrozenConfig& frozen_config);
+[[nodiscard]] std::string serializeDerivedRuntimeConfig(const DerivedRuntimeConfig& derived_config);
+
+void writeNormalizedConfigSnapshot(
+    const FrozenConfig& frozen_config,
+    const std::filesystem::path& run_directory);
+
+[[nodiscard]] std::string modeToString(SimulationMode mode);
+[[nodiscard]] std::string gravitySolverToString(GravitySolver solver);
+[[nodiscard]] std::string hydroSolverToString(HydroSolver solver);
+[[nodiscard]] std::string coordinateFrameToString(CoordinateFrame frame);
+[[nodiscard]] std::string initialConditionConventionToString(
+    InitialConditionConvention convention);
+[[nodiscard]] std::string initialConditionCoordinateFrameToString(
+    InitialConditionCoordinateFrame frame);
+[[nodiscard]] std::string initialConditionVelocityConventionToString(
+    InitialConditionVelocityConvention convention);
+[[nodiscard]] std::string initialConditionSpeciesPolicyToString(
+    InitialConditionSpeciesPolicy policy);
+[[nodiscard]] std::string initialConditionMissingFieldPolicyToString(
+    InitialConditionMissingFieldPolicy policy);
+[[nodiscard]] std::string modeHydroBoundaryToString(ModeHydroBoundary boundary);
+[[nodiscard]] std::string modeGravityBoundaryToString(ModeGravityBoundary boundary);
+[[nodiscard]] std::string starFormationModelKindToString(StarFormationModelKind model);
+[[nodiscard]] std::string starFormationCollapseTimescaleToString(StarFormationCollapseTimescale mode);
+[[nodiscard]] std::string starParticleMassPolicyToString(StarParticleMassPolicy policy);
+[[nodiscard]] std::string effectiveIsmEosRelaxationToString(EffectiveIsmEosRelaxation mode);
+[[nodiscard]] std::string effectiveIsmBirthMassConventionToString(EffectiveIsmBirthMassConvention mode);
+[[nodiscard]] std::string effectiveIsmFeedbackCouplingToString(EffectiveIsmFeedbackCoupling mode);
+[[nodiscard]] std::string feedbackModeToString(FeedbackMode mode);
+[[nodiscard]] std::string feedbackVariantToString(FeedbackVariant variant);
+[[nodiscard]] std::string uvBackgroundModelToString(UvBackgroundModel model);
+[[nodiscard]] std::string selfShieldingModelToString(SelfShieldingModel model);
+[[nodiscard]] std::string coolingModelToString(CoolingModel model);
+[[nodiscard]] std::string metalSpeciesModeToString(MetalSpeciesMode mode);
+[[nodiscard]] std::string metalDiffusionModelToString(MetalDiffusionModel model);
+[[nodiscard]] std::string metalDiffusionTimeIntegratorToString(
+    MetalDiffusionTimeIntegrator integrator);
+[[nodiscard]] std::string integratorTimeVariableToString(IntegratorTimeVariable variable);
+
+}  // namespace cosmosim::core

@@ -1,0 +1,351 @@
+#include <cassert>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+#include "cosmosim/core/constants.hpp"
+#include "cosmosim/core/build_config.hpp"
+#include "cosmosim/core/version.hpp"
+#include "cosmosim/core/config.hpp"
+#include "cosmosim/core/cosmology.hpp"
+#include "cosmosim/core/provenance.hpp"
+#include "cosmosim/core/units.hpp"
+
+namespace {
+
+constexpr double k_tolerance = 1.0e-12;
+
+void testHubbleAndCriticalDensityAtAOne() {
+  cosmosim::core::CosmologyBackgroundConfig cfg;
+  cfg.hubble_param = 0.7;
+  cfg.omega_matter = 0.3;
+  cfg.omega_lambda = 0.7;
+  cfg.omega_radiation = 0.0;
+  cfg.omega_curvature = 0.0;
+
+  cosmosim::core::LambdaCdmBackground background(cfg);
+
+  const double expected_h0 = 0.7 * cosmosim::core::constants::k_hubble_100_km_s_mpc_si;
+  const double h_a1 = background.hubbleSi(1.0);
+  assert(std::abs((h_a1 - expected_h0) / expected_h0) < k_tolerance);
+
+  const double rho_crit = background.criticalDensitySi(1.0);
+  const double expected_rho =
+      (3.0 * expected_h0 * expected_h0) /
+      (8.0 * cosmosim::core::constants::k_pi * cosmosim::core::constants::k_newton_g_si);
+  assert(std::abs((rho_crit - expected_rho) / expected_rho) < k_tolerance);
+}
+
+void testCosmologyDensityClosureContract() {
+  cosmosim::core::CosmologyBackgroundConfig eds;
+  eds.hubble_param = 0.7;
+  eds.omega_matter = 1.0;
+  eds.omega_lambda = 0.0;
+  eds.omega_radiation = 0.0;
+  eds.omega_curvature = 0.0;
+  const cosmosim::core::LambdaCdmBackground eds_background(eds);
+  assert(std::abs(eds_background.hubbleSi(1.0) - eds_background.hubble0Si()) /
+             eds_background.hubble0Si() < k_tolerance);
+
+  cosmosim::core::CosmologyBackgroundConfig with_radiation;
+  with_radiation.hubble_param = 0.67;
+  with_radiation.omega_matter = 0.30;
+  with_radiation.omega_lambda = 0.68;
+  with_radiation.omega_radiation = 0.02;
+  with_radiation.omega_curvature = 0.0;
+  const cosmosim::core::LambdaCdmBackground radiation_background(with_radiation);
+  assert(std::abs(radiation_background.hubbleSi(1.0) - radiation_background.hubble0Si()) /
+             radiation_background.hubble0Si() < k_tolerance);
+
+  auto inconsistent = eds;
+  inconsistent.omega_matter = 0.3;
+  bool rejected = false;
+  try {
+    (void)cosmosim::core::LambdaCdmBackground(inconsistent);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
+}
+
+void testScaleFactorDependence() {
+  cosmosim::core::CosmologyBackgroundConfig cfg;
+  cfg.hubble_param = 0.67;
+  cfg.omega_matter = 0.31;
+  cfg.omega_lambda = 0.68;
+  cfg.omega_radiation = 0.01;
+  cfg.omega_curvature = 0.0;
+
+  cosmosim::core::LambdaCdmBackground background(cfg);
+  const double a = 0.5;
+  const double e = std::sqrt(
+      cfg.omega_radiation * std::pow(a, -4.0) + cfg.omega_matter * std::pow(a, -3.0) +
+      cfg.omega_curvature * std::pow(a, -2.0) + cfg.omega_lambda);
+  assert(std::abs(background.eFactor(a) - e) < 1.0e-12);
+}
+
+void testEinsteinDeSitterCosmicTimeIntegral() {
+  cosmosim::core::CosmologyBackgroundConfig cfg;
+  cfg.hubble_param = 0.7;
+  cfg.omega_matter = 1.0;
+  cfg.omega_lambda = 0.0;
+  cfg.omega_radiation = 0.0;
+  cfg.omega_curvature = 0.0;
+  const cosmosim::core::LambdaCdmBackground background(cfg);
+  constexpr double a_begin = 0.125;
+  constexpr double a_end = 0.8;
+  const double expected = (2.0 / (3.0 * background.hubble0Si())) *
+      (std::pow(a_end, 1.5) - std::pow(a_begin, 1.5));
+  const double actual = background.cosmicTimeIntervalSi(a_begin, a_end);
+  assert(std::abs(actual - expected) / expected < 5.0e-10);
+  assert(background.cosmicTimeIntervalSi(a_end, a_end) == 0.0);
+}
+
+void testComovingPhysicalConversions() {
+  const double a = 0.25;
+  const double x_comoving = 16.0;
+  const double r_phys = cosmosim::core::comovingToPhysicalLength(x_comoving, a);
+  assert(std::abs(r_phys - 4.0) < k_tolerance);
+  assert(std::abs(cosmosim::core::physicalToComovingLength(r_phys, a) - x_comoving) < k_tolerance);
+
+  const double dx_dt = 20.0;
+  const double v_pec = cosmosim::core::peculiarVelocityFromComovingRate(dx_dt, a);
+  assert(std::abs(v_pec - 5.0) < k_tolerance);
+  assert(std::abs(cosmosim::core::comovingRateFromPeculiarVelocity(v_pec, a) - dx_dt) <
+         k_tolerance);
+}
+
+void testUnitsConversions() {
+  const auto units = cosmosim::core::makeUnitSystem("mpc", "msun", "km_s");
+
+  const double length_si = units.lengthCodeToSi(1.0);
+  assert(std::abs(length_si - cosmosim::core::constants::k_megaparsec_si) < 1.0e-3);
+
+  const double rho_code = 2.5;
+  const double rho_si = units.densityCodeToSi(rho_code);
+  const double rho_roundtrip = units.densitySiToCode(rho_si);
+  assert(std::abs(rho_roundtrip - rho_code) < k_tolerance);
+
+  const double rho_cgs = units.densityCodeToCgs(1.0);
+  assert(rho_cgs > 0.0);
+
+  const double astrophysical_g_code =
+      cosmosim::core::newtonGravitationalConstantCode(units);
+  const double expected_astrophysical_g_code =
+      cosmosim::core::constants::k_newton_g_si *
+      cosmosim::core::constants::k_solar_mass_si /
+      (cosmosim::core::constants::k_megaparsec_si *
+       cosmosim::core::constants::k_kilometer_si *
+       cosmosim::core::constants::k_kilometer_si);
+  assert(std::abs(astrophysical_g_code - expected_astrophysical_g_code) /
+             expected_astrophysical_g_code <
+         1.0e-14);
+
+  const auto si_units = cosmosim::core::makeUnitSystem("m", "kg", "m_s");
+  assert(std::abs(cosmosim::core::newtonGravitationalConstantCode(si_units) -
+                  cosmosim::core::constants::k_newton_g_si) /
+             cosmosim::core::constants::k_newton_g_si <
+         1.0e-14);
+}
+
+void testStableHash() {
+  const std::string normalized = "a=1\nb=2\n";
+  const std::string hash_a = cosmosim::core::stableConfigHashHex(normalized);
+  const std::string hash_b = cosmosim::core::stableConfigHashHex(normalized);
+  assert(hash_a == hash_b);
+  assert(cosmosim::core::strongConfigHashSha256Hex("") ==
+         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  assert(cosmosim::core::strongConfigHashSha256Hex("abc") ==
+         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+void testDerivedConstantsConsistencyFromNormalizedConfig() {
+  const std::string text = R"(
+[mode]
+mode = cosmo_cube
+[units]
+length_unit = mpc
+mass_unit = msun
+velocity_unit = km_s
+[cosmology]
+hubble_param = 0.7
+omega_matter = 0.3
+omega_lambda = 0.7
+)";
+  const auto frozen = cosmosim::core::loadFrozenConfigFromString(text, "derived_constants");
+  const auto units_from_frozen = cosmosim::core::makeUnitSystem(
+      frozen.config.units.length_unit,
+      frozen.config.units.mass_unit,
+      frozen.config.units.velocity_unit);
+  const auto units_from_roundtrip = cosmosim::core::makeUnitSystem("mpc", "msun", "km_s");
+  assert(std::abs(units_from_frozen.length_si_per_code - units_from_roundtrip.length_si_per_code) < k_tolerance);
+
+  cosmosim::core::CosmologyBackgroundConfig bg_cfg;
+  bg_cfg.hubble_param = frozen.config.cosmology.hubble_param;
+  bg_cfg.omega_matter = frozen.config.cosmology.omega_matter;
+  bg_cfg.omega_lambda = frozen.config.cosmology.omega_lambda;
+  bg_cfg.omega_radiation = 0.0;
+  bg_cfg.omega_curvature = 0.0;
+  const cosmosim::core::LambdaCdmBackground background(bg_cfg);
+  const double expected_h0 = frozen.config.cosmology.hubble_param * cosmosim::core::constants::k_hubble_100_km_s_mpc_si;
+  assert(std::abs(background.hubble0Si() - expected_h0) / expected_h0 < k_tolerance);
+}
+
+void testInvalidUnitsCosmologyAndProvenanceFailClosed() {
+  cosmosim::core::UnitSystem invalid_units;
+  invalid_units.length_si_per_code = 0.0;
+  bool threw = false;
+  try {
+    (void)invalid_units.lengthCodeToSi(1.0);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  threw = false;
+  try {
+    (void)cosmosim::core::comovingToPhysicalLength(1.0, 0.0);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  cosmosim::core::CosmologyBackgroundConfig invalid_cosmology;
+  invalid_cosmology.hubble_param = std::numeric_limits<double>::quiet_NaN();
+  threw = false;
+  try {
+    (void)cosmosim::core::LambdaCdmBackground(invalid_cosmology);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  const std::string normalized_config = "mode=cosmo_cube\nvalue=1\n";
+  cosmosim::core::ProvenanceRecord record = cosmosim::core::makeProvenanceRecord(
+      cosmosim::core::stableConfigHashHex(normalized_config),
+      "deadbeef",
+      0,
+      normalized_config);
+  assert(record.git_sha=="deadbeef"); // explicit caller identity is preserved
+  const auto automatic=cosmosim::core::makeProvenanceRecord(record.config_hash_hex,"unavailable",0,normalized_config);
+  assert(automatic.git_sha==COSMOSIM_SOURCE_GIT);
+  const auto build_identity=cosmosim::core::buildProvenance();
+  assert(build_identity.find("source="+std::string(COSMOSIM_SOURCE_IDENTITY))!=std::string::npos);
+  assert(build_identity.find("source_manifest_sha256="+std::string(COSMOSIM_SOURCE_MANIFEST_SHA256))!=std::string::npos);
+  record.raw_input_config = "  raw\\value\nline=two\tend  ";
+  record.normalized_config = normalized_config;
+  record.derived_runtime_state = "state=ok\r\nnext=yes";
+  record.compiler_flags = "-O2 -DNAME=\\\"value\\\"";
+  const std::string serialized = cosmosim::core::serializeProvenanceRecord(record);
+  const auto parsed = cosmosim::core::deserializeProvenanceRecord(serialized);
+  assert(parsed.schema_version == "provenance_v7");
+  assert(parsed.config_hash_hex == record.config_hash_hex);
+  assert(parsed.normalized_config_sha256_hex ==
+         cosmosim::core::strongConfigHashSha256Hex(normalized_config));
+  assert(parsed.raw_input_config == record.raw_input_config);
+  assert(parsed.normalized_config == record.normalized_config);
+  assert(parsed.derived_runtime_state == record.derived_runtime_state);
+  assert(parsed.compiler_flags == record.compiler_flags);
+
+  threw = false;
+  try {
+    (void)cosmosim::core::deserializeProvenanceRecord(serialized + "schema_version=duplicate\n");
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  threw = false;
+  try {
+    (void)cosmosim::core::deserializeProvenanceRecord(serialized + "unknown_key=1\n");
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  auto replace_line = [](std::string text, const std::string& key, const std::string& replacement) {
+    const std::string prefix = key + "=";
+    const auto begin = text.find(prefix);
+    assert(begin != std::string::npos);
+    const auto end = text.find('\n', begin);
+    assert(end != std::string::npos);
+    text.replace(begin, end - begin, prefix + replacement);
+    return text;
+  };
+
+  threw = false;
+  try {
+    (void)cosmosim::core::deserializeProvenanceRecord(
+        replace_line(serialized, "raw_input_config", "abc\\q"));
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  threw = false;
+  try {
+    (void)cosmosim::core::deserializeProvenanceRecord(
+        replace_line(serialized, "raw_input_config", "dangling\\"));
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  threw = false;
+  try {
+    (void)cosmosim::core::deserializeProvenanceRecord(
+        replace_line(serialized, "normalized_config_sha256_hex", std::string(64U, '0')));
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  std::string nonfinite = serialized;
+  const std::string key = "gravity_treepm_asmth_cells=0";
+  const auto offset = nonfinite.find(key);
+  assert(offset != std::string::npos);
+  nonfinite.replace(offset, key.size(), "gravity_treepm_asmth_cells=nan");
+  threw = false;
+  try {
+    (void)cosmosim::core::deserializeProvenanceRecord(nonfinite);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  cosmosim::core::ProvenanceRecord legacy = record;
+  legacy.schema_version = "provenance_v6";
+  legacy.raw_input_config = "legacy\\path\nline";
+  legacy.normalized_config.clear();
+  const auto legacy_parsed = cosmosim::core::deserializeProvenanceRecord(
+      cosmosim::core::serializeProvenanceRecord(legacy));
+  assert(legacy_parsed.schema_version == "provenance_v6");
+  assert(legacy_parsed.raw_input_config == legacy.raw_input_config);
+
+  std::string malformed_legacy = cosmosim::core::serializeProvenanceRecord(legacy);
+  malformed_legacy = replace_line(malformed_legacy, "raw_input_config", "legacy\\q");
+  threw = false;
+  try {
+    (void)cosmosim::core::deserializeProvenanceRecord(malformed_legacy);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+}
+
+}  // namespace
+
+int main() {
+  testHubbleAndCriticalDensityAtAOne();
+  testCosmologyDensityClosureContract();
+  testScaleFactorDependence();
+  testEinsteinDeSitterCosmicTimeIntegral();
+  testComovingPhysicalConversions();
+  testUnitsConversions();
+  testStableHash();
+  testDerivedConstantsConsistencyFromNormalizedConfig();
+  testInvalidUnitsCosmologyAndProvenanceFailClosed();
+  return 0;
+}
